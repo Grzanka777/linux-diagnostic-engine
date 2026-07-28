@@ -12,7 +12,7 @@ htmlcov/
 venv/
 
 # Generated diagnostic reports
-syscheck-*.md
+/syscheck-*.md
 
 # Backups and recovery files
 *.bak
