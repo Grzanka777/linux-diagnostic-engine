@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Generated diagnostic reports
+syscheck-*.md
+
+# Backups and recovery files
+*.bak
+*.broken
+*.clean
+*.orig
+*~
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Agent prompts
+.agent-work/prompts/
