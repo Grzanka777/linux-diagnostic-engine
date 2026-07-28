@@ -28,3 +28,13 @@ venv/
 
 # Agent prompts
 .agent-work/prompts/
+
+# Historical superseded reviews
+.agent-work/reviews/iteration-17-*.md
+.agent-work/reviews/iteration-18-*.md
+.agent-work/reviews/iteration-19-*.md
+.agent-work/reviews/iteration-20-*.md
+.agent-work/reviews/iteration-21-*.md
+.agent-work/reviews/iteration-22-*.md
+.agent-work/reviews/iteration-23-*.md
+.agent-work/reviews/review-syscheck-diagnostic-accuracy-20260727.md
