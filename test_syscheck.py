@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
+    RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
     CmdResult,
     Finding,
@@ -5582,6 +5583,7 @@ class TestSegfaultAndTaintCollectorPath:
             "firmware_msgs": self._cmd_ok(""),
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6026,6 +6028,7 @@ class TestOomCollectorPath:
             "firmware_msgs": self._cmd_ok(""),
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6558,6 +6561,7 @@ class TestGpuI915HangCollectorPath:
             "firmware_msgs": self._cmd_ok(""),
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6977,6 +6981,805 @@ class TestGpuI915HangCollectorPath:
                 "kernel: CPU: 0 PID: 1 Comm: swapper Tainted: P        "
             ),
             gpu_i915_hang=self._cmd_ok(""),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 1
+        assert taint_raws[0].payload.get("tainted") is True
+
+
+class TestAmdgpuResetFailCommandStatus:
+    """Direct shell-level tests for _oom_collector_command with AMDGPU reset-failed regex."""
+
+    def test_match_success(self):
+        """Standard 'amdgpu ... GPU reset failed' → exit 0, stdout contains it."""
+        cmd = _oom_collector_command(
+            "printf 'Dec 25 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+            "amdgpu: GPU reset failed!'",
+            RE_AMDGPU_RESET_FAIL,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"GPU reset failed" in cp.stdout
+
+    def test_match_reverse_order(self):
+        """'GPU reset failed ... amdgpu' → exit 0."""
+        cmd = _oom_collector_command(
+            "printf 'Dec 25 10:00:00 host kernel: GPU reset failed: "
+            "amdgpu device 0000:01:00.0'",
+            RE_AMDGPU_RESET_FAIL,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"GPU reset failed" in cp.stdout
+
+    def test_case_insensitive(self):
+        """Case variations → exit 0."""
+        cmd = _oom_collector_command(
+            "printf 'amdgpu 0000:01:00.0: AMDGPU: Gpu Reset Failed!'",
+            RE_AMDGPU_RESET_FAIL,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"Gpu Reset Failed" in cp.stdout
+
+    def test_no_match(self):
+        """No match → exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'something harmless'",
+            RE_AMDGPU_RESET_FAIL,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_upstream_failure(self):
+        """journalctl fails (rc=42) → exit 42."""
+        cmd = _oom_collector_command(
+            "bash -c 'printf log; exit 42'",
+            RE_AMDGPU_RESET_FAIL,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 42
+
+    def test_grep_rc2_propagated(self):
+        """grep exits with rc=2 (invalid regex) → propagated as-is."""
+        cmd = _oom_collector_command("printf 'test'", r"invalid[")
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 2
+
+    def test_zero_length_input_no_match(self):
+        """Empty input → exit 0, empty stdout."""
+        cmd = _oom_collector_command("printf ''", RE_AMDGPU_RESET_FAIL)
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+
+class TestAmdgpuResetFailCollectorPath:
+    """Collector-path and pipeline tests for AMDGPU-RESET-FAIL-001."""
+
+    @staticmethod
+    def _cmd_ok(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    @staticmethod
+    def _cmd_error(
+        execution_status: str = "error",
+        return_code: int = 1,
+    ) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout="",
+            stderr="",
+            return_code=return_code,
+            execution_status=execution_status,
+        )
+
+    def _collect_with_mock(self, engine, **overrides):
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd_ok("0"),
+            "kernel_errors": self._cmd_ok(""),
+            "segfaults": self._cmd_ok(""),
+            "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
+            "lspci": self._cmd_ok(""),
+            "lsusb": self._cmd_ok(""),
+        }
+        results.update(overrides)
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _make_line(variant: str = "reset_fail") -> str:
+        lines = {
+            "reset_fail": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset failed!"
+            ),
+            "reverse": (
+                "lip 29 10:00:00 host kernel: GPU reset failed: amdgpu 0000:01:00.0"
+            ),
+            "no_amdgpu": ("lip 29 10:00:00 host kernel: [drm] GPU reset failed!"),
+            "amdgpu_no_fail": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset begin!"
+            ),
+            "reset_begin": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset begin!"
+            ),
+            "reset_succeeded": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset succeeded!"
+            ),
+            "reset_end": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset end!"
+            ),
+            "job_timedout": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "[drm:amdgpu_job_timedout] *ERROR* Process X (pid 1234) job timed out"
+            ),
+            "ring_timeout": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "ring gfx timeout: seq 42"
+            ),
+            "vm_fault": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "[drm:gmc_v9_0_process_interrupt] *ERROR* [amdgpu: VM fault ..."
+            ),
+            "page_fault": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "[drm:amdgpu_vm_bo_fault] *ERROR* Couldn't update page tables"
+            ),
+            "drm_error": (
+                "lip 29 10:00:00 host kernel: [drm:atom_op_constant_fs [amdgpu]] "
+                "*ERROR* Invalid constant (0xdeadbeef)"
+            ),
+            "i915_event": (
+                "lip 29 10:00:00 host kernel: i915 0000:00:02.0: "
+                "GPU HANG: ecode 9:1:0x85ffffff"
+            ),
+            "nvidia_xid": (
+                "lip 29 10:00:00 host kernel: nvidia: "
+                "Xid (PCI:0000:01:00): 79, GPU has fallen off the bus."
+            ),
+            "nouveau_event": (
+                "lip 29 10:00:00 host kernel: nouveau 0000:01:00.0: "
+                "fifo: read fault at 0000000000 engine 0x00"
+            ),
+        }
+        return lines.get(variant, variant)
+
+    # ── Positive triggers ────────────────────────────────────────
+
+    def test_reset_fail_triggers(self):
+        """Standard 'amdgpu ... GPU reset failed' produces AMDGPU-RESET-FAIL-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_coll")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reset_fail")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 1
+        assert raws[0].payload.get("reset_failure_detected") is True
+        assert raws[0].payload.get("driver") == "amdgpu"
+        assert raws[0].payload.get("match_count") == 1
+
+    def test_reverse_order_triggers(self):
+        """'GPU reset failed ... amdgpu' also triggers."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_coll")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reverse")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 1
+        assert raws[0].payload.get("reset_failure_detected") is True
+
+    # ── Negative / no-trigger ────────────────────────────────────
+
+    def test_no_amdgpu_no_trigger(self):
+        """'GPU reset failed' without AMDGPU does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_no_amdgpu")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("no_amdgpu")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_amdgpu_no_marker_no_trigger(self):
+        """AMDGPU without reset-failed marker does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_no_marker")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("amdgpu_no_fail")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_reset_begin_no_trigger(self):
+        """'GPU reset begin' does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_begin")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reset_begin")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_reset_succeeded_no_trigger(self):
+        """'GPU reset succeeded' does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_succeeded")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reset_succeeded")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_reset_end_no_trigger(self):
+        """'GPU reset end' does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_end")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reset_end")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_job_timedout_no_trigger(self):
+        """'amdgpu_job_timedout' does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_timedout")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("job_timedout")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_ring_timeout_no_trigger(self):
+        """Ring timeout does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_ring")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("ring_timeout")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_vm_fault_no_trigger(self):
+        """VM fault does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_vm")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("vm_fault")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_page_fault_no_trigger(self):
+        """Page fault does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_pf")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("page_fault")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_drm_error_no_trigger(self):
+        """Generic DRM error does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_drm_err")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("drm_error")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_i915_no_trigger(self):
+        """i915 GPU HANG does not trigger AMDGPU diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_i915")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("i915_event")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_nvidia_xid_no_trigger(self):
+        """NVIDIA Xid does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_nvidia")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("nvidia_xid")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_nouveau_no_trigger(self):
+        """Nouveau event does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_nouveau")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("nouveau_event")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_empty_no_trigger(self):
+        """Empty output → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_empty")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(""),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    # ── Multiple matches ─────────────────────────────────────────
+
+    def test_multiple_matches(self):
+        """Multiple matching lines produce one diagnostic with match_count."""
+        lines = "\n".join(
+            [
+                self._make_line("reset_fail"),
+                self._make_line("reverse"),
+            ]
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_mult")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(lines),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 1
+        assert raws[0].payload.get("match_count") == 2
+        assert len(raws[0].payload.get("matched_lines", [])) == 2
+
+    # ── Command failure / edge cases ────────────────────────────
+
+    def test_command_failure_safe(self):
+        """Command fails → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_fail")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_error(return_code=1),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_timeout_safe(self):
+        """Timeout → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_timeout")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_error(execution_status="timeout"),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 0
+
+    def test_payload_provenance(self):
+        """Payload contains correct provenance keys."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_prov")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(self._make_line("reset_fail")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 1
+        p = raws[0].payload
+        assert p.get("reset_failure_detected") is True
+        assert p.get("driver") == "amdgpu"
+        assert p.get("driver_attribution_source") == "in_message"
+        assert p.get("journal_scope") == "current_boot_kernel"
+        assert p.get("source_query") == "amdgpu_reset_fail"
+        assert len(p.get("matched_lines", [])) >= 1
+
+    def test_output_cap(self):
+        """At most 20 matched lines kept in payload."""
+        many_lines = "\n".join([self._make_line("reset_fail")] * 25)
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_cap")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(many_lines),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(raws) == 1
+        assert len(raws[0].payload.get("matched_lines", [])) == 20
+
+    # ── Pipeline: observation / evidence / finding ──────────────
+
+    def test_observation_mapping(self):
+        """RawDiagnostic routes through _raw_to_observation correctly."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="AMDGPU-RESET-FAIL-001",
+                category="amdgpu_reset_fail",
+                payload={
+                    "reset_failure_detected": True,
+                    "matched_lines": [
+                        "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!"
+                    ],
+                    "match_count": 1,
+                    "driver": "amdgpu",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "amdgpu_reset_fail",
+                },
+            )
+        ]
+        engine._derive_observations()
+        assert len(engine.observations) == 1
+        obs = engine.observations[0]
+        assert obs.obs_id == "AMDGPU-RESET-FAIL-001"
+        assert obs.category == "amdgpu_reset_fail"
+        assert obs.direct_measurement is True
+        assert obs.data_complete is True
+        assert obs.inference_required is False
+
+    def test_evidence_journal_event_type(self):
+        """Evidence uses JOURNAL_EVENT type and preserves provenance."""
+        from syscheck import EvidenceType
+
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="AMDGPU-RESET-FAIL-001",
+                category="amdgpu_reset_fail",
+                payload={
+                    "reset_failure_detected": True,
+                    "matched_lines": [
+                        "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!"
+                    ],
+                    "match_count": 1,
+                    "driver": "amdgpu",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "amdgpu_reset_fail",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        amdgpu_evidence = [
+            e
+            for e in engine.evidence_objects
+            if e.evidence_type == EvidenceType.JOURNAL_EVENT
+            and "AMDGPU reset failure" in e.summary
+        ]
+        assert len(amdgpu_evidence) >= 1
+        data = amdgpu_evidence[0].data
+        assert data.get("reset_failure_detected") is True
+        assert data.get("driver") == "amdgpu"
+        assert data.get("journal_scope") == "current_boot_kernel"
+        assert data.get("source_query") == "amdgpu_reset_fail"
+
+    def test_finding_classification(self):
+        """Finding uses AMDGPU_RESET_FAIL kind, HARDWARE, P2, Certain, ACTIONABLE, INVESTIGATE."""
+        from syscheck import (
+            FindingKind,
+            DiagnosticDomain,
+            Actionability,
+            RecommendationIntent,
+        )
+
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="AMDGPU-RESET-FAIL-001",
+                category="amdgpu_reset_fail",
+                payload={
+                    "reset_failure_detected": True,
+                    "matched_lines": [
+                        "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!"
+                    ],
+                    "match_count": 1,
+                    "driver": "amdgpu",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "amdgpu_reset_fail",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        amdgpu_findings = [
+            f for f in engine.findings if f.finding_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(amdgpu_findings) == 1
+        f = amdgpu_findings[0]
+        assert f.kind == FindingKind.AMDGPU_RESET_FAIL
+        assert f.domain == DiagnosticDomain.HARDWARE
+        assert f.severity == "P2"
+        assert f.confidence == "Certain"
+        assert f.actionability == Actionability.ACTIONABLE
+        assert f.recommendation_intent == RecommendationIntent.INVESTIGATE
+
+    def test_rule_registered(self):
+        """AmdgpuResetFailRule is registered in the default rule engine."""
+        from syscheck import build_default_rule_engine
+
+        engine_instance = build_default_rule_engine()
+        assert any(
+            hasattr(r, "rule_id") and r.rule_id == "RULE-AMDGPU-RESET-FAIL"
+            for r in engine_instance._registry.rules
+        )
+
+    # ── Finding wording boundaries ──────────────────────────────
+
+    def test_no_hardware_failure_claim(self):
+        """Finding does not claim hardware failure."""
+        from syscheck import build_default_rule_engine, Observation
+
+        engine = build_default_rule_engine()
+        obs = Observation(
+            obs_id="AMDGPU-RESET-FAIL-001",
+            category="amdgpu_reset_fail",
+            details={
+                "reset_failure_detected": True,
+                "matched_lines": ["kernel: amdgpu: GPU reset failed!"],
+                "match_count": 1,
+                "driver": "amdgpu",
+                "driver_attribution_source": "in_message",
+                "journal_scope": "current_boot_kernel",
+                "source_query": "amdgpu_reset_fail",
+            },
+            direct_measurement=True,
+            data_complete=True,
+            contradictory_evidence=False,
+            inference_required=False,
+            independent_sources=1,
+            source_raw_ids=("AMDGPU-RESET-FAIL-001",),
+        )
+        result = engine.evaluate([obs])
+        for f in result.findings:
+            assert "nie potwierdza defektu sprzętowego" in f.interpretation
+
+    def test_no_current_unavailability_claim(self):
+        """Finding does not claim current GPU unavailability."""
+        from syscheck import build_default_rule_engine, Observation
+
+        engine = build_default_rule_engine()
+        obs = Observation(
+            obs_id="AMDGPU-RESET-FAIL-001",
+            category="amdgpu_reset_fail",
+            details={
+                "reset_failure_detected": True,
+                "matched_lines": ["kernel: amdgpu: GPU reset failed!"],
+                "match_count": 1,
+                "driver": "amdgpu",
+                "driver_attribution_source": "in_message",
+                "journal_scope": "current_boot_kernel",
+                "source_query": "amdgpu_reset_fail",
+            },
+            direct_measurement=True,
+            data_complete=True,
+            contradictory_evidence=False,
+            inference_required=False,
+            independent_sources=1,
+            source_raw_ids=("AMDGPU-RESET-FAIL-001",),
+        )
+        result = engine.evaluate([obs])
+        for f in result.findings:
+            assert "może nie być już aktywne" in f.interpretation
+
+    def test_no_arch_only_command(self):
+        """Recommendation does not contain Arch-only 'pacman -Q'."""
+        from syscheck import build_default_rule_engine, Observation
+
+        engine = build_default_rule_engine()
+        obs = Observation(
+            obs_id="AMDGPU-RESET-FAIL-001",
+            category="amdgpu_reset_fail",
+            details={
+                "reset_failure_detected": True,
+                "matched_lines": ["kernel: amdgpu: GPU reset failed!"],
+                "match_count": 1,
+                "driver": "amdgpu",
+                "driver_attribution_source": "in_message",
+                "journal_scope": "current_boot_kernel",
+                "source_query": "amdgpu_reset_fail",
+            },
+            direct_measurement=True,
+            data_complete=True,
+            contradictory_evidence=False,
+            inference_required=False,
+            independent_sources=1,
+            source_raw_ids=("AMDGPU-RESET-FAIL-001",),
+        )
+        result = engine.evaluate([obs])
+        for f in result.findings:
+            assert "pacman -Q" not in f.remediation
+            assert "pacman -Q" not in f.recommended_diagnostics
+
+    def test_no_kernel_parameters(self):
+        """Recommendation does not prescribe arbitrary kernel parameters."""
+        from syscheck import build_default_rule_engine, Observation
+
+        engine = build_default_rule_engine()
+        obs = Observation(
+            obs_id="AMDGPU-RESET-FAIL-001",
+            category="amdgpu_reset_fail",
+            details={
+                "reset_failure_detected": True,
+                "matched_lines": ["kernel: amdgpu: GPU reset failed!"],
+                "match_count": 1,
+                "driver": "amdgpu",
+                "driver_attribution_source": "in_message",
+                "journal_scope": "current_boot_kernel",
+                "source_query": "amdgpu_reset_fail",
+            },
+            direct_measurement=True,
+            data_complete=True,
+            contradictory_evidence=False,
+            inference_required=False,
+            independent_sources=1,
+            source_raw_ids=("AMDGPU-RESET-FAIL-001",),
+        )
+        result = engine.evaluate([obs])
+        for f in result.findings:
+            assert "amdgpu.aspm" not in f.remediation
+            assert "amdgpu.runpm" not in f.remediation
+            assert "amdgpu.gpu_recovery" not in f.remediation
+            assert "i915" not in f.remediation
+
+    def test_verification_no_disappearance_claim(self):
+        """Verification does not claim historical entry disappears."""
+        from syscheck import build_default_rule_engine, Observation
+
+        engine = build_default_rule_engine()
+        obs = Observation(
+            obs_id="AMDGPU-RESET-FAIL-001",
+            category="amdgpu_reset_fail",
+            details={
+                "reset_failure_detected": True,
+                "matched_lines": ["kernel: amdgpu: GPU reset failed!"],
+                "match_count": 1,
+                "driver": "amdgpu",
+                "driver_attribution_source": "in_message",
+                "journal_scope": "current_boot_kernel",
+                "source_query": "amdgpu_reset_fail",
+            },
+            direct_measurement=True,
+            data_complete=True,
+            contradictory_evidence=False,
+            inference_required=False,
+            independent_sources=1,
+            source_raw_ids=("AMDGPU-RESET-FAIL-001",),
+        )
+        result = engine.evaluate([obs])
+        for f in result.findings:
+            assert "zniknie" not in f.verification
+            assert "disappear" not in f.verification
+
+    # ── Regression ──────────────────────────────────────────────
+
+    def test_existing_oom_unchanged(self):
+        """Adding amdgpu_reset_fail to mock does not break existing OOM detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_regr")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: mysqld invoked oom-killer: gfp_mask=0xcc0"
+            ),
+            amdgpu_reset_fail=self._cmd_ok(""),
+        )
+        oom_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"
+        ]
+        assert len(oom_raws) == 1
+        assert oom_raws[0].payload.get("oom_detected") is True
+
+    def test_existing_i915_unchanged(self):
+        """Adding amdgpu_reset_fail to mock does not break existing i915 detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_regr")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(
+                "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1:0x85ffffff"
+            ),
+            amdgpu_reset_fail=self._cmd_ok(""),
+        )
+        i915_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"
+        ]
+        assert len(i915_raws) == 1
+        assert i915_raws[0].payload.get("hang_detected") is True
+
+    def test_existing_segfault_unchanged(self):
+        """Adding amdgpu_reset_fail to mock does not break existing segfault detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_regr")
+        segfaults = "\n".join(
+            [
+                "lip 27 08:09:51 host kernel: wireplumber[1274]: segfault at 0 "
+                "ip 7f2c9743a55c sp 7fff981984c8 error 4 in libspa-libcamera.so"
+                "[13155c,7f2c97382000+f0000] likely on CPU 0",
+                "lip 27 08:09:52 host kernel: wireplumber[1387]: segfault at 0 "
+                "ip 7f3f5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f3f5cda8000+f0000] likely on CPU 0",
+                "lip 27 08:09:53 host kernel: wireplumber[1400]: segfault at 0 "
+                "ip 7f4a5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f4a5cda8000+f0000] likely on CPU 0",
+            ]
+        )
+        self._collect_with_mock(
+            engine,
+            segfaults=self._cmd_ok(segfaults),
+            amdgpu_reset_fail=self._cmd_ok(""),
+        )
+        wp_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
+        ]
+        assert len(wp_raws) == 1
+        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
+
+    def test_existing_taint_unchanged(self):
+        """Adding amdgpu_reset_fail to mock does not break existing taint detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_amdgpu_regr")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: CPU: 0 PID: 1 Comm: swapper Tainted: P        "
+            ),
+            amdgpu_reset_fail=self._cmd_ok(""),
         )
         taint_raws = [
             r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
