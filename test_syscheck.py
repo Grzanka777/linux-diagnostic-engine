@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
+    RE_GPU_I915_HANG,
     CmdResult,
     Finding,
     Observation,
@@ -5580,6 +5581,7 @@ class TestSegfaultAndTaintCollectorPath:
             "segfaults": self._cmd_ok(""),
             "firmware_msgs": self._cmd_ok(""),
             "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6023,6 +6025,7 @@ class TestOomCollectorPath:
             "segfaults": self._cmd_ok(""),
             "firmware_msgs": self._cmd_ok(""),
             "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6452,3 +6455,531 @@ class TestOomCommandStatus:
         cp = subprocess.run(cmd, capture_output=True, timeout=120)
         assert cp.returncode == 0
         assert cp.stdout == b""
+
+
+class TestGpuI915HangCommandStatus:
+    """Direct shell-level tests for _oom_collector_command with GPU i915 hang regex."""
+
+    def test_match_success(self):
+        """grep finds 'i915.*GPU HANG:' → exit 0, stdout contains it."""
+        cmd = _oom_collector_command(
+            "printf 'Dec 25 10:00:00 host kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1:0x85ffffff'",
+            RE_GPU_I915_HANG,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"GPU HANG" in cp.stdout
+
+    def test_match_reverse_order(self):
+        """grep finds 'GPU HANG:.*i915' (i915 after GPU HANG) → exit 0."""
+        cmd = _oom_collector_command(
+            "printf 'Dec 25 10:00:00 host kernel: GPU HANG: i915 ecode ...'",
+            RE_GPU_I915_HANG,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"GPU HANG" in cp.stdout
+
+    def test_no_match(self):
+        """grep finds nothing i915-related → exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'something harmless'",
+            RE_GPU_I915_HANG,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_upstream_failure(self):
+        """journalctl fails (rc=42) → exit 42."""
+        cmd = _oom_collector_command(
+            "bash -c 'printf log; exit 42'",
+            RE_GPU_I915_HANG,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 42
+
+    def test_grep_rc2_propagated(self):
+        """grep exits with rc=2 (invalid regex) → propagated as-is."""
+        cmd = _oom_collector_command("printf 'test'", r"invalid[")
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 2
+
+    def test_stderr_suppressed_preserves_status(self):
+        """journalctl stderr redirection does not mask exit status."""
+        cmd = _oom_collector_command(
+            "bash -c 'echo log >&2; exit 0'",
+            RE_GPU_I915_HANG,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+
+    def test_zero_length_input_no_match(self):
+        """Empty journalctl output → exit 0, no match."""
+        cmd = _oom_collector_command("printf ''", RE_GPU_I915_HANG)
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+
+class TestGpuI915HangCollectorPath:
+    """Collector-path and pipeline tests for GPU-I915-HANG-001."""
+
+    @staticmethod
+    def _cmd_ok(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    @staticmethod
+    def _cmd_error(
+        execution_status: str = "error",
+        return_code: int = 1,
+    ) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout="",
+            stderr="",
+            return_code=return_code,
+            execution_status=execution_status,
+        )
+
+    def _collect_with_mock(self, engine, **overrides):
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd_ok("0"),
+            "kernel_errors": self._cmd_ok(""),
+            "segfaults": self._cmd_ok(""),
+            "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
+            "lspci": self._cmd_ok(""),
+            "lsusb": self._cmd_ok(""),
+        }
+        results.update(overrides)
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _make_hang_line(variant: str = "standard") -> str:
+        lines = {
+            "standard": (
+                "lip 29 10:00:00 host kernel: i915 0000:00:02.0: "
+                "GPU HANG: ecode 9:1:0x85ffffff, in Xorg [1234]"
+            ),
+            "reverse": (
+                "lip 29 10:00:00 host kernel: GPU HANG: i915 ecode 9:1:0x85ffffff"
+            ),
+            "i915_no_hang": (
+                "lip 29 10:00:00 host kernel: i915 0000:00:02.0: "
+                "reset controller for gpu reset"
+            ),
+            "drm_error": (
+                "lip 29 10:00:00 host kernel: [drm:atom_op_constant_fs [amdgpu]] "
+                "*ERROR* Invalid constant (0xdeadbeef)"
+            ),
+            "resetting_chip": (
+                "lip 29 10:00:00 host kernel: i915 0000:00:02.0: "
+                "Resetting chip for stopped heartbeat on rcs0"
+            ),
+            "wedged": (
+                "lip 29 10:00:00 host kernel: i915 0000:00:02.0: "
+                "GPU seems wedged, cancelling queued job"
+            ),
+            "amdgpu_reset": (
+                "lip 29 10:00:00 host kernel: amdgpu 0000:01:00.0: "
+                "amdgpu: GPU reset begin!"
+            ),
+            "nvidia_xid": (
+                "lip 29 10:00:00 host kernel: nvidia: "
+                "Xid (PCI:0000:01:00): 79, GPU has fallen off the bus."
+            ),
+            "nouveau_hang": (
+                "lip 29 10:00:00 host kernel: nouveau 0000:01:00.0: "
+                "fifo: fifo: read fault at 0000000000 engine 0x00 [GR] client 0x1f "
+                "indicates a bug"
+            ),
+            "nouveau_no_match": (
+                "lip 29 10:00:00 host kernel: nouveau 0000:01:00.0: "
+                "mmu fault ... not a GPU hang"
+            ),
+            "drm_generic_no_match": (
+                "lip 29 10:00:00 host kernel: [drm] GPU HANG: ecode 9:1:0x85ffffff"
+            ),
+        }
+        return lines.get(variant, variant)
+
+    # ── Positive triggers ────────────────────────────────────────
+
+    def test_hang_triggers(self):
+        """'i915 ... GPU HANG:' produces GPU-I915-HANG-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_coll")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("standard")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("hang_detected") is True
+        assert raws[0].payload.get("driver") == "i915"
+        assert raws[0].payload.get("match_count") == 1
+
+    def test_reverse_order_triggers(self):
+        """'GPU HANG: ... i915' also triggers GPU-I915-HANG-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_coll")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("reverse")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("hang_detected") is True
+
+    def test_multiple_hangs(self):
+        """Multiple i915 GPU HANG lines produce one diagnostic with count."""
+        lines = "\n".join(
+            [
+                self._make_hang_line("standard"),
+                self._make_hang_line("reverse"),
+            ]
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_mult")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(lines),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("match_count") == 2
+        assert len(raws[0].payload.get("matched_lines", [])) == 2
+
+    # ── Negative / no-trigger ────────────────────────────────────
+
+    def test_non_i915_hang_no_trigger(self):
+        """GPU HANG: without i915 context does not trigger GPU-I915-HANG-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_nohit")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("drm_generic_no_match")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_nouveau_no_trigger(self):
+        """nouveau kernel messages do not trigger i915 GPU HANG."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_nouveau")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("nouveau_no_match")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_i915_no_hang_no_trigger(self):
+        """i915 line without 'GPU HANG:' does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_i915_nohang")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("i915_no_hang")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_drm_error_no_trigger(self):
+        """Generic DRM error without i915/GPU HANG: does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_drm_err")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("drm_error")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_resetting_chip_no_trigger(self):
+        """'Resetting chip' alone (without GPU HANG:) does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_reset")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("resetting_chip")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_wedged_no_trigger(self):
+        """'wedged' alone (without GPU HANG:) does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_wedged")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("wedged")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_amdgpu_reset_no_trigger(self):
+        """AMDGPU reset/failure does not trigger i915 GPU HANG."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_amdgpu")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("amdgpu_reset")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_nvidia_xid_no_trigger(self):
+        """NVIDIA Xid error does not trigger i915 GPU HANG."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_nvidia")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("nvidia_xid")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_nouveau_hang_no_trigger(self):
+        """Nouveau GPU hang/error line does not trigger i915 GPU HANG."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_nouveau_hang")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("nouveau_hang")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_empty_gpu_hang_no_trigger(self):
+        """Empty gpu_i915_hang result → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_empty")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(""),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    # ── Command failure / edge cases ────────────────────────────
+
+    def test_command_failure_safe(self):
+        """gpu_i915_hang command fails → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_fail")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_error(return_code=1),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_timeout_safe(self):
+        """gpu_i915_hang command times out → no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_timeout")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_error(execution_status="timeout"),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 0
+
+    def test_payload_provenance(self):
+        """Payload contains correct provenance keys."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_prov")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(self._make_hang_line("standard")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 1
+        p = raws[0].payload
+        assert p.get("hang_detected") is True
+        assert p.get("driver") == "i915"
+        assert p.get("driver_attribution_source") == "in_message"
+        assert p.get("journal_scope") == "current_boot_kernel"
+        assert p.get("source_query") == "gpu_i915_hang"
+        assert len(p.get("matched_lines", [])) >= 1
+
+    def test_output_cap(self):
+        """At most 20 matched lines are kept in payload."""
+        many_lines = "\n".join([self._make_hang_line("standard")] * 25)
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_cap")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(many_lines),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"]
+        assert len(raws) == 1
+        assert len(raws[0].payload.get("matched_lines", [])) == 20
+
+    # ── Pipeline: observation / evidence / finding ──────────────
+
+    def test_observation_mapping(self):
+        """RawDiagnostic routes through _raw_to_observation correctly."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-I915-HANG-001",
+                category="gpu_i915_hang",
+                payload={
+                    "hang_detected": True,
+                    "matched_lines": [
+                        "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1:0x85ffffff"
+                    ],
+                    "match_count": 1,
+                    "driver": "i915",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_i915_hang",
+                },
+            )
+        ]
+        engine._derive_observations()
+        assert len(engine.observations) == 1
+        obs = engine.observations[0]
+        assert obs.obs_id == "GPU-I915-HANG-001"
+        assert obs.category == "gpu_i915_hang"
+        assert obs.direct_measurement is True
+        assert obs.data_complete is True
+        assert obs.inference_required is False
+
+    def test_evidence_journal_event_type(self):
+        """Evidence produced for gpu_i915_hang uses JOURNAL_EVENT type."""
+        from syscheck import EvidenceType
+
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-I915-HANG-001",
+                category="gpu_i915_hang",
+                payload={
+                    "hang_detected": True,
+                    "matched_lines": [
+                        "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1:0x85ffffff"
+                    ],
+                    "match_count": 1,
+                    "driver": "i915",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_i915_hang",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        hang_evidence = [
+            e
+            for e in engine.evidence_objects
+            if e.evidence_type == EvidenceType.JOURNAL_EVENT
+            and "i915 GPU hang" in e.summary
+        ]
+        assert len(hang_evidence) >= 1
+        data = hang_evidence[0].data
+        assert data.get("hang_detected") is True
+        assert data.get("driver") == "i915"
+        assert data.get("journal_scope") == "current_boot_kernel"
+        assert data.get("source_query") == "gpu_i915_hang"
+
+    def test_finding_gpu_i915_hang_kind(self):
+        """Finding uses GPU_I915_HANG kind, HARDWARE domain, P2 severity, Certain confidence."""
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-I915-HANG-001",
+                category="gpu_i915_hang",
+                payload={
+                    "hang_detected": True,
+                    "matched_lines": [
+                        "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1:0x85ffffff"
+                    ],
+                    "match_count": 1,
+                    "driver": "i915",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_i915_hang",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        hang_findings = [
+            f for f in engine.findings if f.finding_id == "GPU-I915-HANG-001"
+        ]
+        assert len(hang_findings) == 1
+        f = hang_findings[0]
+        assert f.kind == FindingKind.GPU_I915_HANG
+        assert f.domain == DiagnosticDomain.HARDWARE
+        assert f.severity == "P2"
+        assert f.confidence == "Certain"
+
+    def test_rule_registered(self):
+        """GpuI915HangRule is registered in the default rule engine."""
+        from syscheck import build_default_rule_engine
+
+        engine_instance = build_default_rule_engine()
+        assert any(
+            hasattr(r, "rule_id") and r.rule_id == "RULE-GPU-I915-HANG"
+            for r in engine_instance._registry.rules
+        )
+
+    # ── Regression ──────────────────────────────────────────────
+
+    def test_existing_oom_unchanged(self):
+        """Adding gpu_i915_hang to mock does not break existing OOM detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_regr")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: mysqld invoked oom-killer: gfp_mask=0xcc0"
+            ),
+            gpu_i915_hang=self._cmd_ok(""),
+        )
+        oom_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"
+        ]
+        assert len(oom_raws) == 1
+        assert oom_raws[0].payload.get("oom_detected") is True
+
+    def test_existing_segfault_unchanged(self):
+        """Adding gpu_i915_hang to mock does not break existing segfault detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_regr")
+        segfaults = "\n".join(
+            [
+                "lip 27 08:09:51 host kernel: wireplumber[1274]: segfault at 0 "
+                "ip 7f2c9743a55c sp 7fff981984c8 error 4 in libspa-libcamera.so"
+                "[13155c,7f2c97382000+f0000] likely on CPU 0",
+                "lip 27 08:09:52 host kernel: wireplumber[1387]: segfault at 0 "
+                "ip 7f3f5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f3f5cda8000+f0000] likely on CPU 0",
+                "lip 27 08:09:53 host kernel: wireplumber[1400]: segfault at 0 "
+                "ip 7f4a5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f4a5cda8000+f0000] likely on CPU 0",
+            ]
+        )
+        self._collect_with_mock(
+            engine,
+            segfaults=self._cmd_ok(segfaults),
+            gpu_i915_hang=self._cmd_ok(""),
+        )
+        wp_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
+        ]
+        assert len(wp_raws) == 1
+        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
+
+    def test_existing_taint_unchanged(self):
+        """Adding gpu_i915_hang to mock does not break existing taint detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_regr")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: CPU: 0 PID: 1 Comm: swapper Tainted: P        "
+            ),
+            gpu_i915_hang=self._cmd_ok(""),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 1
+        assert taint_raws[0].payload.get("tainted") is True

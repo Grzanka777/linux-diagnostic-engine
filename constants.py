@@ -25,6 +25,7 @@ RE_FIRMWARE = r"firmware|microcode|ucode"
 RE_AUTH_FAIL = r"authentication failure|Failed password"
 RE_GFX_ERROR = r"niri|dms|wayland|greetd|i915|drm"
 RE_OOM = r"invoked oom-killer|oom-killer:|Out of memory: Killed process"
+RE_GPU_I915_HANG = r"i915.*GPU HANG:|GPU HANG:.*i915"
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────
 TRUNCATE_NORMAL = 5000

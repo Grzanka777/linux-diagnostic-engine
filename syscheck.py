@@ -52,6 +52,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_FIRMWARE,
     RE_GFX_ERROR,
     RE_KERNEL_ERROR,
+    RE_GPU_I915_HANG,
     RE_OOM,
     RE_SEGFAULT,
     SCRIPT_VERSION,
@@ -136,6 +137,7 @@ class FindingKind(str, Enum):
     KERNEL_COUNT = "kernel_count"
     KERNEL_TAINT = "kernel_taint"
     OOM_EVENT = "oom_event"
+    GPU_I915_HANG = "gpu_i915_hang"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -701,6 +703,12 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
+        "gpu_i915_hang": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.GPU_I915_HANG,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
     }
 
     _SEGFAULT_WP = FindingClassification(
@@ -1105,6 +1113,44 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "gpu_i915_hang":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+            if observation.inference_required:
+                directness = EvidenceDirectness.INFERRED
+            if observation.contradictory_evidence:
+                strength = EvidenceStrength.MODERATE
+
+            count = d.get("match_count", 0)
+            summary = (
+                f"i915 GPU hang detected during current boot "
+                f"({count} matching journal line(s))"
+            )
+
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=summary,
+                data={
+                    "hang_detected": d.get("hang_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "driver": d.get("driver", "i915"),
+                    "driver_attribution_source": d.get(
+                        "driver_attribution_source", "in_message"
+                    ),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "gpu_i915_hang"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1483,6 +1529,83 @@ class KernelOomRule(DiagnosticRule):
         )
 
 
+class GpuI915HangRule(DiagnosticRule):
+    rule_id = "RULE-GPU-I915-HANG"
+    supported_categories = frozenset({"gpu_i915_hang"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        conf = derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        return DiagnosticRuleResult(
+            finding=Finding(
+                finding_id=obs_id,
+                title=("Wykryto zawieszenie GPU obsługiwanego przez sterownik i915"),
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Dziennik jądra odnotował zdarzenie "
+                    "`GPU HANG:` dla sterownika i915 w bieżącym bocie. "
+                    "Zdarzenie mogło mieć charakter historyczny "
+                    "i może nie być już aktywne. "
+                    "Diagnostyka nie potwierdza defektu sprzętowego — "
+                    "możliwe przyczyny obejmują usterki jądra/sterownika, "
+                    "interakcję z firmware lub platformą, "
+                    "obciążenie wywołujące błąd, "
+                    "lub niestabilność sprzętową.\n\n"
+                    "Diagnostyka nie określa, czy dotknięte GPU "
+                    "było aktywnym rendererem — "
+                    "wpływ na użytkownika może być różny.\n\n"
+                    "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
+                    "że nie wystąpiło zawieszenie — "
+                    "retencja dziennika jądra może być niepełna."
+                ),
+                recommended_diagnostics=(
+                    "Sprawdź aktualny dziennik jądra: "
+                    "`journalctl -b -k --no-pager`\n"
+                    "Sprawdź wersję jądra: `uname -r`\n"
+                    "Sprawdź sterownik GPU: `lspci -k`\n"
+                    "Sprawdź, czy zdarzenie powtarza się w kolejnych bootach."
+                ),
+                remediation=(
+                    "Jeśli problem jest powtarzalny: "
+                    "porównaj zachowanie na innym wspieranym jądrze, "
+                    "przejrzyj ostatnie zmiany jądra/sterownika graficznego, "
+                    "zachowaj dokładne linie zawieszenia do zgłoszenia błędu."
+                ),
+                verification=(
+                    "Sprawdź, czy system jest obecnie responsywny.\n"
+                    "Monitoruj, czy nowe zawieszenia występują: "
+                    "`journalctl -b -k | grep -iE 'GPU HANG:'`.\n"
+                    "Po podjęciu działań sprawdź w kolejnym bocie, "
+                    "czy znacznik nadal występuje."
+                ),
+                risk_level=(
+                    "Średnie. Zawieszenie GPU może wskazywać na "
+                    "niestabilność; nieleczona przyczyna może prowadzić "
+                    "do dalszych problemów."
+                ),
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class FailedSystemUnitRule(DiagnosticRule):
     rule_id = "RULE-SYSTEMD-FAILED-SYSTEM"
     supported_categories = frozenset({"systemd_failed"})
@@ -1787,6 +1910,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         MinorSegfaultRule(eb),
         KernelTaintRule(eb),
         KernelOomRule(eb),
+        GpuI915HangRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
@@ -2300,6 +2424,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "gpu_i915_hang": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_GPU_I915_HANG,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2310,6 +2442,7 @@ class SysCheckEngine:
         segfaults_result = r["segfaults"]
         firmware_msgs_result = r["firmware_msgs"]
         oom_events_result = r["oom_events"]
+        gpu_i915_hang_result = r["gpu_i915_hang"]
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2458,6 +2591,31 @@ class SysCheckEngine:
                             "match_classes": match_classes,
                             "journal_scope": "current_boot_kernel",
                             "source_query": "oom_events",
+                        },
+                    )
+                )
+
+        # Sprawdź i915 GPU HANG — dedykowane zapytanie z dokładnym markerem
+        if gpu_i915_hang_result.is_ok() and gpu_i915_hang_result.stdout.strip():
+            hang_lines = gpu_i915_hang_result.stdout.split("\n")
+            hang_matching = [
+                line
+                for line in hang_lines
+                if re.search(RE_GPU_I915_HANG, line, re.IGNORECASE)
+            ]
+            if hang_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="GPU-I915-HANG-001",
+                        category="gpu_i915_hang",
+                        payload={
+                            "hang_detected": True,
+                            "matched_lines": hang_matching[:20],
+                            "match_count": len(hang_matching),
+                            "driver": "i915",
+                            "driver_attribution_source": "in_message",
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "gpu_i915_hang",
                         },
                     )
                 )
@@ -3160,6 +3318,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="KERNEL-OOM-001",
                 category="oom_event",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=True,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "gpu_i915_hang":
+            return Observation(
+                obs_id="GPU-I915-HANG-001",
+                category="gpu_i915_hang",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=True,
