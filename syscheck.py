@@ -52,6 +52,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_FIRMWARE,
     RE_GFX_ERROR,
     RE_KERNEL_ERROR,
+    RE_OOM,
     RE_SEGFAULT,
     SCRIPT_VERSION,
     SEGFAULT_ALERT_THRESHOLD,
@@ -134,6 +135,7 @@ class FindingKind(str, Enum):
     SEGFAULT = "segfault"
     KERNEL_COUNT = "kernel_count"
     KERNEL_TAINT = "kernel_taint"
+    OOM_EVENT = "oom_event"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -590,6 +592,34 @@ def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
     return results
 
 
+def _oom_collector_command(upstream_cmd: str, regex: str) -> List[str]:
+    """Build the OOM collector bash command with safe PIPESTATUS handling.
+
+    Args:
+        upstream_cmd: The upstream command that produces journal output
+                      (e.g. ``journalctl -b -k --no-pager 2>/dev/null``).
+        regex: The grep -iE pattern to match against.
+
+    Returns:
+        A ``["bash", "-c", "..."]`` list suitable for ``_parallel_cmd``.
+
+    The captured PIPESTATUS array is read atomically so that the
+    ``journalctl`` exit status and ``grep`` exit status are both
+    preserved regardless of bash version.
+    """
+    return [
+        "bash",
+        "-c",
+        f"{upstream_cmd} | "
+        f"grep -iE '{regex}'; "
+        'statuses=("${PIPESTATUS[@]}"); '
+        "js=${statuses[0]}; gs=${statuses[1]}; "
+        'if [ "$js" -ne 0 ]; then exit "$js"; '
+        'elif [ "$gs" -eq 1 ]; then exit 0; '
+        'else exit "$gs"; fi',
+    ]
+
+
 # ──────────────────────────────────────────────────────────────────
 # Silnik diagnostyczny
 # ──────────────────────────────────────────────────────────────────
@@ -664,6 +694,12 @@ class FindingClassificationPolicy:
             FindingKind.BOOT_DELAY,
             Actionability.CONDITIONAL,
             RecommendationIntent.MONITOR,
+        ),
+        "oom_event": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.OOM_EVENT,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
         ),
     }
 
@@ -1033,6 +1069,42 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "oom_event":
+            # Derive quality from observation flags
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+            if observation.inference_required:
+                directness = EvidenceDirectness.INFERRED
+            if observation.contradictory_evidence:
+                strength = EvidenceStrength.MODERATE
+
+            count = d.get("match_count", 0)
+            summary = (
+                f"OOM killer invoked during current boot "
+                f"({count} matching journal line(s))"
+            )
+
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=summary,
+                data={
+                    "oom_detected": d.get("oom_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "match_classes": d.get("match_classes", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "oom_events"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1328,6 +1400,78 @@ class KernelTaintRule(DiagnosticRule):
                 remediation="Rozważ przejście na otwarte sterowniki.",
                 verification="`cat /proc/sys/kernel/tainted` — 0",
                 risk_level="Niskie. Informacja, nie awaria.",
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class KernelOomRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-OOM"
+    supported_categories = frozenset({"oom_event"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        conf = derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        return DiagnosticRuleResult(
+            finding=Finding(
+                finding_id=obs_id,
+                title="Wykryto zdarzenie OOM (Out of Memory) w bieżącym bocie",
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Jądro zgłosiło brak pamięci i uruchomiło OOM killer. "
+                    "Proces(y) zostały zabite w celu odzyskania pamięci. "
+                    "Diagnostyka nie określa przyczyny — może to być "
+                    "niewystarczająca ilość RAM-u, brak/zbyt mały swap, "
+                    "wyciek pamięci aplikacji, ograniczenie cgroup, "
+                    "anormalne obciążenie lub konfiguracja.\n\n"
+                    "Uwaga: diagnostyka wykrywa obecność zdarzenia OOM "
+                    "w dzienniku bieżącego bota. Nie potwierdza ani nie "
+                    "zaprzecza trwającej presji pamięci. Zdarzenia OOM "
+                    "mogły zostać pominięte jeśli zostały usunięte z "
+                    "dziennika przed uruchomieniem diagnostyki."
+                ),
+                recommended_diagnostics=(
+                    "Sprawdź bieżące użycie pamięci: `free -h`\n"
+                    "Sprawdź swap: `swapon --show`\n"
+                    "Sprawdź procesy według zużycia pamięci: "
+                    "`ps aux --sort=-%mem | head -20`"
+                ),
+                remediation=(
+                    "Jeśli problem jest powtarzalny: zwiększ swap, "
+                    "dodaj więcej RAM, zidentyfikuj wyciek pamięci, "
+                    "lub ogranicz obciążenie."
+                ),
+                verification=(
+                    "Sprawdź bieżące użycie pamięci komendą `free -h` — "
+                    "czy dostępna pamięć nie jest zbyt niska.\n"
+                    "Sprawdź swap: `swapon --show` — czy swap jest "
+                    "włączony i ma odpowiedni rozmiar.\n"
+                    "Po podjęciu działań naprawczych monitoruj dziennik "
+                    "w kolejnym bocie: `journalctl -b -k --grep='oom'`."
+                ),
+                risk_level=(
+                    "Umiarkowane. OOM wskazuje na wyczerpanie pamięci; "
+                    "nieleczona przyczyna może prowadzić do dalszych "
+                    "problemów stabilności."
+                ),
                 domain=classification.domain,
                 kind=classification.kind,
                 actionability=classification.actionability,
@@ -1642,6 +1786,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         GeneralSegfaultRule(eb),
         MinorSegfaultRule(eb),
         KernelTaintRule(eb),
+        KernelOomRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
@@ -2147,6 +2292,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "oom_events": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_OOM,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2156,6 +2309,7 @@ class SysCheckEngine:
         kernel_errors_result = r["kernel_errors"]
         segfaults_result = r["segfaults"]
         firmware_msgs_result = r["firmware_msgs"]
+        oom_events_result = r["oom_events"]
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2264,6 +2418,49 @@ class SysCheckEngine:
                     payload={"tainted": True},
                 )
             )
+
+        # Sprawdź OOM — dedykowane zapytanie z dokładnymi markerami
+        if oom_events_result.is_ok() and oom_events_result.stdout.strip():
+            oom_lines = oom_events_result.stdout.split("\n")
+            oom_matching = [
+                line
+                for line in oom_lines
+                if re.search(RE_OOM, line, re.IGNORECASE)
+                and "memory cgroup" not in line.lower()
+            ]
+            if oom_matching:
+                # Klasyfikuj dopasowane linie
+                all_classes = []
+                for ml in oom_matching:
+                    ml_lower = ml.lower()
+                    if "invoked oom-killer" in ml_lower:
+                        all_classes.append("oom_invocation")
+                    if "oom-killer:" in ml_lower:
+                        all_classes.append("oom_killer_marker")
+                    if "out of memory: killed process" in ml_lower:
+                        all_classes.append("oom_kill_outcome")
+                # Deduplikuj klasy, zachowując kolejność pierwszego wystąpienia
+                seen_classes = set()
+                match_classes = []
+                for cls in all_classes:
+                    if cls not in seen_classes:
+                        seen_classes.add(cls)
+                        match_classes.append(cls)
+
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-OOM-001",
+                        category="oom_event",
+                        payload={
+                            "oom_detected": True,
+                            "matched_lines": oom_matching[:20],
+                            "match_count": len(oom_matching),
+                            "match_classes": match_classes,
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "oom_events",
+                        },
+                    )
+                )
 
     # ── Raport: Systemd ──────────────────────────────────────────
     def collect_systemd(self) -> None:
@@ -2952,6 +3149,18 @@ class SysCheckEngine:
                     "usage_percent": payload.get("usage_percent", 0),
                     "threshold_state": state,
                 },
+                direct_measurement=True,
+                data_complete=True,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "oom_event":
+            return Observation(
+                obs_id="KERNEL-OOM-001",
+                category="oom_event",
+                details={**payload},
                 direct_measurement=True,
                 data_complete=True,
                 contradictory_evidence=False,

@@ -7,6 +7,7 @@ Uruchom:
 
 import os
 import re
+import subprocess
 import sys
 
 import pytest
@@ -29,6 +30,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
     _get_bootable_kernels_from_modules,
+    _oom_collector_command,
     _parse_storage_usage,
     confidence_tag,
     severity_tag,
@@ -5577,6 +5579,7 @@ class TestSegfaultAndTaintCollectorPath:
             "kernel_errors": self._cmd_ok(""),
             "segfaults": self._cmd_ok(""),
             "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -5983,3 +5986,469 @@ class TestSensorsCollectorPath:
             if "sensor" in r.category.lower() or "temp" in r.category.lower()
         ]
         assert len(sensor_raws) == 0
+
+
+class TestOomCollectorPath:
+    """Collector-path and pipeline tests for KERNEL-OOM-001 (Iteration 27)."""
+
+    @staticmethod
+    def _cmd_ok(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    @staticmethod
+    def _cmd_error(
+        execution_status: str = "error",
+        return_code: int = 1,
+    ) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout="",
+            stderr="",
+            return_code=return_code,
+            execution_status=execution_status,
+        )
+
+    def _collect_with_mock(self, engine, **overrides):
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd_ok("0"),
+            "kernel_errors": self._cmd_ok(""),
+            "segfaults": self._cmd_ok(""),
+            "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
+            "lspci": self._cmd_ok(""),
+            "lsusb": self._cmd_ok(""),
+        }
+        results.update(overrides)
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _make_oom_line(variant: str, extra: str = "") -> str:
+        """Create a kernel OOM journal line for testing."""
+        lines = {
+            "invocation": (
+                "lip 27 10:00:00 host kernel: mysqld invoked oom-killer: "
+                "gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0"
+            ),
+            "killer_marker": (
+                "lip 27 10:00:00 host kernel: oom-killer: constraining "
+                "constraint at zone Normal"
+            ),
+            "outcome": (
+                "lip 27 10:00:01 host kernel: Out of memory: Killed process "
+                "1234 (mysqld) total-vm:1234567kB, anon-rss:123456kB, "
+                "file-rss:0kB, shmem-rss:0kB, UID:0"
+            ),
+        }
+        base = lines.get(variant, variant)
+        if extra:
+            return base + extra
+        return base
+
+    # ── Positive triggers ────────────────────────────────────────
+
+    def test_oom_invocation_triggers(self):
+        """'invoked oom-killer' produces KERNEL-OOM-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(self._make_oom_line("invocation")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("oom_detected") is True
+        assert "oom_invocation" in raws[0].payload.get("match_classes", [])
+
+    def test_oom_killer_marker_triggers(self):
+        """'oom-killer:' produces KERNEL-OOM-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(self._make_oom_line("killer_marker")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        assert "oom_killer_marker" in raws[0].payload.get("match_classes", [])
+
+    def test_oom_kill_outcome_triggers(self):
+        """'Out of memory: Killed process' produces KERNEL-OOM-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(self._make_oom_line("outcome")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        assert "oom_kill_outcome" in raws[0].payload.get("match_classes", [])
+
+    # ── Negative cases (should NOT trigger) ──────────────────────
+
+    def test_ordinary_kernel_errors_no_trigger(self):
+        """Ordinary kernel errors (BUG, lockup, error) do not trigger OOM diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: BUG: unable to handle kernel NULL pointer dereference\n"
+                "kernel: watchdog: BUG: soft lockup\n"
+                "kernel: mce: [Hardware Error]: Machine check events logged"
+            ),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_empty_output_no_trigger(self):
+        """Empty successful oom_events output produces no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(""),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_incidental_oom_substrings_no_trigger(self):
+        """Incidental words containing 'oom' (bloom, doom, room) do not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: bloom_filter: hash table full\n"
+                "kernel: doom_ring: processing interrupts\n"
+                "kernel: room_for_grow: expanding cache\n"
+            ),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_systemd_oomd_no_trigger(self):
+        """systemd-oomd text in oom_events does not trigger (should never appear in -k)."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: systemd-oomd: Memory pressure relief triggered"
+            ),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_memcg_oom_no_trigger(self):
+        """Memcg OOM line does not trigger the global OOM diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: Memory cgroup out of memory: Killed process 5678 (java)"
+            ),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_oom_reaper_alone_no_trigger(self):
+        """oom_reaper alone (without OOM markers) does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: oom_reaper: reaped process 1234 (mysqld), now anon-rss:0kB"
+            ),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    # ── Deduplication and payload ────────────────────────────────
+
+    def test_multiple_matching_lines_one_diagnostic(self):
+        """Multiple matching OOM lines produce exactly one KERNEL-OOM-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        lines = "\n".join(
+            [
+                self._make_oom_line("invocation"),
+                self._make_oom_line("killer_marker"),
+                self._make_oom_line("outcome"),
+            ]
+        )
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(lines),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("match_count") == 3
+        assert len(raws[0].payload.get("matched_lines", [])) == 3
+
+    def test_payload_preserves_provenance(self):
+        """Payload preserves matched lines, count, classes, scope, and source query."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(self._make_oom_line("invocation")),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        p = raws[0].payload
+        assert p.get("oom_detected") is True
+        assert len(p.get("matched_lines", [])) == 1
+        assert p.get("match_count") == 1
+        assert p.get("journal_scope") == "current_boot_kernel"
+        assert p.get("source_query") == "oom_events"
+        # match_classes should be a non-empty list
+        assert isinstance(p.get("match_classes"), list)
+        assert len(p["match_classes"]) > 0
+
+    def test_matched_lines_capped_at_20(self):
+        """More than 20 matching lines are capped in payload while count remains accurate."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        lines = "\n".join(
+            [self._make_oom_line("invocation", extra=f" extra={i}") for i in range(25)]
+        )
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(lines),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 1
+        assert raws[0].payload.get("match_count") == 25
+        assert len(raws[0].payload.get("matched_lines", [])) == 20
+
+    # ── Command failure handling ────────────────────────────────
+
+    def test_command_failure_no_trigger(self):
+        """Command failure (execution_status=error) produces no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_error(execution_status="error", return_code=1),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    def test_timeout_no_trigger(self):
+        """Command timeout produces no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_coll")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_error(execution_status="timeout", return_code=-2),
+        )
+        raws = [r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"]
+        assert len(raws) == 0
+
+    # ── Pipeline integration ─────────────────────────────────────
+
+    def test_observation_mapping(self):
+        """RawDiagnostic routes through _raw_to_observation correctly."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="KERNEL-OOM-001",
+                category="oom_event",
+                payload={
+                    "oom_detected": True,
+                    "matched_lines": ["kernel: OOM invoked"],
+                    "match_count": 1,
+                    "match_classes": ["oom_invocation"],
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "oom_events",
+                },
+            )
+        ]
+        engine._derive_observations()
+        assert len(engine.observations) == 1
+        obs = engine.observations[0]
+        assert obs.obs_id == "KERNEL-OOM-001"
+        assert obs.category == "oom_event"
+        assert obs.direct_measurement is True
+        assert obs.data_complete is True
+        assert obs.inference_required is False
+
+    def test_evidence_journal_event_type(self):
+        """Evidence produced for oom_event uses JOURNAL_EVENT type."""
+        from syscheck import EvidenceType
+
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="KERNEL-OOM-001",
+                category="oom_event",
+                payload={
+                    "oom_detected": True,
+                    "matched_lines": ["kernel: OOM invoked"],
+                    "match_count": 1,
+                    "match_classes": ["oom_invocation"],
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "oom_events",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        oom_evidence = [
+            e
+            for e in engine.evidence_objects
+            if e.evidence_type == EvidenceType.JOURNAL_EVENT and "OOM" in e.summary
+        ]
+        assert len(oom_evidence) >= 1
+        data = oom_evidence[0].data
+        assert data.get("oom_detected") is True
+        assert data.get("journal_scope") == "current_boot_kernel"
+        assert data.get("source_query") == "oom_events"
+
+    def test_finding_oom_event_kind(self):
+        """Finding uses OOM_EVENT kind, KERNEL domain, P2 severity, Certain confidence."""
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="KERNEL-OOM-001",
+                category="oom_event",
+                payload={
+                    "oom_detected": True,
+                    "matched_lines": ["kernel: OOM invoked"],
+                    "match_count": 1,
+                    "match_classes": ["oom_invocation"],
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "oom_events",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        oom_findings = [f for f in engine.findings if f.finding_id == "KERNEL-OOM-001"]
+        assert len(oom_findings) == 1
+        f = oom_findings[0]
+        assert f.kind == FindingKind.OOM_EVENT
+        assert f.domain == DiagnosticDomain.KERNEL
+        assert f.severity == "P2"
+        assert f.confidence == "Certain"
+
+    def test_rule_registered(self):
+        """KernelOomRule is registered in the default rule engine."""
+        from syscheck import build_default_rule_engine
+
+        engine_instance = build_default_rule_engine()
+        # The rule engine has _registry with rules; check that one supports oom_event
+        assert any(
+            hasattr(r, "rule_id") and r.rule_id == "RULE-KERNEL-OOM"
+            for r in engine_instance._registry.rules
+        )
+
+    # ── Regression ──────────────────────────────────────────────
+
+    def test_existing_segfault_unchanged(self):
+        """Adding oom_events to mock does not break existing segfault detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_regr")
+        segfaults = "\n".join(
+            [
+                "lip 27 08:09:51 host kernel: wireplumber[1274]: segfault at 0 "
+                "ip 7f2c9743a55c sp 7fff981984c8 error 4 in libspa-libcamera.so"
+                "[13155c,7f2c97382000+f0000] likely on CPU 0",
+                "lip 27 08:09:52 host kernel: wireplumber[1387]: segfault at 0 "
+                "ip 7f3f5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f3f5cda8000+f0000] likely on CPU 0",
+                "lip 27 08:09:53 host kernel: wireplumber[1400]: segfault at 0 "
+                "ip 7f4a5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f4a5cda8000+f0000] likely on CPU 0",
+            ]
+        )
+        # Use existing helpers from TestSegfaultAndTaintCollectorPath
+        self._collect_with_mock(
+            engine,
+            segfaults=self._cmd_ok(segfaults),
+            oom_events=self._cmd_ok(""),
+        )
+        wp_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
+        ]
+        assert len(wp_raws) == 1
+        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
+
+    def test_existing_taint_unchanged(self):
+        """Adding oom_events to mock does not break existing taint detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_oom_regr")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: CPU: 0 PID: 1 Comm: swapper Tainted: P        "
+            ),
+            oom_events=self._cmd_ok(""),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 1
+        assert taint_raws[0].payload.get("tainted") is True
+
+
+class TestOomCommandStatus:
+    """Direct shell-level tests for _oom_collector_command status logic."""
+
+    # ── tests ─────────────────────────────────────────────────
+
+    def test_match_success(self):
+        """grep finds a match → exit 0, stdout contains the line."""
+        cmd = _oom_collector_command(
+            "printf 'Dec 25 10:00:00 host kernel: invoked oom-killer: gfp_mask=...'",
+            r"invoked oom-killer|oom-killer:|Out of memory: Killed process",
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"invoked oom-killer" in cp.stdout
+
+    def test_no_match(self):
+        """grep finds nothing → exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'something harmless'",
+            r"invoked oom-killer|oom-killer:|Out of memory: Killed process",
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_upstream_failure(self):
+        """journalctl fails (rc=42) → exit 42."""
+        cmd = _oom_collector_command(
+            "bash -c 'printf log; exit 42'",
+            r"invoked oom-killer|oom-killer:|Out of memory: Killed process",
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 42
+
+    def test_grep_rc2_propagated(self):
+        """grep exits with rc=2 (invalid regex) → propagated as-is."""
+        cmd = _oom_collector_command(
+            "printf 'test'",
+            r"invalid[",  # malformed character class → grep exits 2
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 2, (
+            f"Expected rc=2 for grep invalid regex, got {cp.returncode}"
+        )
+
+    def test_stderr_suppressed_preserves_status(self):
+        """journalctl stderr redirection does not mask exit status."""
+        cmd = _oom_collector_command(
+            "bash -c 'echo log >&2; exit 0'",
+            r"invoked oom-killer|oom-killer:|Out of memory: Killed process",
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+
+    def test_zero_length_input_no_match(self):
+        """Empty journalctl output → exit 0, no match."""
+        cmd = _oom_collector_command(
+            "printf ''",
+            r"invoked oom-killer|oom-killer:|Out of memory: Killed process",
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
