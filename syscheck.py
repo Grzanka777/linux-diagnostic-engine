@@ -2257,10 +2257,10 @@ class SysCheckEngine:
                 )
             )
 
-        # Sprawdź taint
-        if (
-            kernel_errors_result.is_ok()
-            and "taint" in kernel_errors_result.stdout.lower()
+        # Sprawdź taint — używamy precyzyjnego wzorca 'Tainted:' zamiast
+        # substring match by uniknąć false positives na 'Not tainted' itp.
+        if kernel_errors_result.is_ok() and re.search(
+            r"\bTainted:\s", kernel_errors_result.stdout, re.IGNORECASE
         ):
             self.raw_diagnostics.append(
                 RawDiagnostic(

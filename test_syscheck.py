@@ -5781,19 +5781,118 @@ class TestSegfaultAndTaintCollectorPath:
         assert taint_raws[0].payload.get("tainted") is True
 
     def test_kernel_no_taint(self):
-        """No taint signal in kernel log produces no KERNEL-TAINT-001.
-
-        Note: The production taint check uses substring match 'taint' in
-        stdout.lower(), which can false-fire on 'Not tainted' messages.
-        This test uses output that does not contain 'taint' at all.
-        A future fix should use a more precise pattern to exclude
-        'Not tainted' entries.
-        """
+        """No taint signal in kernel log produces no KERNEL-TAINT-001."""
         engine = SysCheckEngine(output_dir="/tmp/test_taint_coll")
         self._collect_with_mock(
             engine,
             kernel_errors=self._cmd_ok("kernel: CPU: 0 PID: 1 Comm: swapper Clean"),
         )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 0
+
+    # ── KERNEL-TAINT-001 regression tests (Iteration 25) ─────────
+
+    def test_taint_not_tainted_negative(self):
+        """'Not tainted' produces no KERNEL-TAINT-001 (false-positive regression)."""
+        engine = SysCheckEngine(output_dir="/tmp/test_taint_coll")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: CPU: 0 PID: 1 Comm: swapper Not tainted"
+            ),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 0
+
+    def test_taint_kernel_is_not_tainted_negative(self):
+        """'Kernel is not tainted' produces no KERNEL-TAINT-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_taint_coll")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok("kernel: Kernel is not tainted"),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 0
+
+    def test_taint_untainted_negative(self):
+        """'untainted' (incidental substring) produces no KERNEL-TAINT-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_taint_coll")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok("kernel: filesystem was untainted after reboot"),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 0
+
+    def test_taint_multiple_positive_no_duplicate(self):
+        """Multiple 'Tainted:' lines produce exactly one KERNEL-TAINT-001 (no duplicate)."""
+        engine = SysCheckEngine(output_dir="/tmp/test_taint_coll")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: Tainted: G        W\n"
+                "kernel: CPU: 4 PID: 123 Comm: foo Tainted: P           OE\n"
+            ),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 1
+        assert taint_raws[0].payload.get("tainted") is True
+
+    def test_segfault_branches_unaffected_by_taint_change(self):
+        """Existing segfault branches remain unaffected by taint fix.
+
+        WirePlumber segfaults still segfault-WP, not taint.
+        Uses 3 segfaults with distinct IPs to meet SEGFAULT_ALERT_THRESHOLD (>=3).
+        """
+        engine = SysCheckEngine(output_dir="/tmp/test_segfault_coll")
+        segfaults = "\n".join(
+            [
+                self._make_segfault_line(
+                    "wireplumber",
+                    "libspa-libcamera.so",
+                    1274,
+                    ip_hex="7f2c9743a55c",
+                    base_hex="7f2c97382000",
+                ),
+                self._make_segfault_line(
+                    "wireplumber",
+                    "libspa-libcamera.so",
+                    1387,
+                    ip_hex="7f3f5ce6055c",
+                    base_hex="7f3f5cda8000",
+                ),
+                self._make_segfault_line(
+                    "wireplumber",
+                    "libspa-libcamera.so",
+                    1400,
+                    ip_hex="7f4a5ce6055c",
+                    base_hex="7f4a5cda8000",
+                ),
+            ]
+        )
+        # Include a 'Not tainted' line in kernel_errors to verify no cross-contamination
+        self._collect_with_mock(
+            engine,
+            segfaults=self._cmd_ok(segfaults),
+            kernel_errors=self._cmd_ok("kernel: Not tainted"),
+        )
+        # Segfault branches unchanged
+        wp_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
+        ]
+        assert len(wp_raws) == 1
+        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
+        # Taint not triggered by 'Not tainted'
         taint_raws = [
             r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
         ]
