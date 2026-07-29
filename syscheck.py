@@ -1968,11 +1968,6 @@ class SysCheckEngine:
                 f"(wartości poniżej {INVALID_TEMPERATURE_CELSIUS}°C - niepodłączone czujniki).\n\n"
             )
 
-        if "crit=" in sensors_raw:
-            self.report_lines.append(
-                "⚠️ Wykryto krytyczne limity temperatur w sensors.\n\n"
-            )
-
     # ── Raport: Dyski, NVMe, Btrfs ───────────────────────────────
     def collect_storage(self) -> None:
         self.log_section("Dyski, NVMe, Btrfs")

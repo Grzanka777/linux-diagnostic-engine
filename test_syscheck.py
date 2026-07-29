@@ -5897,3 +5897,89 @@ class TestSegfaultAndTaintCollectorPath:
             r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
         ]
         assert len(taint_raws) == 0
+
+
+class TestSensorsCollectorPath:
+    """Collector-path tests for sensors display and crit= warning removal (Iteration 26).
+
+    Verifies that the misleading ``crit=`` warning has been removed while
+    sensors display and invalid-temperature filtering remain intact.
+    """
+
+    def _collect_with_mock(self, engine, sensors_raw=""):
+        """Run collect_resources with mocked _parallel returning controlled sensors output."""
+        from unittest.mock import patch
+
+        results = {
+            "lscpu": "",
+            "free_h": "",
+            "zramctl": "",
+            "loadavg": "",
+            "governor": "",
+            "ps_cpu": "",
+            "ps_mem": "",
+            "sensors": sensors_raw,
+        }
+        with patch.object(SysCheckEngine, "_parallel", return_value=results):
+            engine.collect_resources()
+
+    @staticmethod
+    def _report_text(engine):
+        """Return concatenated report lines as a single string."""
+        return "\n".join(engine.report_lines)
+
+    def test_sensors_with_crit_still_displayed(self):
+        """Sensors output containing crit= definition remains present in the report."""
+        engine = SysCheckEngine(output_dir="/tmp/test_sensors_coll")
+        sensors = (
+            "coretemp-isa-0000\n"
+            "Package id 0:  +52.0\u00b0C  (high = +100.0\u00b0C, crit = +100.0\u00b0C)\n"
+            "Core 0:        +42.0\u00b0C\n"
+        )
+        self._collect_with_mock(engine, sensors_raw=sensors)
+        report = self._report_text(engine)
+        assert "+52.0" in report
+        assert "+42.0" in report
+
+    def test_misleading_crit_warning_absent(self):
+        """The misleading 'Wykryto krytyczne limity' warning is no longer emitted."""
+        engine = SysCheckEngine(output_dir="/tmp/test_sensors_coll")
+        sensors = (
+            "coretemp-isa-0000\n"
+            "Package id 0:  +52.0\u00b0C  (high = +100.0\u00b0C, crit = +100.0\u00b0C)\n"
+        )
+        self._collect_with_mock(engine, sensors_raw=sensors)
+        report = self._report_text(engine)
+        assert "krytyczne limity" not in report
+
+    def test_invalid_readings_still_filtered(self):
+        """Invalid -273.3\u00b0C readings are still removed by _filter_invalid_temperatures."""
+        engine = SysCheckEngine(output_dir="/tmp/test_sensors_coll")
+        sensors = (
+            "acpitz-acpi-0\ntemp1:       -273.3\u00b0C\ntemp2:        +27.8\u00b0C\n"
+        )
+        self._collect_with_mock(engine, sensors_raw=sensors)
+        report = self._report_text(engine)
+        assert "-273.3" not in report
+        assert "+27.8" in report
+        assert "Pomini\u0119to" in report
+
+    def test_valid_readings_remain_visible(self):
+        """Normal temperature readings remain in the report."""
+        engine = SysCheckEngine(output_dir="/tmp/test_sensors_coll")
+        sensors = "temp1: +25.0\u00b0C\n"
+        self._collect_with_mock(engine, sensors_raw=sensors)
+        report = self._report_text(engine)
+        assert "+25.0" in report
+
+    def test_no_raw_diagnostic_from_sensors(self):
+        """No RawDiagnostic is created from sensors output."""
+        engine = SysCheckEngine(output_dir="/tmp/test_sensors_coll")
+        sensors = "temp1: +25.0\u00b0C\n"
+        self._collect_with_mock(engine, sensors_raw=sensors)
+        sensor_raws = [
+            r
+            for r in engine.raw_diagnostics
+            if "sensor" in r.category.lower() or "temp" in r.category.lower()
+        ]
+        assert len(sensor_raws) == 0
