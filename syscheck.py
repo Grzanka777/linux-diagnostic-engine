@@ -54,6 +54,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_KERNEL_ERROR,
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
+    RE_NVIDIA_XID_79,
     RE_OOM,
     RE_SEGFAULT,
     SCRIPT_VERSION,
@@ -140,6 +141,7 @@ class FindingKind(str, Enum):
     OOM_EVENT = "oom_event"
     GPU_I915_HANG = "gpu_i915_hang"
     AMDGPU_RESET_FAIL = "amdgpu_reset_fail"
+    GPU_NVIDIA_XID_79 = "gpu_nvidia_xid_79"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -717,6 +719,12 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
+        "gpu_nvidia_xid_79": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.GPU_NVIDIA_XID_79,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
     }
 
     _SEGFAULT_WP = FindingClassification(
@@ -1192,6 +1200,45 @@ class EvidenceBuilder:
                     ),
                     "journal_scope": d.get("journal_scope", "current_boot_kernel"),
                     "source_query": d.get("source_query", "amdgpu_reset_fail"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "gpu_nvidia_xid_79":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+            if observation.inference_required:
+                directness = EvidenceDirectness.INFERRED
+            if observation.contradictory_evidence:
+                strength = EvidenceStrength.MODERATE
+
+            count = d.get("match_count", 0)
+            summary = (
+                f"NVIDIA Xid 79 event detected during current boot "
+                f"({count} matching journal line(s))"
+            )
+
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=summary,
+                data={
+                    "xid_detected": d.get("xid_detected", False),
+                    "xid_code": d.get("xid_code", 0),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "driver": d.get("driver", "nvidia"),
+                    "driver_attribution_source": d.get(
+                        "driver_attribution_source", "in_message"
+                    ),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "gpu_nvidia_xid_79"),
                 },
                 strength=strength,
                 directness=directness,
@@ -1736,6 +1783,93 @@ class AmdgpuResetFailRule(DiagnosticRule):
         )
 
 
+class GpuNvidiaXid79Rule(DiagnosticRule):
+    rule_id = "RULE-GPU-NVIDIA-XID-79"
+    supported_categories = frozenset({"gpu_nvidia_xid_79"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        conf = derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        return DiagnosticRuleResult(
+            finding=Finding(
+                finding_id=obs_id,
+                title=(
+                    "Wykryto zdarzenie NVIDIA Xid 79 "
+                    "— utrata połączenia GPU z magistralą"
+                ),
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Dziennik jądra odnotował zdarzenie "
+                    "NVIDIA Xid 79 w bieżącym bocie. "
+                    "Zdarzenie mogło mieć charakter historyczny "
+                    "i może nie być już aktywne. "
+                    "Diagnostyka nie potwierdza defektu sprzętowego, "
+                    "nie potwierdza aktualnej niedostępności GPU, "
+                    "ani nie określa, czy dotknięte GPU "
+                    "było aktywnym rendererem.\n\n"
+                    "Xid 79 wskazuje na utratę połączenia GPU z magistralą PCIe. "
+                    "Możliwe konteksty zdarzenia obejmują: "
+                    "spontaniczną utratę PCIe/zasilania, "
+                    "celowe odłączenie eGPU, "
+                    "niepełną reinicjalizację po zawieszeniu/resume, "
+                    "lub interakcję sterownika z firmware/platformą. "
+                    "SysCheck nie rozróżnia tych przyczyn "
+                    "na podstawie pojedynczej linii zdarzenia.\n\n"
+                    "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
+                    "że nie wystąpiło — "
+                    "retencja dziennika jądra może być niepełna."
+                ),
+                recommended_diagnostics=(
+                    "Sprawdź aktualny dziennik jądra: "
+                    "`journalctl -b -k --no-pager | grep -iE 'Xid'`\n"
+                    "Sprawdź wersję jądra: `uname -r`\n"
+                    "Sprawdź sterownik GPU: `lspci -k`\n"
+                    "Sprawdź, czy GPU jest eGPU, które zostało celowo odłączone.\n"
+                    "Sprawdź, czy zdarzenie powtarza się w kolejnych bootach.\n"
+                    "Zachowaj dokładną linię Xid do analizy."
+                ),
+                remediation=(
+                    "Jeśli problem jest powtarzalny bez znanej przyczyny: "
+                    "porównaj zachowanie na innym wspieranym jądrze, "
+                    "przejrzyj ostatnie zmiany sterownika NVIDIA, "
+                    "sprawdź kontekst PCIe/zasilania/termiczny jako hipotezy, "
+                    "zachowaj dokładne linie zdarzenia do zgłoszenia problemu."
+                ),
+                verification=(
+                    "Sprawdź, czy system jest obecnie responsywny.\n"
+                    "Monitoruj, czy nowe zdarzenia Xid występują: "
+                    "`journalctl -b -k | grep -iE 'Xid'`.\n"
+                    "Po podjęciu działań sprawdź w kolejnym bocie, "
+                    "czy znacznik nadal występuje."
+                ),
+                risk_level=(
+                    "Średnie. Zdarzenie Xid 79 może wskazywać na "
+                    "niestabilność połączenia GPU; nieleczona przyczyna "
+                    "może prowadzić do dalszych problemów."
+                ),
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class FailedSystemUnitRule(DiagnosticRule):
     rule_id = "RULE-SYSTEMD-FAILED-SYSTEM"
     supported_categories = frozenset({"systemd_failed"})
@@ -2042,6 +2176,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         KernelOomRule(eb),
         GpuI915HangRule(eb),
         AmdgpuResetFailRule(eb),
+        GpuNvidiaXid79Rule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
@@ -2571,6 +2706,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "gpu_nvidia_xid_79": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_NVIDIA_XID_79,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2583,6 +2726,7 @@ class SysCheckEngine:
         oom_events_result = r["oom_events"]
         gpu_i915_hang_result = r["gpu_i915_hang"]
         amdgpu_reset_fail_result = r["amdgpu_reset_fail"]
+        gpu_nvidia_xid_79_result = r["gpu_nvidia_xid_79"]
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2781,6 +2925,32 @@ class SysCheckEngine:
                             "driver_attribution_source": "in_message",
                             "journal_scope": "current_boot_kernel",
                             "source_query": "amdgpu_reset_fail",
+                        },
+                    )
+                )
+
+        # Sprawdź NVIDIA Xid 79 — dedykowane zapytanie z dokładnym kodem
+        if gpu_nvidia_xid_79_result.is_ok() and gpu_nvidia_xid_79_result.stdout.strip():
+            xid79_lines = gpu_nvidia_xid_79_result.stdout.split("\n")
+            xid79_matching = [
+                line
+                for line in xid79_lines
+                if re.search(RE_NVIDIA_XID_79, line, re.IGNORECASE)
+            ]
+            if xid79_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="GPU-NVIDIA-XID-79-001",
+                        category="gpu_nvidia_xid_79",
+                        payload={
+                            "xid_detected": True,
+                            "xid_code": 79,
+                            "matched_lines": xid79_matching[:20],
+                            "match_count": len(xid79_matching),
+                            "driver": "nvidia",
+                            "driver_attribution_source": "in_message",
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "gpu_nvidia_xid_79",
                         },
                     )
                 )
@@ -3507,6 +3677,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="AMDGPU-RESET-FAIL-001",
                 category="amdgpu_reset_fail",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=True,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "gpu_nvidia_xid_79":
+            return Observation(
+                obs_id="GPU-NVIDIA-XID-79-001",
+                category="gpu_nvidia_xid_79",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=True,

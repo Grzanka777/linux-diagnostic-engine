@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
+    RE_NVIDIA_XID_79,
     CmdResult,
     Finding,
     Observation,
@@ -5584,6 +5585,7 @@ class TestSegfaultAndTaintCollectorPath:
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
             "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6029,6 +6031,7 @@ class TestOomCollectorPath:
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
             "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -6562,6 +6565,7 @@ class TestGpuI915HangCollectorPath:
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
             "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -7094,6 +7098,7 @@ class TestAmdgpuResetFailCollectorPath:
             "oom_events": self._cmd_ok(""),
             "gpu_i915_hang": self._cmd_ok(""),
             "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
             "lspci": self._cmd_ok(""),
             "lsusb": self._cmd_ok(""),
         }
@@ -7786,3 +7791,812 @@ class TestAmdgpuResetFailCollectorPath:
         ]
         assert len(taint_raws) == 1
         assert taint_raws[0].payload.get("tainted") is True
+
+
+class TestNvidiaXid79CommandStatus:
+    """Direct shell-level tests for _oom_collector_command with NVIDIA Xid 79 regex."""
+
+    def test_match_success_nvidia_prefix(self):
+        """'nvidia: Xid (PCI:...): 79' match -> exit 0."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "nvidia: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"79" in cp.stdout
+
+    def test_match_success_nvrm_prefix(self):
+        """'NVRM: Xid (PCI:...): 79' match -> exit 0."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"79" in cp.stdout
+
+    def test_match_pci_with_dot_zero(self):
+        """PCI address with '.0' suffix still matches."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00.0): 79, GPU has fallen off the bus.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert b"79" in cp.stdout
+
+    def test_no_match_other_xid(self):
+        """Xid 13 should NOT match -> exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 13, Graphics Engine Exception.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_no_match_xid_179(self):
+        """Xid 179 should NOT match -> exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 179, some error.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_no_match_xid_790(self):
+        """Xid 790 should NOT match -> exit 0, empty stdout."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 790, some error.'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_no_match_unrelated_79(self):
+        "79 not as Xid code should NOT match."
+        cmd = _oom_collector_command(
+            "printf 'some kernel message with 79 somewhere'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    def test_upstream_failure(self):
+        """journalctl fails (rc=42) -> exit 42."""
+        cmd = _oom_collector_command(
+            "bash -c 'printf log; exit 42'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 42
+
+    def test_grep_rc2_propagated(self):
+        """grep exits with rc=2 (invalid regex) -> propagated as-is."""
+        cmd = _oom_collector_command("printf 'test'", r"invalid[")
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 2
+
+    def test_stderr_suppressed_preserves_status(self):
+        """journalctl stderr redirection does not mask exit status."""
+        cmd = _oom_collector_command(
+            "bash -c 'echo log >&2; exit 0'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+
+    def test_zero_length_input(self):
+        """Empty journalctl output -> exit 0, no match."""
+        cmd = _oom_collector_command("printf ''", RE_NVIDIA_XID_79)
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b""
+
+    # ── Adversarial: other Xid codes with stray 79 on same line ──
+
+    def test_no_match_xid13_with_later_79(self):
+        """Xid 13 followed by stray 79 later must NOT match (false-positive
+        the old regex would produce)."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 13, GPU at 79% load'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b"", "Adversarial: Xid 13 with stray 79 must NOT match"
+
+    def test_no_match_xid31_with_later_79(self):
+        """Xid 31 with trailing 79 on the line must NOT match."""
+        cmd = _oom_collector_command(
+            "printf 'lip 29 10:00:00 host kernel: "
+            "NVRM: Xid (PCI:0000:01:00): 31, temp 79C'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b"", "Adversarial: Xid 31 with stray 79 must NOT match"
+
+    def test_no_match_bare_79_before_xid(self):
+        """79 appearing elsewhere (e.g. upstream timestamp) must NOT match."""
+        cmd = _oom_collector_command(
+            "printf '79: NVRM: Xid (PCI:0000:01:00): 13, GPU exception'",
+            RE_NVIDIA_XID_79,
+        )
+        cp = subprocess.run(cmd, capture_output=True, timeout=120)
+        assert cp.returncode == 0
+        assert cp.stdout == b"", "Adversarial: bare 79 before Xid must NOT match"
+
+
+class TestNvidiaXid79CollectorPath:
+    """Collector-path and pipeline tests for GPU-NVIDIA-XID-79-001."""
+
+    @staticmethod
+    def _cmd_ok(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    @staticmethod
+    def _cmd_error(
+        execution_status: str = "error",
+        return_code: int = 1,
+    ) -> CmdResult:
+        return CmdResult(
+            command="",
+            stdout="",
+            stderr="",
+            return_code=return_code,
+            execution_status=execution_status,
+        )
+
+    def _collect_with_mock(self, engine, **overrides):
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd_ok("0"),
+            "kernel_errors": self._cmd_ok(""),
+            "segfaults": self._cmd_ok(""),
+            "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
+            "lspci": self._cmd_ok(""),
+            "lsusb": self._cmd_ok(""),
+        }
+        results.update(overrides)
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _make_xid79_line(prefix: str = "NVRM", pci: str = "0000:01:00") -> str:
+        return (
+            f"lip 29 10:00:00 host kernel: {prefix}: "
+            f"Xid (PCI:{pci}): 79, GPU has fallen off the bus."
+        )
+
+    @staticmethod
+    def _make_xid_line(prefix: str, code: int) -> str:
+        return (
+            f"lip 29 10:00:00 host kernel: {prefix}: "
+            f"Xid (PCI:0000:01:00): {code}, description."
+        )
+
+    # ── Positive triggers ────────────────────────────────────────
+
+    def test_xid79_nvrm_prefix_triggers(self):
+        """NVRM Xid 79 -> GPU-NVIDIA-XID-79-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid79_line(prefix="NVRM")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+        assert raws[0].payload.get("xid_detected") is True
+        assert raws[0].payload.get("xid_code") == 79
+        assert raws[0].payload.get("driver") == "nvidia"
+
+    def test_xid79_nvidia_prefix_triggers(self):
+        """'nvidia:' prefix Xid 79 -> GPU-NVIDIA-XID-79-001."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_nvidia")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid79_line(prefix="nvidia")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+
+    def test_xid79_pci_with_dot_zero_triggers(self):
+        """PCI with .0 suffix -> still triggers."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_pci")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid79_line(pci="0000:01:00.0")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+
+    # ── Non-triggers: other Xid codes ────────────────────────────
+
+    def test_xid13_no_trigger(self):
+        """Xid 13 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid13")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 13)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid31_no_trigger(self):
+        """Xid 31 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid31")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 31)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid43_no_trigger(self):
+        """Xid 43 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid43")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 43)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid56_no_trigger(self):
+        """Xid 56 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid56")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 56)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid74_no_trigger(self):
+        """Xid 74 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid74")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 74)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid179_no_trigger(self):
+        """Xid 179 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid179")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 179)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid790_no_trigger(self):
+        """Xid 790 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid790")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 790)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid7_no_trigger(self):
+        """Xid 7 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid7")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 7)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid9_no_trigger(self):
+        """Xid 9 does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid9")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid_line("NVRM", 9)),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    # ── Adversarial: other Xid codes with stray 79 on same line ──
+
+    def test_xid13_with_later_79_no_trigger(self):
+        """Xid 13 with stray 79 later in the line must NOT trigger
+        (the old regex would false-positive here)."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid13_adv")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "lip 29 10:00:00 host kernel: "
+                "NVRM: Xid (PCI:0000:01:00): 13, GPU at 79% load"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid31_with_later_79_no_trigger(self):
+        """Xid 31 with trailing 79 in the description must NOT trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid31_adv")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "lip 29 10:00:00 host kernel: NVRM: Xid (PCI:0000:01:00): 31, temp 79C"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_xid_bare_79_before_xid_no_trigger(self):
+        """79 appearing before Xid on the line must NOT trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_bare")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "lip 29 10:00:00 host kernel: "
+                "79: NVRM: Xid (PCI:0000:01:00): 13, GPU exception"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    # ── Non-triggers: other drivers and contexts ─────────────────
+
+    def test_i915_no_trigger(self):
+        """i915 GPU HANG does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_i915")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_amdgpu_no_trigger(self):
+        """AMDGPU reset does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_amdgpu")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_nouveau_no_trigger(self):
+        """Nouveau messages do not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_nouveau")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "kernel: nouveau 0000:01:00.0: fifo: read fault"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_nvidia_modeset_no_trigger(self):
+        """nvidia-modeset without Xid does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_modeset")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "kernel: nvidia-modeset: ERROR: some modeset error"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_nvidia_drm_no_trigger(self):
+        """nvidia-drm without Xid does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_drm")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok("kernel: nvidia-drm: some DRM message"),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_generic_drm_error_no_trigger(self):
+        """Generic DRM error does not trigger."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_drm_gen")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(
+                "kernel: [drm:atom_op_constant_fs [amdgpu]] *ERROR* Invalid constant"
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_empty_no_trigger(self):
+        """Empty output -> no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_empty")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(""),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    # ── Command failure handling ─────────────────────────────────
+
+    def test_command_failure_safe(self):
+        """Command execution_status=error -> no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_fail")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_error(return_code=1),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_permission_denied_safe(self):
+        """Permission denied -> no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_perm")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_error(
+                execution_status="permission_denied", return_code=-3
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_not_found_safe(self):
+        """Command not found -> no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_nf")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_error(
+                execution_status="not_found", return_code=-1
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    def test_timeout_safe(self):
+        """Timeout -> no diagnostic."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_to")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_error(
+                execution_status="timeout", return_code=-2
+            ),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 0
+
+    # ── Deduplication and payload ────────────────────────────────
+
+    def test_multiple_matches_one_diagnostic(self):
+        """Multiple matching Xid 79 lines produce one diagnostic with count."""
+        lines = "\n".join(
+            [
+                self._make_xid79_line(prefix="NVRM"),
+                self._make_xid79_line(prefix="nvidia"),
+            ]
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_mult")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(lines),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+        assert raws[0].payload.get("match_count") == 2
+        assert len(raws[0].payload.get("matched_lines", [])) == 2
+
+    def test_output_cap(self):
+        """At most 20 matched lines are kept in payload."""
+        many_lines = "\n".join([self._make_xid79_line() for _ in range(25)])
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_cap")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(many_lines),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+        assert len(raws[0].payload.get("matched_lines", [])) == 20
+        assert raws[0].payload.get("match_count") == 25
+
+    def test_payload_provenance(self):
+        """Payload contains correct provenance keys."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_prov")
+        self._collect_with_mock(
+            engine,
+            gpu_nvidia_xid_79=self._cmd_ok(self._make_xid79_line(prefix="NVRM")),
+        )
+        raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(raws) == 1
+        p = raws[0].payload
+        assert p.get("xid_detected") is True
+        assert p.get("xid_code") == 79
+        assert p.get("driver") == "nvidia"
+        assert p.get("driver_attribution_source") == "in_message"
+        assert p.get("journal_scope") == "current_boot_kernel"
+        assert p.get("source_query") == "gpu_nvidia_xid_79"
+        assert len(p.get("matched_lines", [])) >= 1
+
+    # ── Pipeline: observation / evidence / finding ──────────────
+
+    def test_observation_mapping(self):
+        """RawDiagnostic routes through _raw_to_observation correctly."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_pipe")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-NVIDIA-XID-79-001",
+                category="gpu_nvidia_xid_79",
+                payload={
+                    "xid_detected": True,
+                    "xid_code": 79,
+                    "matched_lines": ["kernel: NVRM: Xid (PCI:0000:01:00): 79, ..."],
+                    "match_count": 1,
+                    "driver": "nvidia",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_nvidia_xid_79",
+                },
+            )
+        ]
+        engine._derive_observations()
+        assert len(engine.observations) == 1
+        obs = engine.observations[0]
+        assert obs.obs_id == "GPU-NVIDIA-XID-79-001"
+        assert obs.category == "gpu_nvidia_xid_79"
+        assert obs.direct_measurement is True
+        assert obs.data_complete is True
+        assert obs.inference_required is False
+
+    def test_evidence_journal_event_type(self):
+        """Evidence uses JOURNAL_EVENT type."""
+        from syscheck import EvidenceType
+
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_evid")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-NVIDIA-XID-79-001",
+                category="gpu_nvidia_xid_79",
+                payload={
+                    "xid_detected": True,
+                    "xid_code": 79,
+                    "matched_lines": ["kernel: NVRM: Xid (PCI:0000:01:00): 79, ..."],
+                    "match_count": 1,
+                    "driver": "nvidia",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_nvidia_xid_79",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        xid_evidence = [
+            e
+            for e in engine.evidence_objects
+            if e.evidence_type == EvidenceType.JOURNAL_EVENT
+            and "NVIDIA Xid 79" in e.summary
+        ]
+        assert len(xid_evidence) >= 1
+        data = xid_evidence[0].data
+        assert data.get("xid_detected") is True
+        assert data.get("xid_code") == 79
+        assert data.get("driver") == "nvidia"
+        assert data.get("journal_scope") == "current_boot_kernel"
+        assert data.get("source_query") == "gpu_nvidia_xid_79"
+
+    def test_finding_gpu_nvidia_xid_79_kind(self):
+        """Finding uses GPU_NVIDIA_XID_79 kind, HARDWARE, P2, Certain."""
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_find")
+        engine.raw_diagnostics = [
+            RawDiagnostic(
+                source_id="GPU-NVIDIA-XID-79-001",
+                category="gpu_nvidia_xid_79",
+                payload={
+                    "xid_detected": True,
+                    "xid_code": 79,
+                    "matched_lines": ["kernel: NVRM: Xid (PCI:0000:01:00): 79, ..."],
+                    "match_count": 1,
+                    "driver": "nvidia",
+                    "driver_attribution_source": "in_message",
+                    "journal_scope": "current_boot_kernel",
+                    "source_query": "gpu_nvidia_xid_79",
+                },
+            )
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        xid_findings = [
+            f for f in engine.findings if f.finding_id == "GPU-NVIDIA-XID-79-001"
+        ]
+        assert len(xid_findings) == 1
+        f = xid_findings[0]
+        assert f.kind == FindingKind.GPU_NVIDIA_XID_79
+        assert f.domain == DiagnosticDomain.HARDWARE
+        assert f.severity == "P2"
+        assert f.confidence == "Certain"
+
+    def test_rule_registered(self):
+        """GpuNvidiaXid79Rule is registered in the default rule engine."""
+        from syscheck import build_default_rule_engine
+
+        engine_instance = build_default_rule_engine()
+        assert any(
+            hasattr(r, "rule_id") and r.rule_id == "RULE-GPU-NVIDIA-XID-79"
+            for r in engine_instance._registry.rules
+        )
+
+    # ── Regression ──────────────────────────────────────────────
+
+    def test_existing_oom_unchanged(self):
+        """Adding gpu_nvidia_xid_79 to mock does not break OOM detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_regr_oom")
+        self._collect_with_mock(
+            engine,
+            oom_events=self._cmd_ok(
+                "kernel: mysqld invoked oom-killer: gfp_mask=0xcc0"
+            ),
+        )
+        oom_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-OOM-001"
+        ]
+        assert len(oom_raws) == 1
+        assert oom_raws[0].payload.get("oom_detected") is True
+
+    def test_existing_i915_unchanged(self):
+        """Adding gpu_nvidia_xid_79 does not break i915 hang detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_regr_i915")
+        self._collect_with_mock(
+            engine,
+            gpu_i915_hang=self._cmd_ok(
+                "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1"
+            ),
+        )
+        i915_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "GPU-I915-HANG-001"
+        ]
+        assert len(i915_raws) == 1
+        assert i915_raws[0].payload.get("hang_detected") is True
+
+    def test_existing_amdgpu_unchanged(self):
+        """Adding gpu_nvidia_xid_79 does not break AMDGPU reset detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_regr_amd")
+        self._collect_with_mock(
+            engine,
+            amdgpu_reset_fail=self._cmd_ok(
+                "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!"
+            ),
+        )
+        amd_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "AMDGPU-RESET-FAIL-001"
+        ]
+        assert len(amd_raws) == 1
+
+    def test_existing_taint_unchanged(self):
+        """Adding gpu_nvidia_xid_79 does not break taint detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_regr_taint")
+        self._collect_with_mock(
+            engine,
+            kernel_errors=self._cmd_ok(
+                "kernel: CPU: 0 PID: 1 Comm: swapper Tainted: P        "
+            ),
+        )
+        taint_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "KERNEL-TAINT-001"
+        ]
+        assert len(taint_raws) == 1
+        assert taint_raws[0].payload.get("tainted") is True
+
+    def test_existing_segfault_unchanged(self):
+        """Adding gpu_nvidia_xid_79 does not break segfault detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_xid79_regr_seg")
+        segfaults = "\n".join(
+            [
+                "lip 27 08:09:51 host kernel: wireplumber[1274]: segfault at 0 "
+                "ip 7f2c9743a55c sp 7fff981984c8 error 4 in libspa-libcamera.so"
+                "[13155c,7f2c97382000+f0000]",
+                "lip 27 08:09:52 host kernel: wireplumber[1387]: segfault at 0 "
+                "ip 7f3f5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f3f5cda8000+f0000]",
+                "lip 27 08:09:53 host kernel: wireplumber[1400]: segfault at 0 "
+                "ip 7f4a5ce6055c sp 7ffc34543d08 error 4 in libspa-libcamera.so"
+                "[13155c,7f4a5cda8000+f0000]",
+            ]
+        )
+        self._collect_with_mock(
+            engine,
+            segfaults=self._cmd_ok(segfaults),
+        )
+        wp_raws = [
+            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
+        ]
+        assert len(wp_raws) == 1

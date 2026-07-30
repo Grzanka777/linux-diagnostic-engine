@@ -27,6 +27,7 @@ RE_GFX_ERROR = r"niri|dms|wayland|greetd|i915|drm"
 RE_OOM = r"invoked oom-killer|oom-killer:|Out of memory: Killed process"
 RE_GPU_I915_HANG = r"i915.*GPU HANG:|GPU HANG:.*i915"
 RE_AMDGPU_RESET_FAIL = r"amdgpu.*GPU reset failed|GPU reset failed.*amdgpu"
+RE_NVIDIA_XID_79 = r"(NVRM|nvidia):\s*Xid\s*\(PCI:[^)]+\):\s*79\b"
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────
 TRUNCATE_NORMAL = 5000
