@@ -1,13 +1,20 @@
-## NeuralEngine usage
+## NeuralEngine
 
-At the start of work, run `neural status`.
+Use the `neuralengine` skill when prior project knowledge, decisions,
+experience, outcomes, or playbooks may materially affect the current task.
 
-Use `neural search` when prior project knowledge, decisions, experience, or
-playbooks may be relevant.
+Run `neural status` at task start.
+
+Current repository/project authority is controlling. NeuralEngine records are
+supporting historical evidence only.
 
 Read-only NeuralEngine operations are allowed without additional approval.
 
 Any Brain write requires:
-1. a preview of the proposed record,
+
+1. an exact preview of the proposed record,
 2. explicit user authorization,
-3. no automatic promotion between lifecycle stages.
+3. use of the existing lifecycle contract,
+4. no automatic promotion between lifecycle stages.
+
+Do not claim NeuralEngine usage based only on running `neural status`.
