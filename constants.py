@@ -28,6 +28,19 @@ RE_OOM = r"invoked oom-killer|oom-killer:|Out of memory: Killed process"
 RE_GPU_I915_HANG = r"i915.*GPU HANG:|GPU HANG:.*i915"
 RE_AMDGPU_RESET_FAIL = r"amdgpu.*GPU reset failed|GPU reset failed.*amdgpu"
 RE_NVIDIA_XID_79 = r"(NVRM|nvidia):\s*Xid\s*\(PCI:[^)]+\):\s*79\b"
+RE_PCIE_AER = (
+    r"PCIe Bus Error:\s*severity=(?:Corrected|Uncorrected \(Non-Fatal\)|"
+    r"Uncorrected \(Fatal\))(?:\s|$)|AER:\s*(?:Corrected|"
+    r"Uncorrected \(Non-Fatal\)|Uncorrected \(Fatal\))\s+error received\b"
+)
+RE_NVME_CONTROLLER_RELIABILITY = (
+    r"\bnvme(?:\d+(?:n\d+)?)?\b.*(?:"
+    r"I/O.*\btimeout\b,\s*(?:aborting|reset controller)\b|"
+    r"\btimeout\b,\s*reset controller\b|"
+    r"controller is down;\s*will reset\b|"
+    r"Device not ready;\s*aborting reset\b"
+    r")"
+)
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────
 TRUNCATE_NORMAL = 5000
@@ -67,7 +80,15 @@ DISTRO_CONFIG: dict[str, dict] = {
         "name": "Arch Linux / CachyOS",
         "pkg_list_orphans": ["pacman", "-Qdt"],
         "pkg_list_foreign": ["pacman", "-Qm"],
-        "pkg_query_kernels": ["bash", "-c", "pacman -Q 2>/dev/null | grep -E '^linux'"],
+        "pkg_query_kernels": [
+            "bash",
+            "-c",
+            "pacman -Q 2>/dev/null | grep -E '^linux'; "
+            'statuses=("${PIPESTATUS[@]}"); '
+            'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; '
+            'elif [ "${statuses[1]}" -eq 1 ]; then exit 0; '
+            'else exit "${statuses[1]}"; fi',
+        ],
         "pkg_timeout": TIMEOUT_MEDIUM,
         "kernel_filter_prefixes": list(KERNEL_NON_BOOTABLE_PREFIXES),
     },

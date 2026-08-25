@@ -29,17 +29,17 @@ Użycie:
 from __future__ import annotations
 
 import os
-import sys
 import subprocess
-from abc import ABC, abstractmethod
 import argparse
 import datetime
 import re
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 # ── Stałe ────────────────────────────────────────────────────────
 from constants import (  # type: ignore[import-untyped]
@@ -55,7 +55,9 @@ from constants import (  # type: ignore[import-untyped]
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
     RE_NVIDIA_XID_79,
+    RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
+    RE_PCIE_AER,
     RE_SEGFAULT,
     SCRIPT_VERSION,
     SEGFAULT_ALERT_THRESHOLD,
@@ -93,22 +95,40 @@ class CmdResult:
     privilege_required: bool = False
     optional_dependency: bool = False
     collected_at: str = ""
+    truncated: bool = False
 
     def is_ok(self) -> bool:
         return self.execution_status == "ok"
 
     def to_fallback_text(self) -> str:
         """Zwraca opis statusu do raportu."""
+
+        def with_capture_marker(text: str) -> str:
+            markers = []
+            if self.truncated:
+                markers.append("[... wynik polecenia obcięty ...]")
+            if self.execution_status == "timeout" and (
+                self.stdout or (self.stderr and not self.stderr.startswith("Timeout"))
+            ):
+                markers.append("[... wynik niepełny po timeout ...]")
+            return text if not markers else f"{text}\n" + "\n".join(markers)
+
         if self.execution_status == "ok":
-            return self.stdout
+            return with_capture_marker(self.stdout)
         if self.execution_status == "not_found":
             return f"(nie znaleziono: {self.command})"
         if self.execution_status == "timeout":
-            return "(timeout)"
+            partial_stderr = (
+                self.stderr if not self.stderr.startswith("Timeout") else ""
+            )
+            return with_capture_marker(self.stdout or partial_stderr or "(timeout)")
         if self.execution_status == "permission_denied":
             return "(wymaga sudo — pominięto)"
         if self.execution_status == "empty_ok":
-            return self.stdout if self.stdout else "(brak wyników)"
+            return with_capture_marker(self.stdout if self.stdout else "(brak wyników)")
+        if self.truncated and (self.stdout or self.stderr):
+            captured = "\n".join(part for part in (self.stdout, self.stderr) if part)
+            return with_capture_marker(captured) + f"\n(błąd rc={self.return_code})"
         return f"(błąd rc={self.return_code})"
 
 
@@ -142,6 +162,8 @@ class FindingKind(str, Enum):
     GPU_I915_HANG = "gpu_i915_hang"
     AMDGPU_RESET_FAIL = "amdgpu_reset_fail"
     GPU_NVIDIA_XID_79 = "gpu_nvidia_xid_79"
+    PCIE_AER_ERROR = "pcie_aer_error"
+    NVME_CONTROLLER_RELIABILITY = "nvme_controller_reliability"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -265,34 +287,82 @@ def run_cmd(
     cmd_str = " ".join(cmd)
     collected_at = datetime.datetime.now().isoformat(timespec="seconds")
 
+    def drain(stream: Any) -> Tuple[bytes, bool]:
+        chunks: List[bytes] = []
+        retained = 0
+        truncated = False
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            if retained < TRUNCATE_NORMAL:
+                keep = chunk[: TRUNCATE_NORMAL - retained]
+                chunks.append(keep)
+                retained += len(keep)
+                if len(keep) < len(chunk):
+                    truncated = True
+            else:
+                truncated = True
+        return b"".join(chunks), truncated
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=merged_env,
+            start_new_session=True,
         )
-        stdout = proc.stdout.strip()
-        stderr = proc.stderr.strip()
-
-        # Ustal status
-        if proc.returncode == 0:
-            status = "ok"
-        elif proc.returncode == 1 and not stdout:
-            # Niektóre polecenia zwracają 1 przy braku wyników (np. pacman -Qdt)
-            status = "empty_ok"
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        stdout_holder: List[Tuple[bytes, bool]] = []
+        stderr_holder: List[Tuple[bytes, bool]] = []
+        stdout_thread = threading.Thread(
+            target=lambda: stdout_holder.append(drain(proc.stdout)), daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=lambda: stderr_holder.append(drain(proc.stderr)), daemon=True
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, 9)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        stdout_bytes, stdout_truncated = (
+            stdout_holder[0] if stdout_holder else (b"", True)
+        )
+        stderr_bytes, stderr_truncated = (
+            stderr_holder[0] if stderr_holder else (b"", True)
+        )
+        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+        truncated = stdout_truncated or stderr_truncated
+        if timed_out:
+            timeout_text = f"Timeout ({timeout}s): {cmd_str}"
+            stderr = f"{stderr}\n{timeout_text}".strip()
+            status = "timeout"
+            return_code = -2
         else:
-            status = "error"
-
+            return_code = proc.returncode
+            status = "ok" if return_code == 0 else "error"
         return CmdResult(
             command=cmd_str,
             stdout=stdout,
             stderr=stderr,
-            return_code=proc.returncode,
+            return_code=return_code,
             execution_status=status,
             optional_dependency=optional_dependency,
             collected_at=collected_at,
+            truncated=truncated,
         )
     except FileNotFoundError:
         return CmdResult(
@@ -303,16 +373,7 @@ def run_cmd(
             execution_status="not_found",
             optional_dependency=optional_dependency,
             collected_at=collected_at,
-        )
-    except subprocess.TimeoutExpired:
-        return CmdResult(
-            command=cmd_str,
-            stdout="",
-            stderr=f"Timeout ({timeout}s): {cmd_str}",
-            return_code=-2,
-            execution_status="timeout",
-            optional_dependency=optional_dependency,
-            collected_at=collected_at,
+            truncated=False,
         )
     except PermissionError:
         return CmdResult(
@@ -324,6 +385,7 @@ def run_cmd(
             privilege_required=True,
             optional_dependency=optional_dependency,
             collected_at=collected_at,
+            truncated=False,
         )
     except Exception as exc:
         return CmdResult(
@@ -334,6 +396,7 @@ def run_cmd(
             execution_status="error",
             optional_dependency=optional_dependency,
             collected_at=collected_at,
+            truncated=False,
         )
 
 
@@ -342,6 +405,45 @@ def safestr(text: str, max_len: int = TRUNCATE_NORMAL, *, full: bool = False) ->
     if full or len(text) <= max_len:
         return text
     return text[:max_len] + f"\n\n[... obcięto, pełna długość: {len(text)} znaków]"
+
+
+def _capture_payload(result: CmdResult, payload: dict) -> dict:
+    """Preserve bounded-capture metadata through the RAW diagnostic stage."""
+    if result.truncated:
+        payload["capture_truncated"] = True
+    return payload
+
+
+def _write_new_text(path: str | Path, text: str) -> None:
+    """Create a new text file without following or replacing a destination."""
+    destination = Path(path)
+    if destination.is_symlink():
+        raise FileExistsError(f"Destination {destination} is a symlink")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(destination, flags, 0o644)
+    except FileExistsError:
+        raise FileExistsError(f"Destination {destination} already exists") from None
+    try:
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        handle.write(text)
+    except BaseException:
+        try:
+            current = os.stat(destination, follow_symlinks=False)
+            opened = os.fstat(fd)
+            if (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
+                destination.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        handle.close()
 
 
 def heading(level: int, title: str) -> str:
@@ -558,29 +660,56 @@ def _count_kernel_packages(pkg_list: str) -> Tuple[int, int, List[str]]:
     Zwraca: (bootable_kernel_count, total_linux_packages, list_of_bootable_kernels)
 
     Logika:
-    - Pomija pakiety zaczynające się od prefiksów non-bootable
-    - Pomija pakiety kończące się na -headers
-    - Pozostałe pakiety na 'linux' są uznawane za bootowalne kernele
+    - Zachowuje filtrowanie pakietów Arch/CachyOS `linux*`
+    - Z tabeli `dpkg -l` wybiera zainstalowane, wersjonowane linux-image
+    - Z `rpm -qa kernel*` wybiera unikalne wersje kernel/kernel-core
     """
     bootable = []
-    non_bootable = []
+    rpm_bootable = {}
+    total_packages = 0
+    is_dpkg_output = any(
+        re.match(r"^[a-z][a-z]\s+linux-", line.strip()) for line in pkg_list.split("\n")
+    )
     for line in pkg_list.split("\n"):
         line = line.strip()
         if not line:
             continue
+
+        dpkg_match = re.match(r"^(\S{2})\s+(\S+)\s+(\S+)", line)
+        if dpkg_match:
+            status, pkg_name, version = dpkg_match.groups()
+            if status[1] != "i":
+                continue
+            total_packages += 1
+            if re.match(r"^linux-image-(?:unsigned-)?\d", pkg_name):
+                bootable.append(f"{pkg_name} {version}")
+            continue
+
+        if is_dpkg_output:
+            continue
+
+        if line.startswith("kernel"):
+            total_packages += 1
+            rpm_match = re.match(r"^(kernel(?:-core)?)-(\d.+)$", line)
+            if rpm_match:
+                package, version = rpm_match.groups()
+                if version not in rpm_bootable or package == "kernel-core":
+                    rpm_bootable[version] = line
+            continue
+
         # Wyodrębnij nazwę pakietu (pierwsze słowo)
         pkg_name = line.split()[0] if " " in line else line
+        total_packages += 1
         # Sprawdź prefiksy na nazwie pakietu
         filters = DISTRO_CONFIG.get("arch", {}).get("kernel_filter_prefixes", [])
         if any(pkg_name.startswith(prefix) for prefix in filters):
-            non_bootable.append(line)
             continue
         # Sprawdź sufiksy na nazwie pakietu (np. -headers)
         if any(pkg_name.endswith(suffix) for suffix in KERNEL_NON_BOOTABLE_SUFFIXES):
-            non_bootable.append(line)
             continue
         bootable.append(line)
-    return len(bootable), len(bootable) + len(non_bootable), bootable
+    bootable.extend(rpm_bootable.values())
+    return len(bootable), total_packages, bootable
 
 
 def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
@@ -598,7 +727,50 @@ def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
     return results
 
 
-def _oom_collector_command(upstream_cmd: str, regex: str) -> List[str]:
+def _journal_filter_command(
+    upstream_cmd: str, regexes: List[str], tail_lines: Optional[int] = None
+) -> List[str]:
+    """Build a status-aware journal filter with bounded pipeline semantics."""
+    stages = [f"grep -iE '{regex}'" for regex in regexes]
+    if tail_lines is not None:
+        stages.append(f"tail -{tail_lines}")
+    pipeline = f"{upstream_cmd} | " + " | ".join(stages)
+    parts = [
+        f"{pipeline};",
+        'statuses=("${PIPESTATUS[@]}");',
+        'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi;',
+    ]
+    for index in range(1, len(regexes) + 1):
+        parts.append(
+            f'if [ "${{statuses[{index}]}}" -ne 0 ] && '
+            f'[ "${{statuses[{index}]}}" -ne 1 ]; then '
+            f'exit "${{statuses[{index}]}}"; fi;'
+        )
+    if tail_lines is not None:
+        tail_index = len(regexes) + 1
+        parts.append(f'exit "${{statuses[{tail_index}]}}";')
+    else:
+        parts.append("exit 0;")
+    return ["bash", "-c", " ".join(parts)]
+
+
+def _journal_count_command(upstream_cmd: str, regex: str) -> List[str]:
+    """Build a status-aware count command with explicit grep no-match handling."""
+    return [
+        "bash",
+        "-c",
+        f"{upstream_cmd} | grep -iE '{regex}' | wc -l; "
+        'statuses=("${PIPESTATUS[@]}"); '
+        'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; '
+        'elif [ "${statuses[1]}" -ne 0 ] && [ "${statuses[1]}" -ne 1 ]; then '
+        'exit "${statuses[1]}"; '
+        'else exit "${statuses[2]}"; fi',
+    ]
+
+
+def _oom_collector_command(
+    upstream_cmd: str, regex: str, tail_lines: Optional[int] = None
+) -> List[str]:
     """Build the OOM collector bash command with safe PIPESTATUS handling.
 
     Args:
@@ -613,17 +785,28 @@ def _oom_collector_command(upstream_cmd: str, regex: str) -> List[str]:
     ``journalctl`` exit status and ``grep`` exit status are both
     preserved regardless of bash version.
     """
-    return [
-        "bash",
-        "-c",
-        f"{upstream_cmd} | "
-        f"grep -iE '{regex}'; "
-        'statuses=("${PIPESTATUS[@]}"); '
-        "js=${statuses[0]}; gs=${statuses[1]}; "
-        'if [ "$js" -ne 0 ]; then exit "$js"; '
-        'elif [ "$gs" -eq 1 ]; then exit 0; '
-        'else exit "$gs"; fi',
-    ]
+    return _journal_filter_command(upstream_cmd, [regex], tail_lines=tail_lines)
+
+
+def _pcie_aer_severity(line: str) -> Optional[str]:
+    """Return the explicit AER severity encoded in a matched kernel line."""
+    normalized = line.lower()
+    if "uncorrected (fatal)" in normalized:
+        return "fatal"
+    if "uncorrected (non-fatal)" in normalized:
+        return "non_fatal"
+    if "corrected" in normalized:
+        return "corrected"
+    return None
+
+
+def _nvme_controller_reliability_severity(line: str) -> Optional[str]:
+    """Return the severity class encoded in a matched NVMe kernel line."""
+    if "device not ready; aborting reset" in line.lower():
+        return "reset_failure"
+    if re.search(RE_NVME_CONTROLLER_RELIABILITY, line, re.IGNORECASE):
+        return "timeout_or_reset"
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -648,8 +831,6 @@ class FindingClassification:
             raise ValueError(f"Invalid domain: {self.domain}")
         if not isinstance(self.kind, FindingKind):
             raise ValueError(f"Invalid kind: {self.kind}")
-
-    __hash__ = str.__hash__  # type: ignore[assignment]
 
 
 class UnsupportedObservationCategoryError(ValueError):
@@ -722,6 +903,18 @@ class FindingClassificationPolicy:
         "gpu_nvidia_xid_79": FindingClassification(
             DiagnosticDomain.HARDWARE,
             FindingKind.GPU_NVIDIA_XID_79,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "pcie_aer_error": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.PCIE_AER_ERROR,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "nvme_controller_reliability": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.NVME_CONTROLLER_RELIABILITY,
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
@@ -1244,946 +1437,104 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "pcie_aer_error":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            severity = d.get("aer_severity", "unknown")
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"PCIe AER {severity} event detected during current boot "
+                    f"({count} matching journal line(s))"
+                ),
+                data={
+                    "aer_detected": d.get("aer_detected", False),
+                    "aer_severity": severity,
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "pcie_aer"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "nvme_controller_reliability":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            severity = d.get("event_severity", "timeout_or_reset")
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"NVMe controller reliability {severity} event detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "nvme_detected": d.get("nvme_detected", False),
+                    "event_severity": severity,
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "event_classes": d.get("event_classes", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "nvme_controller_reliability"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
-@dataclass(frozen=True)
-class DiagnosticRuleResult:
-    finding: Optional[Finding] = None
-    evidence: tuple = ()
-
-
-@dataclass(frozen=True)
-class DiagnosticEvaluation:
-    findings: tuple = ()
-    evidence: tuple = ()
-
-
-class DiagnosticRuleError(ValueError):
-    pass
-
-
-class UnsupportedObservationRuleError(DiagnosticRuleError):
-    pass
-
-
-class AmbiguousObservationRuleError(DiagnosticRuleError):
-    pass
-
-
-class DuplicateDiagnosticRuleError(DiagnosticRuleError):
-    pass
-
-
-class DuplicateFindingError(DiagnosticRuleError):
-    pass
-
-
-class DuplicateEvidenceError(DiagnosticRuleError):
-    pass
-
-
-class DiagnosticRule(ABC):
-    rule_id: str
-    supported_categories: frozenset = frozenset()
-
-    @abstractmethod
-    def evaluate(
-        self, observation: Observation, classification: FindingClassification
-    ) -> DiagnosticRuleResult: ...
-
-    def supports(self, observation: Observation) -> bool:
-        return observation.category in self.supported_categories
-
-
-class BtrfsDeviceErrorRule(DiagnosticRule):
-    rule_id = "RULE-BTRFS-DEVICE-ERROR"
-    supported_categories = frozenset({"btrfs_error"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-
-        # Safety: do not emit device-error Finding for non-error states
-        status = observation.details.get("status")
-        if status in ("ok", "permission_denied", "command_not_found"):
-            return DiagnosticRuleResult()
-
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title="Btrfs device stats wykazują błędy we/wy",
-                severity="P1",
-                confidence=conf,
-                evidence=str(observation.details.get("line", "")),
-                interpretation="Liczniki błędów Btrfs są niezerowe — możliwy problem sprzętowy.",
-                recommended_diagnostics="`sudo btrfs scrub start /`; `sudo btrfs device stats /`",
-                remediation="Jeśli błędy utrzymują się po scrubie, rozważ wymianę dysku.",
-                verification="`sudo btrfs device stats /` — wszystkie liczniki zerowe",
-                risk_level="Wysokie ryzyko utraty danych.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class BtrfsScrubStatusRule(DiagnosticRule):
-    rule_id = "RULE-BTRFS-SCRUB-STATUS"
-    supported_categories = frozenset({"btrfs_scrub"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title="Btrfs scrub nigdy nie był wykonany",
-                severity="P2",
-                confidence=conf,
-                evidence="Brak historii skrubowania.",
-                interpretation="Zaleca się wykonanie scrub do wykrycia bit-rot.",
-                recommended_diagnostics="`sudo btrfs scrub start /`",
-                remediation="Po scrubie skonfiguruj timer: `sudo systemctl enable btrfs-scrub@-.timer`",
-                verification="`sudo btrfs scrub status /`",
-                risk_level="Niskie ryzyko. Skrubowanie zapobiegawcze.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence[0].evidence_id,),
-            ),
-            evidence=evidence,
-        )
-
-
-class WirePlumberSegfaultRule(DiagnosticRule):
-    rule_id = "RULE-SEGFAULT-WIREPLUMBER"
-    supported_categories = frozenset({"segfault"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        if observation.details.get("segfault_type") != "wireplumber":
-            return DiagnosticRuleResult()
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        n = observation.details.get(
-            "count", observation.details.get("segfault_type", "?")
-        )
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=f"WirePlumber segfault ({n}) — libcamera",
-                severity="P2",
-                confidence=conf,
-                evidence=f"Segfaulty WirePlumber: {n}.",
-                interpretation="Wszystkie segfaulty w libspa-libcamera.so. Prawdopodobnie związane z tą biblioteką. Brak dowodów na uszkodzenie sprzętu.",
-                recommended_diagnostics="`pacman -Q wireplumber libcamera pipewire`",
-                remediation="`sudo pacman -Syu`; przeinstaluj wireplumber/libcamera.",
-                verification="`journalctl -b | grep -c segfault` — 0",
-                risk_level="Niskie. Ograniczone do jednej biblioteki.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class GeneralSegfaultRule(DiagnosticRule):
-    rule_id = "RULE-SEGFAULT-GENERAL"
-    supported_categories = frozenset({"segfault"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        if observation.details.get("segfault_type") == "wireplumber":
-            return DiagnosticRuleResult()
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        n = observation.details.get("count", "?")
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=f"Wielokrotne segfaulty w systemie ({n})",
-                severity="P1",
-                confidence=conf,
-                evidence=f"Liczba segfaultów: {n}.",
-                interpretation="Segfaulty różnych procesów — możliwe uszkodzenie sprzętu.",
-                recommended_diagnostics="`sudo memtest86+`; `sudo smartctl -a /dev/nvme0n1`",
-                remediation="Test pamięci; sprawdź SMART; jeśli potwierdzone — wymień sprzęt.",
-                verification="`journalctl -b -k | grep segfault` — brak wyników",
-                risk_level="Wysokie ryzyko przy wielu procesach.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class MinorSegfaultRule(DiagnosticRule):
-    rule_id = "RULE-SEGFAULT-MINOR"
-    supported_categories = frozenset({"segfault_minor"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title="Pojedyncze segfaulty podczas bootu",
-                severity="P3",
-                confidence=conf,
-                evidence=str(observation.details),
-                interpretation="Incydentalne segfaulty — monitoruj.",
-                recommended_diagnostics="`journalctl -b -k | grep segfault`",
-                remediation="Jeśli powtarzalne: `sudo pacman -S <pakiet>`.",
-                verification="`journalctl -b -k | grep -c segfault` — 0",
-                risk_level="Niskie.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class KernelTaintRule(DiagnosticRule):
-    rule_id = "RULE-KERNEL-TAINT"
-    supported_categories = frozenset({"tainted"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title="Kernel tainted",
-                severity="P2",
-                confidence=conf,
-                evidence="Wykryto 'taint' w logach.",
-                interpretation="Załadowano moduł spoza drzewa jądra.",
-                recommended_diagnostics="`cat /proc/sys/kernel/tainted`",
-                remediation="Rozważ przejście na otwarte sterowniki.",
-                verification="`cat /proc/sys/kernel/tainted` — 0",
-                risk_level="Niskie. Informacja, nie awaria.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class KernelOomRule(DiagnosticRule):
-    rule_id = "RULE-KERNEL-OOM"
-    supported_categories = frozenset({"oom_event"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title="Wykryto zdarzenie OOM (Out of Memory) w bieżącym bocie",
-                severity="P2",
-                confidence=conf,
-                evidence=str(observation.details.get("matched_lines", [])),
-                interpretation=(
-                    "Jądro zgłosiło brak pamięci i uruchomiło OOM killer. "
-                    "Proces(y) zostały zabite w celu odzyskania pamięci. "
-                    "Diagnostyka nie określa przyczyny — może to być "
-                    "niewystarczająca ilość RAM-u, brak/zbyt mały swap, "
-                    "wyciek pamięci aplikacji, ograniczenie cgroup, "
-                    "anormalne obciążenie lub konfiguracja.\n\n"
-                    "Uwaga: diagnostyka wykrywa obecność zdarzenia OOM "
-                    "w dzienniku bieżącego bota. Nie potwierdza ani nie "
-                    "zaprzecza trwającej presji pamięci. Zdarzenia OOM "
-                    "mogły zostać pominięte jeśli zostały usunięte z "
-                    "dziennika przed uruchomieniem diagnostyki."
-                ),
-                recommended_diagnostics=(
-                    "Sprawdź bieżące użycie pamięci: `free -h`\n"
-                    "Sprawdź swap: `swapon --show`\n"
-                    "Sprawdź procesy według zużycia pamięci: "
-                    "`ps aux --sort=-%mem | head -20`"
-                ),
-                remediation=(
-                    "Jeśli problem jest powtarzalny: zwiększ swap, "
-                    "dodaj więcej RAM, zidentyfikuj wyciek pamięci, "
-                    "lub ogranicz obciążenie."
-                ),
-                verification=(
-                    "Sprawdź bieżące użycie pamięci komendą `free -h` — "
-                    "czy dostępna pamięć nie jest zbyt niska.\n"
-                    "Sprawdź swap: `swapon --show` — czy swap jest "
-                    "włączony i ma odpowiedni rozmiar.\n"
-                    "Po podjęciu działań naprawczych monitoruj dziennik "
-                    "w kolejnym bocie: `journalctl -b -k --grep='oom'`."
-                ),
-                risk_level=(
-                    "Umiarkowane. OOM wskazuje na wyczerpanie pamięci; "
-                    "nieleczona przyczyna może prowadzić do dalszych "
-                    "problemów stabilności."
-                ),
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class GpuI915HangRule(DiagnosticRule):
-    rule_id = "RULE-GPU-I915-HANG"
-    supported_categories = frozenset({"gpu_i915_hang"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=("Wykryto zawieszenie GPU obsługiwanego przez sterownik i915"),
-                severity="P2",
-                confidence=conf,
-                evidence=str(observation.details.get("matched_lines", [])),
-                interpretation=(
-                    "Dziennik jądra odnotował zdarzenie "
-                    "`GPU HANG:` dla sterownika i915 w bieżącym bocie. "
-                    "Zdarzenie mogło mieć charakter historyczny "
-                    "i może nie być już aktywne. "
-                    "Diagnostyka nie potwierdza defektu sprzętowego — "
-                    "możliwe przyczyny obejmują usterki jądra/sterownika, "
-                    "interakcję z firmware lub platformą, "
-                    "obciążenie wywołujące błąd, "
-                    "lub niestabilność sprzętową.\n\n"
-                    "Diagnostyka nie określa, czy dotknięte GPU "
-                    "było aktywnym rendererem — "
-                    "wpływ na użytkownika może być różny.\n\n"
-                    "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
-                    "że nie wystąpiło zawieszenie — "
-                    "retencja dziennika jądra może być niepełna."
-                ),
-                recommended_diagnostics=(
-                    "Sprawdź aktualny dziennik jądra: "
-                    "`journalctl -b -k --no-pager`\n"
-                    "Sprawdź wersję jądra: `uname -r`\n"
-                    "Sprawdź sterownik GPU: `lspci -k`\n"
-                    "Sprawdź, czy zdarzenie powtarza się w kolejnych bootach."
-                ),
-                remediation=(
-                    "Jeśli problem jest powtarzalny: "
-                    "porównaj zachowanie na innym wspieranym jądrze, "
-                    "przejrzyj ostatnie zmiany jądra/sterownika graficznego, "
-                    "zachowaj dokładne linie zawieszenia do zgłoszenia błędu."
-                ),
-                verification=(
-                    "Sprawdź, czy system jest obecnie responsywny.\n"
-                    "Monitoruj, czy nowe zawieszenia występują: "
-                    "`journalctl -b -k | grep -iE 'GPU HANG:'`.\n"
-                    "Po podjęciu działań sprawdź w kolejnym bocie, "
-                    "czy znacznik nadal występuje."
-                ),
-                risk_level=(
-                    "Średnie. Zawieszenie GPU może wskazywać na "
-                    "niestabilność; nieleczona przyczyna może prowadzić "
-                    "do dalszych problemów."
-                ),
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class AmdgpuResetFailRule(DiagnosticRule):
-    rule_id = "RULE-AMDGPU-RESET-FAIL"
-    supported_categories = frozenset({"amdgpu_reset_fail"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=(
-                    "Wykryto nieudany reset GPU obsługiwanego przez sterownik amdgpu"
-                ),
-                severity="P2",
-                confidence=conf,
-                evidence=str(observation.details.get("matched_lines", [])),
-                interpretation=(
-                    "Dziennik jądra odnotował zdarzenie "
-                    "`GPU reset failed` dla sterownika amdgpu w bieżącym bocie. "
-                    "Zdarzenie mogło mieć charakter historyczny "
-                    "i może nie być już aktywne. "
-                    "Diagnostyka nie potwierdza defektu sprzętowego — "
-                    "możliwe przyczyny obejmują usterki jądra/sterownika, "
-                    "interakcję z firmware lub platformą, "
-                    "obciążenie wywołujące błąd, "
-                    "niestabilność zasilania/termiczna/PCIe, "
-                    "lub niestabilność sprzętową.\n\n"
-                    "Diagnostyka nie określa, czy dotknięte GPU "
-                    "było aktywnym rendererem — "
-                    "wpływ na użytkownika może być różny.\n\n"
-                    "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
-                    "że nie wystąpił reset — "
-                    "retencja dziennika jądra może być niepełna."
-                ),
-                recommended_diagnostics=(
-                    "Sprawdź aktualny dziennik jądra: "
-                    "`journalctl -b -k --no-pager | grep -iE 'amdgpu'`\n"
-                    "Sprawdź wersję jądra: `uname -r`\n"
-                    "Sprawdź sterownik GPU: `lspci -k`\n"
-                    "Sprawdź temperatury (jeśli dostępne): `sensors`\n"
-                    "Sprawdź, czy zdarzenie powtarza się w kolejnych bootach."
-                ),
-                remediation=(
-                    "Jeśli problem jest powtarzalny: "
-                    "porównaj zachowanie na innym wspieranym jądrze, "
-                    "przejrzyj ostatnie zmiany jądra/sterownika AMDGPU, "
-                    "sprawdź wersje grafiki i firmware menedżerem pakietów systemu, "
-                    "zachowaj dokładne linie błędu do zgłoszenia problemu. "
-                    "Uwzględnij czynniki takie jak temperatura, "
-                    "obciążenie, stabilność PCIe i jakość zasilania w diagnozie."
-                ),
-                verification=(
-                    "Sprawdź, czy system jest obecnie responsywny.\n"
-                    "Monitoruj, czy nowe reset występują: "
-                    "`journalctl -b -k | grep -iE 'reset'`.\n"
-                    "Po podjęciu działań sprawdź w kolejnym bocie, "
-                    "czy znacznik nadal występuje."
-                ),
-                risk_level=(
-                    "Średnie. Nieudany reset GPU może wskazywać na "
-                    "niestabilność; nieleczona przyczyna może prowadzić "
-                    "do dalszych problemów."
-                ),
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class GpuNvidiaXid79Rule(DiagnosticRule):
-    rule_id = "RULE-GPU-NVIDIA-XID-79"
-    supported_categories = frozenset({"gpu_nvidia_xid_79"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=(
-                    "Wykryto zdarzenie NVIDIA Xid 79 "
-                    "— utrata połączenia GPU z magistralą"
-                ),
-                severity="P2",
-                confidence=conf,
-                evidence=str(observation.details.get("matched_lines", [])),
-                interpretation=(
-                    "Dziennik jądra odnotował zdarzenie "
-                    "NVIDIA Xid 79 w bieżącym bocie. "
-                    "Zdarzenie mogło mieć charakter historyczny "
-                    "i może nie być już aktywne. "
-                    "Diagnostyka nie potwierdza defektu sprzętowego, "
-                    "nie potwierdza aktualnej niedostępności GPU, "
-                    "ani nie określa, czy dotknięte GPU "
-                    "było aktywnym rendererem.\n\n"
-                    "Xid 79 wskazuje na utratę połączenia GPU z magistralą PCIe. "
-                    "Możliwe konteksty zdarzenia obejmują: "
-                    "spontaniczną utratę PCIe/zasilania, "
-                    "celowe odłączenie eGPU, "
-                    "niepełną reinicjalizację po zawieszeniu/resume, "
-                    "lub interakcję sterownika z firmware/platformą. "
-                    "SysCheck nie rozróżnia tych przyczyn "
-                    "na podstawie pojedynczej linii zdarzenia.\n\n"
-                    "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
-                    "że nie wystąpiło — "
-                    "retencja dziennika jądra może być niepełna."
-                ),
-                recommended_diagnostics=(
-                    "Sprawdź aktualny dziennik jądra: "
-                    "`journalctl -b -k --no-pager | grep -iE 'Xid'`\n"
-                    "Sprawdź wersję jądra: `uname -r`\n"
-                    "Sprawdź sterownik GPU: `lspci -k`\n"
-                    "Sprawdź, czy GPU jest eGPU, które zostało celowo odłączone.\n"
-                    "Sprawdź, czy zdarzenie powtarza się w kolejnych bootach.\n"
-                    "Zachowaj dokładną linię Xid do analizy."
-                ),
-                remediation=(
-                    "Jeśli problem jest powtarzalny bez znanej przyczyny: "
-                    "porównaj zachowanie na innym wspieranym jądrze, "
-                    "przejrzyj ostatnie zmiany sterownika NVIDIA, "
-                    "sprawdź kontekst PCIe/zasilania/termiczny jako hipotezy, "
-                    "zachowaj dokładne linie zdarzenia do zgłoszenia problemu."
-                ),
-                verification=(
-                    "Sprawdź, czy system jest obecnie responsywny.\n"
-                    "Monitoruj, czy nowe zdarzenia Xid występują: "
-                    "`journalctl -b -k | grep -iE 'Xid'`.\n"
-                    "Po podjęciu działań sprawdź w kolejnym bocie, "
-                    "czy znacznik nadal występuje."
-                ),
-                risk_level=(
-                    "Średnie. Zdarzenie Xid 79 może wskazywać na "
-                    "niestabilność połączenia GPU; nieleczona przyczyna "
-                    "może prowadzić do dalszych problemów."
-                ),
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class FailedSystemUnitRule(DiagnosticRule):
-    rule_id = "RULE-SYSTEMD-FAILED-SYSTEM"
-    supported_categories = frozenset({"systemd_failed"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        if observation.details.get("scope") != "system":
-            return DiagnosticRuleResult()
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        units = observation.details.get("units", [])
-        evidence = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=f"Failed jednostki systemowe: {', '.join(units)}",
-                severity="P2",
-                confidence=conf,
-                evidence=f"Jednostki: {units}",
-                interpretation="Systemowe jednostki systemd nie uruchomiły się.",
-                recommended_diagnostics="`systemctl status <unit>`; `journalctl -b -u <unit>`",
-                remediation="`sudo systemctl reset-failed <unit>`; popraw konfigurację.",
-                verification="`systemctl --failed` — 0 loaded units.",
-                risk_level="Średnie.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence[0].evidence_id,),
-            ),
-            evidence=evidence,
-        )
-
-
-class FailedUserUnitRule(DiagnosticRule):
-    rule_id = "RULE-SYSTEMD-FAILED-USER"
-    supported_categories = frozenset({"systemd_failed"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        if observation.details.get("scope") != "user":
-            return DiagnosticRuleResult()
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        units = observation.details.get("units", [])
-        evidence = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=f"Failed jednostki użytkownika: {', '.join(units)}",
-                severity="P2",
-                confidence=conf,
-                evidence=f"Jednostki: {units}",
-                interpretation="Użytkownicze jednostki systemd nie uruchomiły się.",
-                recommended_diagnostics="`systemctl --user status <unit>`",
-                remediation="`systemctl --user reset-failed <unit>`",
-                verification="`systemctl --user --failed` — 0 loaded units.",
-                risk_level="Niskie-średnie.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence[0].evidence_id,),
-            ),
-            evidence=evidence,
-        )
-
-
-class KernelCountRule(DiagnosticRule):
-    rule_id = "RULE-KERNEL-COUNT"
-    supported_categories = frozenset({"kernel_count"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        cnt = observation.details.get("count", "?")
-        evidence = (self._evidence_builder.build(observation),)
-        finding = Finding(
-            finding_id=obs_id,
-            title=f"Zainstalowane kernele ({cnt})",
-            severity="Info",
-            confidence=conf,
-            evidence=f"Liczba kernel: {cnt}.",
-            interpretation="Wszystkie obrazy kernel obecne. Rekomendacja dot. przestrzeni.",
-            recommended_diagnostics="`uname -r`; `ls /boot/vmlinuz-*`",
-            remediation="Można usunąć nieużywane: `sudo pacman -Rs <kernel>`. Zostaw zapasowy.",
-            verification="`ls /boot/vmlinuz-* | wc -l` <= 2",
-            risk_level="Informacja.",
-            domain=classification.domain,
-            kind=classification.kind,
-            actionability=classification.actionability,
-            recommendation_intent=classification.recommendation_intent,
-            source_observation_ids=(obs_id,),
-            evidence_ids=(evidence[0].evidence_id,),
-        )
-        return DiagnosticRuleResult(finding=finding, evidence=evidence)
-
-
-class BootDelayRule(DiagnosticRule):
-    rule_id = "RULE-BOOT-DELAY"
-    supported_categories = frozenset({"boot_time"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        obs_id = observation.obs_id
-        t = observation.details.get("userspace_time", "?")
-        evidence_items = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=obs_id,
-                title=f"Wydłużony czas bootu ({t}s userspace)",
-                severity="P3",
-                confidence=conf,
-                evidence=f"Czas userspace: {t}s.",
-                interpretation="Czas uruchamiania przekracza 30s.",
-                recommended_diagnostics="`systemd-analyze blame`; `systemd-analyze critical-chain`",
-                remediation="Wyłącz zbędne usługi: `systemctl disable <usługa>`.",
-                verification="`systemd-analyze` — < 30s",
-                risk_level="Niskie.",
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(obs_id,),
-                evidence_ids=(evidence_items[0].evidence_id,),
-            ),
-            evidence=evidence_items,
-        )
-
-
-class StorageUsageRule(DiagnosticRule):
-    rule_id = "RULE-STORAGE-USAGE"
-    supported_categories = frozenset({"storage_usage"})
-
-    def __init__(self, evidence_builder):
-        self._evidence_builder = evidence_builder
-
-    def evaluate(self, observation, classification):
-        conf = derive_confidence(
-            direct_measurement=observation.direct_measurement,
-            data_complete=observation.data_complete,
-            contradictory_evidence=observation.contradictory_evidence,
-            inference_required=observation.inference_required,
-            independent_sources=observation.independent_sources,
-        )
-        details = observation.details
-        state = details.get("threshold_state", "warning")
-        mp = details.get("mountpoint", "/")
-        pct = details.get("usage_percent", 0)
-        if state == "critical":
-            fid, title, sev, interp, risk = (
-                "STORAGE-USAGE-CRITICAL",
-                f"Krytyczne użycie miejsca na {mp}: {pct}%",
-                "P1",
-                f"Przekroczono {pct}% — ryzyko braku miejsca.",
-                "Wysokie ryzyko utraty danych.",
-            )
-        else:
-            fid, title, sev, interp, risk = (
-                "STORAGE-USAGE-WARNING",
-                f"Znaczące użycie miejsca na {mp}: {pct}%",
-                "P2",
-                f"Zalecane monitorowanie użycia {mp}.",
-                "Średnie ryzyko. Monitoruj i zaplanuj czyszczenie.",
-            )
-        evidence = (self._evidence_builder.build(observation),)
-        return DiagnosticRuleResult(
-            finding=Finding(
-                finding_id=fid,
-                title=title,
-                severity=sev,
-                confidence=conf,
-                evidence=f"{mp}: {pct}%.",
-                interpretation=interp,
-                recommended_diagnostics="`du -sh /* | sort -rh | head -10`",
-                remediation="`sudo pacman -Sc`; `sudo journalctl --vacuum-size=500M`",
-                verification=f"`df -h {mp}` — < 75%",
-                risk_level=risk,
-                domain=classification.domain,
-                kind=classification.kind,
-                actionability=classification.actionability,
-                recommendation_intent=classification.recommendation_intent,
-                source_observation_ids=(observation.obs_id,),
-                evidence_ids=(evidence[0].evidence_id,),
-            ),
-            evidence=evidence,
-        )
-
-
-class DiagnosticRuleRegistry:
-    def __init__(self, rules: Iterable[DiagnosticRule]):
-        rule_list = tuple(rules)
-        if len({r.rule_id for r in rule_list}) != len(rule_list):
-            raise DuplicateDiagnosticRuleError("Duplicate rule_id in registry")
-        self._rules = rule_list
-
-    @property
-    def rules(self) -> tuple:
-        return self._rules
-
-
-class DiagnosticRuleEngine:
-    def __init__(
-        self,
-        registry: DiagnosticRuleRegistry,
-        classification_policy: FindingClassificationPolicy | None = None,
-    ):
-        self._registry = registry
-        self._classification_policy = (
-            classification_policy or FindingClassificationPolicy()
-        )
-
-    def evaluate(self, observations: Iterable[Observation]) -> DiagnosticEvaluation:
-        findings = []
-        evidence_list = []
-        seen_fids = set()
-        seen_eids = set()
-        for obs in observations:
-            classification = self._classification_policy.classify(obs)
-            matching = [r for r in self._registry.rules if r.supports(obs)]
-            if not matching:
-                raise UnsupportedObservationRuleError(
-                    f"No rule supports category '{obs.category}'"
-                )
-            raw_results = [r.evaluate(obs, classification) for r in matching]
-            results = [self._normalize(r) for r in raw_results]
-            results = [r for r in results if r is not None]
-            if len(results) > 1:
-                raise AmbiguousObservationRuleError(
-                    f"Multiple rules produced findings for category '{obs.category}'"
-                )
-            for result in results:
-                if result.finding is not None:
-                    if result.finding.finding_id in seen_fids:
-                        raise DuplicateFindingError(
-                            f"Duplicate finding_id: {result.finding.finding_id}"
-                        )
-                    seen_fids.add(result.finding.finding_id)
-                    findings.append(result.finding)
-                for ev in result.evidence:
-                    if ev.evidence_id in seen_eids:
-                        raise DuplicateEvidenceError(
-                            f"Duplicate evidence_id: {ev.evidence_id}"
-                        )
-                    seen_eids.add(ev.evidence_id)
-                    evidence_list.append(ev)
-        return DiagnosticEvaluation(
-            findings=tuple(findings), evidence=tuple(evidence_list)
-        )
-
-    @staticmethod
-    def _normalize(result: DiagnosticRuleResult) -> DiagnosticRuleResult | None:
-        if result.finding is None and not result.evidence:
-            return None
-        return result
-
-
-def build_default_rule_engine() -> DiagnosticRuleEngine:
-    policy = FindingClassificationPolicy()
-    eb = EvidenceBuilder()
-    rules = (
-        BtrfsDeviceErrorRule(eb),
-        BtrfsScrubStatusRule(eb),
-        WirePlumberSegfaultRule(eb),
-        GeneralSegfaultRule(eb),
-        MinorSegfaultRule(eb),
-        KernelTaintRule(eb),
-        KernelOomRule(eb),
-        GpuI915HangRule(eb),
-        AmdgpuResetFailRule(eb),
-        GpuNvidiaXid79Rule(eb),
-        FailedSystemUnitRule(eb),
-        FailedUserUnitRule(eb),
-        KernelCountRule(eb),
-        BootDelayRule(eb),
-        StorageUsageRule(eb),
-    )
-    return DiagnosticRuleEngine(DiagnosticRuleRegistry(rules), policy)
+import diagnostic_rules as _diagnostic_rules  # noqa: E402
+
+# Compatibility re-exports for existing syscheck imports.
+AmdgpuResetFailRule = _diagnostic_rules.AmdgpuResetFailRule
+AmbiguousObservationRuleError = _diagnostic_rules.AmbiguousObservationRuleError
+BootDelayRule = _diagnostic_rules.BootDelayRule
+BtrfsDeviceErrorRule = _diagnostic_rules.BtrfsDeviceErrorRule
+BtrfsScrubStatusRule = _diagnostic_rules.BtrfsScrubStatusRule
+DiagnosticEvaluation = _diagnostic_rules.DiagnosticEvaluation
+DiagnosticRule = _diagnostic_rules.DiagnosticRule
+DiagnosticRuleEngine = _diagnostic_rules.DiagnosticRuleEngine
+DiagnosticRuleError = _diagnostic_rules.DiagnosticRuleError
+DiagnosticRuleRegistry = _diagnostic_rules.DiagnosticRuleRegistry
+DiagnosticRuleResult = _diagnostic_rules.DiagnosticRuleResult
+DuplicateDiagnosticRuleError = _diagnostic_rules.DuplicateDiagnosticRuleError
+DuplicateEvidenceError = _diagnostic_rules.DuplicateEvidenceError
+DuplicateFindingError = _diagnostic_rules.DuplicateFindingError
+FailedSystemUnitRule = _diagnostic_rules.FailedSystemUnitRule
+FailedUserUnitRule = _diagnostic_rules.FailedUserUnitRule
+GeneralSegfaultRule = _diagnostic_rules.GeneralSegfaultRule
+GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
+GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
+KernelCountRule = _diagnostic_rules.KernelCountRule
+KernelOomRule = _diagnostic_rules.KernelOomRule
+KernelTaintRule = _diagnostic_rules.KernelTaintRule
+MinorSegfaultRule = _diagnostic_rules.MinorSegfaultRule
+PcieAerErrorRule = _diagnostic_rules.PcieAerErrorRule
+NvmeControllerReliabilityRule = _diagnostic_rules.NvmeControllerReliabilityRule
+StorageUsageRule = _diagnostic_rules.StorageUsageRule
+UnsupportedObservationRuleError = _diagnostic_rules.UnsupportedObservationRuleError
+WirePlumberSegfaultRule = _diagnostic_rules.WirePlumberSegfaultRule
+build_default_rule_engine = _diagnostic_rules.build_default_rule_engine
 
 
 class SysCheckEngine:
@@ -2251,18 +1602,9 @@ class SysCheckEngine:
         result = self.cmd(
             cmd, timeout=timeout, env=env, optional_dependency=optional_dependency
         )
-        if result.execution_status == "ok":
-            return result.stdout
-        if result.execution_status == "empty_ok":
-            return result.stdout if result.stdout else "(brak wyników)"
         if result.execution_status == "permission_denied":
             self.restrictions.append(f"Brak sudo: {cmd[0]}")
-            return fallback if fallback else "(wymaga sudo — pominięto)"
-        if result.execution_status == "not_found":
-            return fallback if fallback else f"(nie znaleziono: {cmd[0]})"
-        if result.execution_status == "timeout":
-            return fallback if fallback else f"(timeout {timeout}s)"
-        return fallback if fallback else f"(błąd rc={result.return_code})"
+        return fallback if fallback else result.to_fallback_text()
 
     # ── Równoległe wykonanie grupy komend ────────────────────────
     def _parallel(self, tasks: Dict[str, Tuple[List[str], int]]) -> Dict[str, str]:
@@ -2455,7 +1797,7 @@ class SysCheckEngine:
                 [
                     "bash",
                     "-c",
-                    "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c",
+                    "set -o pipefail; cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c",
                 ],
                 TIMEOUT_SHORT,
             ),
@@ -2656,29 +1998,27 @@ class SysCheckEngine:
                 False,
             ),
             "kernel_errors": (
-                [
-                    "bash",
-                    "-c",
-                    f"journalctl -b -k --no-pager 2>/dev/null | grep -iE '{RE_KERNEL_ERROR}' | tail -50 || true",
-                ],
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_KERNEL_ERROR,
+                    tail_lines=50,
+                ),
                 TIMEOUT_LONG,
                 False,
             ),
             "segfaults": (
-                [
-                    "bash",
-                    "-c",
-                    f"journalctl -b --no-pager 2>/dev/null | grep -i '{RE_SEGFAULT}' || true",
-                ],
+                _journal_filter_command(
+                    "journalctl -b --no-pager 2>/dev/null", [RE_SEGFAULT]
+                ),
                 TIMEOUT_LONG,
                 False,
             ),
             "firmware_msgs": (
-                [
-                    "bash",
-                    "-c",
-                    f"journalctl -b --no-pager 2>/dev/null | grep -iE '{RE_FIRMWARE}' | tail -20 || true",
-                ],
+                _oom_collector_command(
+                    "journalctl -b --no-pager 2>/dev/null",
+                    RE_FIRMWARE,
+                    tail_lines=20,
+                ),
                 TIMEOUT_LONG,
                 False,
             ),
@@ -2714,6 +2054,22 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "pcie_aer": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_PCIE_AER,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
+            "nvme_controller_reliability": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_NVME_CONTROLLER_RELIABILITY,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2727,6 +2083,8 @@ class SysCheckEngine:
         gpu_i915_hang_result = r["gpu_i915_hang"]
         amdgpu_reset_fail_result = r["amdgpu_reset_fail"]
         gpu_nvidia_xid_79_result = r["gpu_nvidia_xid_79"]
+        pcie_aer_result = r.get("pcie_aer")
+        nvme_controller_reliability_result = r.get("nvme_controller_reliability")
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2794,10 +2152,13 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="SEGFAULT-WP-001",
                         category="segfault",
-                        payload={
-                            "segfault_type": "wireplumber",
-                            "count": unique_segfault_count,
-                        },
+                        payload=_capture_payload(
+                            segfaults_result,
+                            {
+                                "segfault_type": "wireplumber",
+                                "count": unique_segfault_count,
+                            },
+                        ),
                     )
                 )
             else:
@@ -2806,10 +2167,13 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="SEGFAULT-SYS-001",
                         category="segfault",
-                        payload={
-                            "segfault_type": "system_wide",
-                            "count": unique_segfault_count,
-                        },
+                        payload=_capture_payload(
+                            segfaults_result,
+                            {
+                                "segfault_type": "system_wide",
+                                "count": unique_segfault_count,
+                            },
+                        ),
                     )
                 )
         elif unique_segfault_count > 0:
@@ -2817,9 +2181,12 @@ class SysCheckEngine:
                 RawDiagnostic(
                     source_id="SEGFAULT-MIN-001",
                     category="segfault_minor",
-                    payload={
-                        "count": unique_segfault_count,
-                    },
+                    payload=_capture_payload(
+                        segfaults_result,
+                        {
+                            "count": unique_segfault_count,
+                        },
+                    ),
                 )
             )
 
@@ -2832,7 +2199,7 @@ class SysCheckEngine:
                 RawDiagnostic(
                     source_id="KERNEL-TAINT-001",
                     category="tainted",
-                    payload={"tainted": True},
+                    payload=_capture_payload(kernel_errors_result, {"tainted": True}),
                 )
             )
 
@@ -2868,14 +2235,17 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="KERNEL-OOM-001",
                         category="oom_event",
-                        payload={
-                            "oom_detected": True,
-                            "matched_lines": oom_matching[:20],
-                            "match_count": len(oom_matching),
-                            "match_classes": match_classes,
-                            "journal_scope": "current_boot_kernel",
-                            "source_query": "oom_events",
-                        },
+                        payload=_capture_payload(
+                            oom_events_result,
+                            {
+                                "oom_detected": True,
+                                "matched_lines": oom_matching[:20],
+                                "match_count": len(oom_matching),
+                                "match_classes": match_classes,
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "oom_events",
+                            },
+                        ),
                     )
                 )
 
@@ -2892,15 +2262,18 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="GPU-I915-HANG-001",
                         category="gpu_i915_hang",
-                        payload={
-                            "hang_detected": True,
-                            "matched_lines": hang_matching[:20],
-                            "match_count": len(hang_matching),
-                            "driver": "i915",
-                            "driver_attribution_source": "in_message",
-                            "journal_scope": "current_boot_kernel",
-                            "source_query": "gpu_i915_hang",
-                        },
+                        payload=_capture_payload(
+                            gpu_i915_hang_result,
+                            {
+                                "hang_detected": True,
+                                "matched_lines": hang_matching[:20],
+                                "match_count": len(hang_matching),
+                                "driver": "i915",
+                                "driver_attribution_source": "in_message",
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "gpu_i915_hang",
+                            },
+                        ),
                     )
                 )
 
@@ -2917,15 +2290,18 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="AMDGPU-RESET-FAIL-001",
                         category="amdgpu_reset_fail",
-                        payload={
-                            "reset_failure_detected": True,
-                            "matched_lines": reset_matching[:20],
-                            "match_count": len(reset_matching),
-                            "driver": "amdgpu",
-                            "driver_attribution_source": "in_message",
-                            "journal_scope": "current_boot_kernel",
-                            "source_query": "amdgpu_reset_fail",
-                        },
+                        payload=_capture_payload(
+                            amdgpu_reset_fail_result,
+                            {
+                                "reset_failure_detected": True,
+                                "matched_lines": reset_matching[:20],
+                                "match_count": len(reset_matching),
+                                "driver": "amdgpu",
+                                "driver_attribution_source": "in_message",
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "amdgpu_reset_fail",
+                            },
+                        ),
                     )
                 )
 
@@ -2942,16 +2318,98 @@ class SysCheckEngine:
                     RawDiagnostic(
                         source_id="GPU-NVIDIA-XID-79-001",
                         category="gpu_nvidia_xid_79",
-                        payload={
-                            "xid_detected": True,
-                            "xid_code": 79,
-                            "matched_lines": xid79_matching[:20],
-                            "match_count": len(xid79_matching),
-                            "driver": "nvidia",
-                            "driver_attribution_source": "in_message",
-                            "journal_scope": "current_boot_kernel",
-                            "source_query": "gpu_nvidia_xid_79",
-                        },
+                        payload=_capture_payload(
+                            gpu_nvidia_xid_79_result,
+                            {
+                                "xid_detected": True,
+                                "xid_code": 79,
+                                "matched_lines": xid79_matching[:20],
+                                "match_count": len(xid79_matching),
+                                "driver": "nvidia",
+                                "driver_attribution_source": "in_message",
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "gpu_nvidia_xid_79",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź PCIe AER — tylko jawne komunikaty błędów z bieżącego bootu.
+        if (
+            pcie_aer_result
+            and pcie_aer_result.is_ok()
+            and pcie_aer_result.stdout.strip()
+        ):
+            aer_matching = [
+                line
+                for line in pcie_aer_result.stdout.split("\n")
+                if re.search(RE_PCIE_AER, line, re.IGNORECASE)
+            ]
+            severities = [
+                severity
+                for line in aer_matching
+                if (severity := _pcie_aer_severity(line)) is not None
+            ]
+            if severities:
+                aer_severity = max(
+                    severities,
+                    key={"corrected": 1, "non_fatal": 2, "fatal": 3}.get,
+                )
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="PCIE-AER-001",
+                        category="pcie_aer_error",
+                        payload=_capture_payload(
+                            pcie_aer_result,
+                            {
+                                "aer_detected": True,
+                                "aer_severity": aer_severity,
+                                "matched_lines": aer_matching[:20],
+                                "match_count": len(aer_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "pcie_aer",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź niezawodność kontrolera NVMe — tylko jawne zdarzenia bieżącego bootu.
+        if (
+            nvme_controller_reliability_result
+            and nvme_controller_reliability_result.is_ok()
+            and nvme_controller_reliability_result.stdout.strip()
+        ):
+            nvme_matching = [
+                line
+                for line in nvme_controller_reliability_result.stdout.split("\n")
+                if re.search(RE_NVME_CONTROLLER_RELIABILITY, line, re.IGNORECASE)
+            ]
+            severities = [
+                severity
+                for line in nvme_matching
+                if (severity := _nvme_controller_reliability_severity(line)) is not None
+            ]
+            if severities:
+                event_severity = max(
+                    severities,
+                    key={"timeout_or_reset": 1, "reset_failure": 2}.get,
+                )
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="NVME-CONTROLLER-RESET-001",
+                        category="nvme_controller_reliability",
+                        payload=_capture_payload(
+                            nvme_controller_reliability_result,
+                            {
+                                "nvme_detected": True,
+                                "event_severity": event_severity,
+                                "matched_lines": nvme_matching[:20],
+                                "match_count": len(nvme_matching),
+                                "event_classes": list(dict.fromkeys(severities)),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "nvme_controller_reliability",
+                            },
+                        ),
                     )
                 )
 
@@ -3143,7 +2601,9 @@ class SysCheckEngine:
 
         # Obsługa pacman -Qdt: rc=1 z pustym stdout oznacza "brak pakietów osieroconych"
         if orphans_result.execution_status == "empty_ok" or (
-            orphans_result.return_code == 1 and not orphans_result.stdout
+            orphans_result.return_code == 1
+            and not orphans_result.stdout
+            and not orphans_result.stderr
         ):
             self.report_lines.append("(brak pakietów osieroconych)\n\n")
             self.restrictions.append(
@@ -3248,12 +2708,11 @@ class SysCheckEngine:
             "drm_ls": (["ls", "/sys/class/drm/"], TIMEOUT_SHORT, False),
             "niri_out": (["niri", "msg", "outputs"], TIMEOUT_SHORT, False),
             "gfx_logs": (
-                [
-                    "bash",
-                    "-c",
-                    f"journalctl -b --no-pager 2>/dev/null | grep -iE '{RE_GFX_ERROR}' | "
-                    f"grep -iE 'error|fail|warn' | tail -30 || true",
-                ],
+                _journal_filter_command(
+                    "journalctl -b --no-pager 2>/dev/null",
+                    [RE_GFX_ERROR, "error|fail|warn"],
+                    tail_lines=30,
+                ),
                 TIMEOUT_LONG,
                 False,
             ),
@@ -3300,11 +2759,9 @@ class SysCheckEngine:
                 False,
             ),
             "auth_fails": (
-                [
-                    "bash",
-                    "-c",
-                    f"journalctl -b --no-pager 2>/dev/null | grep -ciE '{RE_AUTH_FAIL}' || echo 0",
-                ],
+                _journal_count_command(
+                    "journalctl -b --no-pager 2>/dev/null", RE_AUTH_FAIL
+                ),
                 TIMEOUT_LONG,
                 False,
             ),
@@ -3517,6 +2974,7 @@ class SysCheckEngine:
         cat = raw.category
         payload = raw.payload
         src_id = raw.source_id
+        capture_complete = not bool(payload.get("capture_truncated"))
 
         if cat == "btrfs_error":
             return Observation(
@@ -3536,7 +2994,7 @@ class SysCheckEngine:
                 category="btrfs_scrub",
                 details={**payload},
                 direct_measurement=True,
-                data_complete="scrub_status" in payload,
+                data_complete="scrub_status" in payload and capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3559,7 +3017,7 @@ class SysCheckEngine:
                 category="segfault",
                 details={**payload},
                 direct_measurement=False,  # segfaults are observed but cause is not
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=inference,
                 independent_sources=1,
@@ -3571,7 +3029,7 @@ class SysCheckEngine:
                 category="segfault_minor",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3583,7 +3041,7 @@ class SysCheckEngine:
                 category="tainted",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3655,7 +3113,7 @@ class SysCheckEngine:
                 category="oom_event",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3667,7 +3125,7 @@ class SysCheckEngine:
                 category="gpu_i915_hang",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3679,7 +3137,7 @@ class SysCheckEngine:
                 category="amdgpu_reset_fail",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3691,7 +3149,31 @@ class SysCheckEngine:
                 category="gpu_nvidia_xid_79",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "pcie_aer_error":
+            return Observation(
+                obs_id="PCIE-AER-001",
+                category="pcie_aer_error",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "nvme_controller_reliability":
+            return Observation(
+                obs_id="NVME-CONTROLLER-RESET-001",
+                category="nvme_controller_reliability",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -3761,8 +3243,10 @@ class SysCheckEngine:
         timestamp = self.start_time_local.strftime("%Y%m%d-%H%M%S")
         report_filename = f"syscheck-{self.hostname}-{timestamp}.md"
         report_path = self.output_dir / report_filename
+
         full_report = "".join(self.report_lines)
-        report_path.write_text(full_report, encoding="utf-8")
+        _write_new_text(report_path, full_report)
+
         self.log(f"\nRaport zapisany do: {report_path}")
         return str(report_path)
 
@@ -4362,8 +3846,10 @@ class SystemSnapshot:
     def to_json(self, path: str) -> None:
         import json
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False, sort_keys=True)
+        payload = json.dumps(
+            self.to_dict(), indent=2, ensure_ascii=False, sort_keys=True
+        )
+        _write_new_text(path, payload)
 
     @classmethod
     def from_json(cls, path: str) -> "SystemSnapshot":
@@ -4881,46 +4367,6 @@ def format_comparison_markdown(comp: SnapshotComparison) -> str:
 
     return "".join(lines)
 
-    if comp.new_findings:
-        lines.append("## New problems\n\n")
-        for f in comp.new_findings:
-            lines.append(f"+ **{f.get('finding_id', '?')}**: {f.get('title', '?')}\n")
-        lines.append("\n")
-
-    if comp.resolved_findings:
-        lines.append("## Resolved\n\n")
-        for f in comp.resolved_findings:
-            lines.append(
-                f"+ \u2713 **{f.get('finding_id', '?')}**: {f.get('title', '?')}\n"
-            )
-        lines.append("\n")
-
-    if comp.changed_findings:
-        lines.append("## Changed findings\n\n")
-        for cf in comp.changed_findings:
-            lines.append(f"### {cf['finding_id']}: {cf['title']}\n\n")
-            for key, vals in cf["changes"].items():
-                lines.append(
-                    f"**{key}**\n\n{vals['old']}\n\n\u2193\n\n{vals['new']}\n\n"
-                )
-        lines.append("\n")
-
-    if comp.environment_changes:
-        lines.append("## Environment changes\n\n")
-        for key, vals in comp.environment_changes.items():
-            lines.append(f"**{key}**\n\n")
-            if (
-                isinstance(vals, dict)
-                and "old" in vals
-                and "new" in vals
-                and not isinstance(vals.get("old"), dict)
-            ):
-                lines.append(f"  {vals['old']}  \u2192  {vals['new']}\n\n")
-            else:
-                lines.append(f"  Changed: {vals}\n\n")
-
-    return "".join(lines)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -4980,7 +4426,7 @@ def main() -> None:
         comp = SnapshotComparator.compare(old_snapshot, new_snapshot)
         md = format_comparison_markdown(comp)
         if args.output:
-            Path(args.output).write_text(md, encoding="utf-8")
+            _write_new_text(args.output, md)
             print(f"Comparison saved to: {args.output}")
         print(md)
         return

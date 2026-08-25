@@ -19,6 +19,8 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
     RE_NVIDIA_XID_79,
+    RE_NVME_CONTROLLER_RELIABILITY,
+    RE_PCIE_AER,
     CmdResult,
     Finding,
     Observation,
@@ -33,11 +35,84 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
     _get_bootable_kernels_from_modules,
+    _journal_count_command,
+    _journal_filter_command,
     _oom_collector_command,
+    _nvme_controller_reliability_severity,
+    _pcie_aer_severity,
     _parse_storage_usage,
+    _write_new_text,
     confidence_tag,
+    run_cmd,
     severity_tag,
 )
+
+
+class TestDiagnosticRuleImportBoundary:
+    """Iteration 33A: keep the extracted runtime import boundary safe."""
+
+    @staticmethod
+    def _run_fresh_python(code: str) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_diagnostic_rules_first_import_is_safe(self):
+        self._run_fresh_python(
+            "import sys; import diagnostic_rules; "
+            "assert 'syscheck' not in sys.modules; import syscheck; "
+            "assert syscheck.build_default_rule_engine()._registry.rules"
+        )
+
+    def test_syscheck_first_import_is_safe(self):
+        self._run_fresh_python(
+            "import syscheck; import diagnostic_rules; "
+            "assert syscheck.build_default_rule_engine()._registry.rules"
+        )
+
+    def test_all_rule_runtime_reexports_are_identical(self):
+        import diagnostic_rules
+        import syscheck
+
+        names = (
+            "DiagnosticRuleResult",
+            "DiagnosticEvaluation",
+            "DiagnosticRuleError",
+            "UnsupportedObservationRuleError",
+            "AmbiguousObservationRuleError",
+            "DuplicateDiagnosticRuleError",
+            "DuplicateFindingError",
+            "DuplicateEvidenceError",
+            "DiagnosticRule",
+            "BtrfsDeviceErrorRule",
+            "BtrfsScrubStatusRule",
+            "WirePlumberSegfaultRule",
+            "GeneralSegfaultRule",
+            "MinorSegfaultRule",
+            "KernelTaintRule",
+            "KernelOomRule",
+            "GpuI915HangRule",
+            "AmdgpuResetFailRule",
+            "GpuNvidiaXid79Rule",
+            "FailedSystemUnitRule",
+            "FailedUserUnitRule",
+            "KernelCountRule",
+            "BootDelayRule",
+            "StorageUsageRule",
+            "DiagnosticRuleRegistry",
+            "DiagnosticRuleEngine",
+            "build_default_rule_engine",
+        )
+
+        assert all(
+            getattr(syscheck, name) is getattr(diagnostic_rules, name) for name in names
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -244,6 +319,44 @@ linux-tools 7.1.5-1
 linux-utils 1.0-1"""
         bootable_count, _, _ = _count_kernel_packages(pkg_list)
         assert bootable_count > 0  # At minimum, linux is counted
+
+    def test_debian_dpkg_output_counts_installed_kernel_images(self):
+        pkg_list = """Desired=Unknown/Install/Remove/Purge/Hold
+| Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend
+|/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)
+||/ Name                                Version               Architecture Description
++++-===================================-=====================-============-=================================
+ii  linux-image-6.8.0-31-generic        6.8.0-31.31          amd64        Signed kernel image generic
+ii  linux-image-6.8.0-32-generic        6.8.0-32.32          amd64        Signed kernel image generic
+ii  linux-headers-6.8.0-32              6.8.0-32.32          all          Header files
+ii  linux-firmware                      20240318.git3b128b60-0ubuntu2 all Firmware
+rc  linux-image-6.8.0-30-generic        6.8.0-30.30          amd64        Removed kernel image
+"""
+        bootable_count, total_count, bootable_list = _count_kernel_packages(pkg_list)
+
+        assert bootable_count == 2
+        assert total_count == 4
+        assert bootable_list == [
+            "linux-image-6.8.0-31-generic 6.8.0-31.31",
+            "linux-image-6.8.0-32-generic 6.8.0-32.32",
+        ]
+
+    def test_rpm_output_counts_distinct_kernel_versions(self):
+        pkg_list = """kernel-6.8.9-200.fc40.x86_64
+kernel-core-6.8.9-200.fc40.x86_64
+kernel-modules-6.8.9-200.fc40.x86_64
+kernel-devel-6.8.9-200.fc40.x86_64
+kernel-headers-6.8.9-200.fc40.x86_64
+kernel-core-6.8.10-200.fc40.x86_64
+kernel-modules-6.8.10-200.fc40.x86_64"""
+        bootable_count, total_count, bootable_list = _count_kernel_packages(pkg_list)
+
+        assert bootable_count == 2
+        assert total_count == 7
+        assert bootable_list == [
+            "kernel-core-6.8.9-200.fc40.x86_64",
+            "kernel-core-6.8.10-200.fc40.x86_64",
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -665,6 +778,208 @@ class TestCmdResult:
             execution_status="timeout",
         )
         assert cr.to_fallback_text() == "(timeout)"
+
+
+class TestBoundedCommandCapture:
+    def test_stdout_is_bounded_while_command_runs(self):
+        result = run_cmd(["bash", "-c", "head -c 20000 /dev/zero | tr '\\0' x"])
+        assert result.execution_status == "ok"
+        assert len(result.stdout.encode()) <= 5000
+        assert result.truncated
+
+    def test_stderr_is_bounded_and_status_is_preserved(self):
+        result = run_cmd(["bash", "-c", "head -c 20000 /dev/zero >&2; exit 7"])
+        assert result.execution_status == "error"
+        assert result.return_code == 7
+        assert len(result.stderr.encode()) <= 5000
+        assert result.truncated
+
+    def test_timeout_keeps_partial_output_and_marks_incomplete(self):
+        result = run_cmd(["bash", "-c", "printf prefix; sleep 2"], timeout=1)
+        assert result.execution_status == "timeout"
+        assert result.return_code == -2
+        assert result.stdout == "prefix"
+        assert "niepełny" in result.to_fallback_text()
+
+    def test_timeout_keeps_partial_stderr_visible(self):
+        result = run_cmd(["bash", "-c", "printf err >&2; sleep 2"], timeout=1)
+        assert result.execution_status == "timeout"
+        assert result.stderr.startswith("err")
+        assert "err" in result.to_fallback_text()
+
+    def test_rc_one_without_explicit_contract_is_error(self):
+        result = run_cmd(["bash", "-c", "exit 1"])
+        assert result.return_code == 1
+        assert result.execution_status == "error"
+
+    def test_truncated_success_is_visible_in_fallback_text(self):
+        result = CmdResult("cmd", "x", "", 0, "ok", truncated=True)
+        assert "obcięty" in result.to_fallback_text()
+
+    def test_cmd_ok_preserves_truncation_marker(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_cmd_ok_capture")
+        result = CmdResult("cmd", "prefix", "", 0, "ok", truncated=True)
+        with patch.object(engine, "cmd", return_value=result):
+            assert "obcięty" in engine.cmd_ok(["cmd"])
+
+    def test_cmd_ok_preserves_timeout_partial_output(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_cmd_ok_timeout")
+        result = CmdResult("cmd", "prefix", "Timeout", -2, "timeout")
+        with patch.object(engine, "cmd", return_value=result):
+            assert "prefix" in engine.cmd_ok(["cmd"])
+
+
+class TestStatusAwareJournalCommands:
+    def test_filter_no_match_is_success(self):
+        result = subprocess.run(
+            _journal_filter_command("printf harmless", ["needle"]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    @pytest.mark.parametrize("return_code", [1, 42])
+    def test_filter_source_failure_is_preserved(self, return_code):
+        result = subprocess.run(
+            _journal_filter_command(f"bash -c 'exit {return_code}'", ["needle"]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == return_code
+
+    def test_auth_count_no_match_emits_zero_successfully(self):
+        result = subprocess.run(
+            _journal_count_command("printf harmless", "needle"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "0\n"
+
+    def test_auth_count_source_failure_does_not_emit_false_zero(self):
+        result = subprocess.run(
+            _journal_count_command("bash -c 'exit 1'", "needle"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1
+
+    def test_auth_count_match_reports_count(self):
+        result = subprocess.run(
+            _journal_count_command("printf 'needle\\nneedle\\n'", "needle"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "2\n"
+
+    def test_filter_invalid_regex_is_error(self):
+        result = subprocess.run(
+            _journal_filter_command("printf test", ["invalid["]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 2
+
+
+class TestCaptureCompleteness:
+    @pytest.mark.parametrize(
+        ("category", "source_id"),
+        [
+            ("pcie_aer_error", "PCIE-AER-001"),
+            ("nvme_controller_reliability", "NVME-CONTROLLER-RESET-001"),
+        ],
+    )
+    def test_truncated_raw_capture_degrades_observation(self, category, source_id):
+        engine = SysCheckEngine(output_dir="/tmp/test_capture_completeness")
+        engine.raw_diagnostics.append(
+            RawDiagnostic(
+                source_id=source_id,
+                category=category,
+                payload={"capture_truncated": True},
+            )
+        )
+        engine._derive_observations()
+        observation = engine.observations[0]
+        assert observation.data_complete is False
+
+
+class TestExclusiveDestinationWrites:
+    def test_new_text_creates_absent_destination(self, tmp_path):
+        destination = tmp_path / "report.md"
+        _write_new_text(destination, "report")
+        assert destination.read_text() == "report"
+
+    def test_new_text_rejects_existing_file_without_truncation(self, tmp_path):
+        destination = tmp_path / "report.md"
+        destination.write_text("keep")
+        with pytest.raises(FileExistsError):
+            _write_new_text(destination, "replace")
+        assert destination.read_text() == "keep"
+
+    @pytest.mark.parametrize("dangling", [False, True])
+    def test_new_text_rejects_final_symlink(self, tmp_path, dangling):
+        target = tmp_path / "target.txt"
+        if not dangling:
+            target.write_text("keep")
+        destination = tmp_path / "report.md"
+        destination.symlink_to(target)
+        with pytest.raises(FileExistsError):
+            _write_new_text(destination, "replace")
+        assert destination.is_symlink()
+        if not dangling:
+            assert target.read_text() == "keep"
+
+    def test_snapshot_rejects_existing_destination(self, tmp_path):
+        snapshot = SystemSnapshot()
+        destination = tmp_path / "snapshot.json"
+        destination.write_text("keep")
+        with pytest.raises(FileExistsError):
+            snapshot.to_json(destination)
+        assert destination.read_text() == "keep"
+
+    def test_compare_rejects_existing_output_without_overwrite(
+        self, tmp_path, monkeypatch
+    ):
+        import syscheck
+
+        old_path = tmp_path / "old.json"
+        new_path = tmp_path / "new.json"
+        snapshot = SystemSnapshot(
+            metadata=SnapshotMetadata(
+                hostname="host", kernel="kernel", syscheck_version="1"
+            )
+        )
+        snapshot.to_json(old_path)
+        snapshot.to_json(new_path)
+        output = tmp_path / "comparison.md"
+        output.write_text("keep")
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "syscheck.py",
+                "compare",
+                str(old_path),
+                str(new_path),
+                "--output",
+                str(output),
+            ],
+        )
+        with pytest.raises(FileExistsError):
+            syscheck.main()
+        assert output.read_text() == "keep"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1174,22 +1489,15 @@ class TestSchemaVersioning:
         with pytest.raises(UnsupportedSnapshotSchemaError, match="must be int"):
             SystemSnapshot._from_validated({"schema_version": "1"})
 
-    def test_schema_version_2_roundtrip(self):
+    def test_schema_version_2_roundtrip(self, tmp_path):
         snap = SystemSnapshot(
             metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1.0"),
         )
-        import tempfile
-        import os
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            path = f.name
-            snap.to_json(path)
-        try:
-            loaded = SystemSnapshot.from_json(path)
-            assert loaded.schema_version == 3
-            assert loaded.metadata.hostname == "h"
-        finally:
-            os.unlink(path)
+        path = tmp_path / "snapshot.json"
+        snap.to_json(path)
+        loaded = SystemSnapshot.from_json(path)
+        assert loaded.schema_version == 3
+        assert loaded.metadata.hostname == "h"
 
     def test_schema_v1_migration_to_v3_works(self):
         """v1 snapshots are migrated to v2 with empty recommendations."""
@@ -1393,7 +1701,7 @@ class TestSnapshotBuilder:
 class TestSnapshotSerializationTyped:
     """T5: typed round-trip, deterministic JSON."""
 
-    def test_typed_roundtrip(self):
+    def test_typed_roundtrip(self, tmp_path):
         snap = SystemSnapshot(
             metadata=SnapshotMetadata(
                 hostname="test", kernel="6.18.40", syscheck_version="2.2.0"
@@ -1408,19 +1716,12 @@ class TestSnapshotSerializationTyped:
             restrictions=("R1",),
             execution=ExecutionSnapshot(commands_count=5),
         )
-        import tempfile
-        import os
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            path = f.name
-            snap.to_json(path)
-        try:
-            loaded = SystemSnapshot.from_json(path)
-            assert loaded.metadata.hostname == "test"
-            assert loaded.findings[0].finding_id == "F1"
-            assert loaded.restrictions == ("R1",)
-        finally:
-            os.unlink(path)
+        path = tmp_path / "snapshot.json"
+        snap.to_json(path)
+        loaded = SystemSnapshot.from_json(path)
+        assert loaded.metadata.hostname == "test"
+        assert loaded.findings[0].finding_id == "F1"
+        assert loaded.restrictions == ("R1",)
 
     def test_deterministic_json(self):
         snap1 = SystemSnapshot(
@@ -1934,7 +2235,7 @@ class TestRecommendationMarkdown:
 class TestSnapshotV2Migration:
     """Schema v1 → v2 migration and v2 round-trip with recommendations."""
 
-    def test_v3_roundtrip_with_recommendations(self):
+    def test_v3_roundtrip_with_recommendations(self, tmp_path):
         rec = DiagnosticRecommendation(
             recommendation_id="REC-F1",
             priority=2,
@@ -1953,19 +2254,12 @@ class TestSnapshotV2Migration:
             ),
             recommendations=(rec,),
         )
-        import tempfile
-        import os
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            path = f.name
-            snap.to_json(path)
-        try:
-            loaded = SystemSnapshot.from_json(path)
-            assert loaded.schema_version == 3
-            assert len(loaded.recommendations) == 1
-            assert loaded.recommendations[0].recommendation_id == "REC-F1"
-        finally:
-            os.unlink(path)
+        path = tmp_path / "snapshot.json"
+        snap.to_json(path)
+        loaded = SystemSnapshot.from_json(path)
+        assert loaded.schema_version == 3
+        assert len(loaded.recommendations) == 1
+        assert loaded.recommendations[0].recommendation_id == "REC-F1"
 
     def test_v1_migrated_to_v3_has_empty_recommendations(self):
         import json
@@ -2071,6 +2365,22 @@ class TestFindingClassificationModel:
         )
         assert a == b
 
+    def test_hash_matches_equal_values(self):
+        a = FindingClassification(
+            DiagnosticDomain.SYSTEMD,
+            FindingKind.FAILED_UNIT,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        )
+        b = FindingClassification(
+            DiagnosticDomain.SYSTEMD,
+            FindingKind.FAILED_UNIT,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        )
+        assert hash(a) == hash(b)
+        assert {a: "classification"}[b] == "classification"
+
 
 class TestClassificationPolicy:
     """Policy maps observation categories to classifications deterministically."""
@@ -2151,6 +2461,10 @@ class TestClassificationPolicyCompleteness:
             "kernel_count",
             "boot_time",
             "storage_usage",
+            "oom_event",
+            "gpu_i915_hang",
+            "amdgpu_reset_fail",
+            "gpu_nvidia_xid_79",
         ]
         policy = FindingClassificationPolicy()
         for cat in known_categories:
@@ -5651,17 +5965,199 @@ class TestSegfaultAndTaintCollectorPath:
             r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
         ]
         assert len(wp_raws) == 1
-        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
-        assert wp_raws[0].payload.get("count") == 3
-        # No SYS or MIN diagnostic
-        sys_raws = [
-            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-SYS-001"
-        ]
-        min_raws = [
-            r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-MIN-001"
-        ]
-        assert len(sys_raws) == 0
-        assert len(min_raws) == 0
+
+    # Iteration 35: deterministic current-boot NVMe controller events.
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult("", stdout, "", return_code, status)
+
+    @staticmethod
+    def _cmd_ok(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    def _collect_with_mock(self, engine, **overrides):
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd_ok("0"),
+            "kernel_errors": self._cmd_ok(""),
+            "segfaults": self._cmd_ok(""),
+            "firmware_msgs": self._cmd_ok(""),
+            "oom_events": self._cmd_ok(""),
+            "gpu_i915_hang": self._cmd_ok(""),
+            "amdgpu_reset_fail": self._cmd_ok(""),
+            "gpu_nvidia_xid_79": self._cmd_ok(""),
+            "lspci": self._cmd_ok(""),
+            "lsusb": self._cmd_ok(""),
+        }
+        results.update(overrides)
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _make_segfault_line(
+        program: str,
+        library: str,
+        pid: int,
+        ip_hex: str = "7f2c9743a55c",
+        sp_hex: str = "7fff981984c8",
+        addr_hex: str = "13155c",
+        base_hex: str = "7f2c97382000",
+    ) -> str:
+        return (
+            f"kernel: {program}[{pid}]: segfault at 0 ip {ip_hex} sp {sp_hex} "
+            f"error 4 in {library}[{addr_hex},{base_hex}+f0000]"
+        )
+
+    def _collect(self, engine: SysCheckEngine, nvme: CmdResult) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": self._cmd(),
+            "nvme_controller_reliability": nvme,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @staticmethod
+    def _line(event: str) -> str:
+        lines = {
+            "io_timeout": "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting",
+            "timeout_reset": "kernel: nvme nvme0: I/O 16 QID 4 timeout, reset controller",
+            "controller_down": "kernel: nvme nvme0: controller is down; will reset: CSTS=0x1",
+            "device_not_ready": "kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0",
+        }
+        return lines[event]
+
+    @pytest.mark.parametrize(
+        "event",
+        ["io_timeout", "timeout_reset", "controller_down", "device_not_ready"],
+    )
+    def test_explicit_nvme_controller_events_match(self, event):
+        assert re.search(RE_NVME_CONTROLLER_RELIABILITY, self._line(event), re.I)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: nvme nvme0: controller initialized",
+            "kernel: nvme nvme0: reset controller requested",
+            "kernel: nvme nvme0: timeout configured to 30 seconds",
+            "kernel: nvme nvme0: I/O timeout configured to 30 seconds",
+            "kernel: nvme nvme0: I/O queue initialized",
+            "kernel: nvme nvme0: Device ready",
+            "kernel: nvme nvme0: I/O 16 QID 4 completed",
+        ],
+    )
+    def test_generic_nvme_init_reset_and_timeout_text_does_not_match(self, line):
+        assert re.search(RE_NVME_CONTROLLER_RELIABILITY, line, re.I) is None
+
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [
+            ("io_timeout", "timeout_or_reset"),
+            ("timeout_reset", "timeout_or_reset"),
+            ("controller_down", "timeout_or_reset"),
+            ("device_not_ready", "reset_failure"),
+        ],
+    )
+    def test_explicit_event_severity_is_deterministic(self, event, expected):
+        assert _nvme_controller_reliability_severity(self._line(event)) == expected
+
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [
+            ("io_timeout", "P2"),
+            ("timeout_reset", "P2"),
+            ("controller_down", "P2"),
+            ("device_not_ready", "P1"),
+        ],
+    )
+    def test_pipeline_preserves_event_severity(self, event, expected):
+        engine = SysCheckEngine(output_dir="/tmp/test_nvme_controller_reliability")
+        self._collect(engine, self._cmd(self._line(event)))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "NVME-CONTROLLER-RESET-001"
+        )
+        assert finding.severity == expected
+
+    def test_mixed_events_choose_reset_failure(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_nvme_controller_mixed")
+        self._collect(
+            engine,
+            self._cmd(
+                "\n".join([self._line("io_timeout"), self._line("device_not_ready")])
+            ),
+        )
+        raw = next(
+            r
+            for r in engine.raw_diagnostics
+            if r.source_id == "NVME-CONTROLLER-RESET-001"
+        )
+        assert raw.payload["event_severity"] == "reset_failure"
+        assert raw.payload["match_count"] == 2
+
+    @pytest.mark.parametrize("status", ["error", "not_found"])
+    def test_failed_or_unavailable_journal_query_does_not_emit(self, status):
+        engine = SysCheckEngine(output_dir="/tmp/test_nvme_controller_failure")
+        self._collect(engine, self._cmd(status=status, return_code=1))
+        assert not any(
+            r.source_id == "NVME-CONTROLLER-RESET-001" for r in engine.raw_diagnostics
+        )
+
+    def test_observation_evidence_and_finding_contract(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_nvme_controller_contract")
+        self._collect(engine, self._cmd(self._line("device_not_ready")))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(
+            o for o in engine.observations if o.obs_id == "NVME-CONTROLLER-RESET-001"
+        )
+        finding = next(
+            f for f in engine.findings if f.finding_id == "NVME-CONTROLLER-RESET-001"
+        )
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-NVME-CONTROLLER-RESET-001-001"
+        )
+        assert observation.category == "nvme_controller_reliability"
+        assert finding.kind == FindingKind.NVME_CONTROLLER_RELIABILITY
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie potwierdza trwałej awarii SSD" in finding.interpretation
+        assert "utraty lub uszkodzenia danych" in finding.interpretation
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert (
+            syscheck.NvmeControllerReliabilityRule
+            is diagnostic_rules.NvmeControllerReliabilityRule
+        )
+        assert any(
+            rule.rule_id == "RULE-NVME-CONTROLLER-RELIABILITY"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
 
     # ── SEGFAULT-SYS-001 tests ───────────────────────────────────
 
@@ -6379,7 +6875,194 @@ class TestOomCollectorPath:
             r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
         ]
         assert len(wp_raws) == 1
-        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
+
+    # Iteration 34: deterministic current-boot PCIe AER detection.
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult("", stdout, "", return_code, status)
+
+    def _collect(self, engine, aer: CmdResult, nvme: CmdResult | None = None) -> None:
+        from unittest.mock import patch
+
+        if nvme is None:
+            nvme = self._cmd()
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer,
+            "nvme_controller_reliability": nvme,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    def test_nvme_only_does_not_depend_on_or_emit_aer(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_nvme_nvme_only")
+        self._collect(
+            engine,
+            self._cmd(),
+            self._cmd("kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"),
+        )
+        source_ids = {raw.source_id for raw in engine.raw_diagnostics}
+        assert "NVME-CONTROLLER-RESET-001" in source_ids
+        assert "PCIE-AER-001" not in source_ids
+
+    def test_aer_only_emits_existing_aer_diagnostic(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_nvme_aer_only")
+        aer_line = self._line("Uncorrected (Non-Fatal)")
+        self._collect(engine, self._cmd(aer_line))
+        aer = next(
+            raw for raw in engine.raw_diagnostics if raw.source_id == "PCIE-AER-001"
+        )
+        assert aer.payload == {
+            "aer_detected": True,
+            "aer_severity": "non_fatal",
+            "matched_lines": [aer_line],
+            "match_count": 1,
+            "journal_scope": "current_boot_kernel",
+            "source_query": "pcie_aer",
+        }
+        assert not any(
+            raw.source_id == "NVME-CONTROLLER-RESET-001"
+            for raw in engine.raw_diagnostics
+        )
+
+    def test_combined_aer_and_nvme_emit_independent_diagnostics(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_nvme_combined")
+        aer_line = self._line("Corrected")
+        nvme_line = "kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0"
+        self._collect(engine, self._cmd(aer_line), self._cmd(nvme_line))
+        diagnostics = {raw.source_id: raw for raw in engine.raw_diagnostics}
+        assert diagnostics["PCIE-AER-001"].payload["aer_severity"] == "corrected"
+        assert (
+            diagnostics["NVME-CONTROLLER-RESET-001"].payload["event_severity"]
+            == "reset_failure"
+        )
+
+    @staticmethod
+    def _line(severity: str, received: bool = False) -> str:
+        if received:
+            return f"kernel: pcieport 0000:00:01.0: AER: {severity} error received"
+        return f"kernel: pcieport 0000:00:01.0: PCIe Bus Error: severity={severity}"
+
+    @pytest.mark.parametrize(
+        ("severity", "expected"),
+        [
+            ("Corrected", "corrected"),
+            ("Uncorrected (Non-Fatal)", "non_fatal"),
+            ("Uncorrected (Fatal)", "fatal"),
+        ],
+    )
+    def test_explicit_bus_error_matches_and_classifies(self, severity, expected):
+        line = self._line(severity)
+        assert re.search(RE_PCIE_AER, line, re.IGNORECASE)
+        assert _pcie_aer_severity(line) == expected
+
+    @pytest.mark.parametrize(
+        ("severity", "expected"),
+        [
+            ("Corrected", "corrected"),
+            ("Uncorrected (Non-Fatal)", "non_fatal"),
+            ("Uncorrected (Fatal)", "fatal"),
+        ],
+    )
+    def test_equivalent_received_error_matches_and_classifies(self, severity, expected):
+        line = self._line(severity, received=True)
+        assert re.search(RE_PCIE_AER, line, re.IGNORECASE)
+        assert _pcie_aer_severity(line) == expected
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: pci 0000:00:00.0: PCIe initialized",
+            "kernel: pcieport 0000:00:01.0: AER: enabled with IRQ 122",
+            "kernel: pcieport 0000:00:01.0: AER: aer_inject init",
+            "kernel: pci 0000:00:01.0: ASPM disabled",
+            "kernel: PCIe Bus Error: severity=Uncorrected",
+            "kernel: AER: Corrected errors received yesterday",
+        ],
+    )
+    def test_generic_pcie_aer_and_init_text_does_not_match(self, line):
+        assert re.search(RE_PCIE_AER, line, re.IGNORECASE) is None
+
+    def test_collector_preserves_corrected_as_low_p3(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_corrected")
+        self._collect(engine, self._cmd(self._line("Corrected")))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "PCIE-AER-001")
+        assert finding.severity == "P3"
+
+    def test_collector_preserves_non_fatal_as_p2(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_nonfatal")
+        self._collect(engine, self._cmd(self._line("Uncorrected (Non-Fatal)")))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "PCIE-AER-001")
+        assert finding.severity == "P2"
+
+    def test_collector_preserves_fatal_as_p1(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_fatal")
+        self._collect(engine, self._cmd(self._line("Uncorrected (Fatal)", True)))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "PCIE-AER-001")
+        assert finding.severity == "P1"
+
+    def test_mixed_events_use_highest_explicit_severity(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_mixed")
+        lines = "\n".join(
+            [self._line("Corrected"), self._line("Uncorrected (Fatal)", True)]
+        )
+        self._collect(engine, self._cmd(lines))
+        raw = next(r for r in engine.raw_diagnostics if r.source_id == "PCIE-AER-001")
+        assert raw.payload["aer_severity"] == "fatal"
+        assert raw.payload["match_count"] == 2
+
+    def test_command_failure_does_not_emit_diagnostic(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_failure")
+        self._collect(engine, self._cmd(status="error", return_code=1))
+        assert not any(r.source_id == "PCIE-AER-001" for r in engine.raw_diagnostics)
+
+    def test_observation_evidence_and_finding_contract(self):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_pcie_aer_contract")
+        self._collect(engine, self._cmd(self._line("Uncorrected (Non-Fatal)")))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(o for o in engine.observations if o.obs_id == "PCIE-AER-001")
+        finding = next(f for f in engine.findings if f.finding_id == "PCIE-AER-001")
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-PCIE-AER-001-001"
+        )
+        assert observation.category == "pcie_aer_error"
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind.PCIE_AER_ERROR
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie określa jego przyczyny" in finding.interpretation
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert syscheck.PcieAerErrorRule is diagnostic_rules.PcieAerErrorRule
+        assert any(
+            rule.rule_id == "RULE-PCIE-AER-ERROR"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
 
     def test_existing_taint_unchanged(self):
         """Adding oom_events to mock does not break existing taint detection."""
@@ -6974,6 +7657,7 @@ class TestGpuI915HangCollectorPath:
             r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
         ]
         assert len(wp_raws) == 1
+        assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
         assert wp_raws[0].payload.get("segfault_type") == "wireplumber"
 
     def test_existing_taint_unchanged(self):
