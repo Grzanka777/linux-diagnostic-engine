@@ -69,6 +69,22 @@ RE_HARDWARE_THERMAL_THROTTLE = (
     r"\b(?:temperature\s+above\s+(?:thermal\s+)?threshold|thermal\s+threshold\s+(?:exceeded|reached)|critical\s+temperature\s+threshold\s+reached)\b.*?\bthrottl\w*\b"
     r")"
 )
+RE_KERNEL_PANIC = r"\bKernel panic - not syncing\b"
+RE_KERNEL_OOPS_BUG = (
+    r"(?:"
+    r"\bOops:\s*|"
+    r"\bkernel BUG at\b|"
+    r"\bBUG:\s*unable to handle kernel\b"
+    r")"
+)
+RE_KERNEL_OOPS_PANIC = (
+    r"(?:"
+    r"\bKernel panic - not syncing\b|"
+    r"\bOops:\s*|"
+    r"\bkernel BUG at\b|"
+    r"\bBUG:\s*unable to handle kernel\b"
+    r")"
+)
 
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────

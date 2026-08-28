@@ -21,6 +21,9 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_KERNEL_OOPS_BUG,
+    RE_KERNEL_OOPS_PANIC,
+    RE_KERNEL_PANIC,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
@@ -42,6 +45,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _hardware_mce_edac_severity,
     _journal_count_command,
     _journal_filter_command,
+    _kernel_oops_panic_severity,
     _oom_collector_command,
     _nvme_controller_reliability_severity,
     _pcie_aer_severity,
@@ -110,6 +114,7 @@ class TestDiagnosticRuleImportBoundary:
             "HardwareMceEdacRule",
             "FilesystemIoErrorRule",
             "HardwareThermalThrottlingRule",
+            "KernelOopsPanicRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -912,6 +917,7 @@ class TestCaptureCompleteness:
             ("hardware_mce_edac_error", "HW-MCE-EDAC-001"),
             ("filesystem_io_error", "FS-IO-ERROR-001"),
             ("hardware_thermal_throttling", "HW-THERMAL-THROTTLE-001"),
+            ("kernel_oops_panic", "KERNEL-OOPS-PANIC-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -10011,6 +10017,242 @@ class TestHardwareThermalThrottlingDiagnostic:
         engine._derive_observations()
         engine._interpret()
         findings = {f.finding_id: f for f in engine.findings}
+        assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
+        assert findings["FS-IO-ERROR-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P3"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
+        assert findings["HW-MCE-EDAC-001"].severity == "P1"
+
+
+class TestKernelOopsPanicDiagnostic:
+    """Deterministic current-boot kernel panic / oops / BUG diagnostic tests."""
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=return_code,
+            execution_status=status,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        kernel_oops_panic: CmdResult,
+        thermal_throttle: CmdResult | None = None,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+        mce_edac: CmdResult | None = None,
+        fs_io: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac or self._cmd(),
+            "filesystem_io_error": fs_io or self._cmd(),
+            "hardware_thermal_throttling": thermal_throttle or self._cmd(),
+            "kernel_oops_panic": kernel_oops_panic,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: [  123.456789] Kernel panic - not syncing: Fatal exception",
+            "kernel: Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)",
+        ],
+    )
+    def test_explicit_kernel_panic_matches(self, line):
+        assert re.search(RE_KERNEL_PANIC, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_OOPS_PANIC, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: Oops: 0000 [#1] PREEMPT SMP",
+            "kernel: [   12.345678] Oops: 0002 [#1] SMP NOPTI",
+            "kernel: kernel BUG at mm/slub.c:1234!",
+            "kernel: BUG: unable to handle kernel paging request at ffff880123456780",
+        ],
+    )
+    def test_explicit_kernel_oops_and_bug_matches(self, line):
+        assert re.search(RE_KERNEL_OOPS_BUG, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_OOPS_PANIC, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "app: panic: runtime error: index out of range",
+            "logger: oops, something went wrong with network",
+            "kernel: BUG: soft lockup - CPU#1 stuck for 22s!",
+            "kernel: segfault at 7f0000000000 rip 7f0000001000 rsp 7ffc00000000 error 4 in libc.so",
+        ],
+    )
+    def test_generic_panics_and_faults_rejected(self, line):
+        assert re.search(RE_KERNEL_OOPS_PANIC, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: mce: [Hardware Error]: Machine Check Exception",
+            "kernel: CPU0: Core temperature above threshold, cpu clock throttled",
+        ],
+    )
+    def test_unrelated_diagnostics_rejected(self, line):
+        assert re.search(RE_KERNEL_OOPS_PANIC, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        ("line", "expected_severity"),
+        [
+            ("kernel: Kernel panic - not syncing: Fatal exception", "P0"),
+            ("kernel: Oops: 0000 [#1] PREEMPT SMP", "P1"),
+        ],
+    )
+    def test_severity_mapping_is_deterministic(self, line, expected_severity):
+        assert _kernel_oops_panic_severity(line) == expected_severity
+
+    def test_collector_emits_p0_for_kernel_panic(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_panic_p0")
+        line = "kernel: [  123.456] Kernel panic - not syncing: Fatal exception"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-OOPS-PANIC-001"
+        )
+        assert finding.severity == "P0"
+        assert "Kernel Panic" in finding.title
+
+    @pytest.mark.parametrize(
+        ("line", "expected_title_fragment"),
+        [
+            ("kernel: Oops: 0000 [#1] PREEMPT SMP", "Kernel Oops / BUG"),
+            (
+                "kernel: BUG: unable to handle kernel NULL pointer dereference at 0000000000000000",
+                "Kernel Oops / BUG",
+            ),
+        ],
+    )
+    def test_collector_emits_p1_for_oops_and_bug(self, line, expected_title_fragment):
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_oops_bug_p1")
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-OOPS-PANIC-001"
+        )
+        assert finding.severity == "P1"
+        assert expected_title_fragment in finding.title
+
+    def test_mixed_oops_and_panic_highest_severity_p0_wins(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_mixed_p0")
+        lines = "\n".join(
+            [
+                "kernel: Oops: 0000 [#1] PREEMPT SMP",
+                "kernel: Kernel panic - not syncing: Fatal exception",
+            ]
+        )
+        self._collect(engine, self._cmd(lines))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-OOPS-PANIC-001"
+        )
+        assert finding.severity == "P0"
+        assert "Kernel Panic" in finding.title
+
+    @pytest.mark.parametrize(
+        ("status", "stdout", "ret_code"),
+        [
+            ("error", "", 1),
+            ("ok", "", 0),
+        ],
+    )
+    def test_failed_or_empty_journal_query_does_not_emit(
+        self, status, stdout, ret_code
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_empty_or_fail")
+        self._collect(
+            engine,
+            self._cmd(stdout=stdout, status=status, return_code=ret_code),
+        )
+        assert not any(
+            r.source_id == "KERNEL-OOPS-PANIC-001" for r in engine.raw_diagnostics
+        )
+
+    def test_observation_evidence_and_finding_contract(self):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_contract")
+        line = "kernel: [  123.456] Kernel panic - not syncing: Fatal exception"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(
+            o for o in engine.observations if o.obs_id == "KERNEL-OOPS-PANIC-001"
+        )
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-OOPS-PANIC-001"
+        )
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-KERNEL-OOPS-PANIC-001-001"
+        )
+        assert observation.category == "kernel_oops_panic"
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind.KERNEL_OOPS_PANIC
+        assert finding.domain == DiagnosticDomain.KERNEL
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie przypisuje przyczyny źródłowej" in finding.interpretation
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert syscheck.KernelOopsPanicRule is diagnostic_rules.KernelOopsPanicRule
+        assert any(
+            rule.rule_id == "RULE-KERNEL-OOPS-PANIC"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
+
+    def test_kernel_oops_panic_isolation_from_other_diagnostics(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_isolation")
+        panic_line = "kernel: Kernel panic - not syncing: Fatal exception"
+        thermal_line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        fs_line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        aer_line = "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+        nvme_line = "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"
+        mce_line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(
+            engine,
+            kernel_oops_panic=self._cmd(panic_line),
+            thermal_throttle=self._cmd(thermal_line),
+            fs_io=self._cmd(fs_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+            mce_edac=self._cmd(mce_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["KERNEL-OOPS-PANIC-001"].severity == "P0"
         assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
         assert findings["FS-IO-ERROR-001"].severity == "P2"
         assert findings["PCIE-AER-001"].severity == "P3"

@@ -57,6 +57,9 @@ from constants import (  # type: ignore[import-untyped]
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_KERNEL_OOPS_BUG,
+    RE_KERNEL_OOPS_PANIC,
+    RE_KERNEL_PANIC,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
@@ -170,6 +173,7 @@ class FindingKind(str, Enum):
     HARDWARE_MCE_EDAC_ERROR = "hardware_mce_edac_error"
     FILESYSTEM_IO_ERROR = "filesystem_io_error"
     HARDWARE_THERMAL_THROTTLING = "hardware_thermal_throttling"
+    KERNEL_OOPS_PANIC = "kernel_oops_panic"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -850,6 +854,15 @@ def _filesystem_io_error_severity(line: str) -> Optional[str]:
     return "io_error"
 
 
+def _kernel_oops_panic_severity(line: str) -> Optional[str]:
+    """Return the explicit severity ('P0' or 'P1') encoded in a matched kernel oops/panic line."""
+    if re.search(RE_KERNEL_PANIC, line, re.IGNORECASE):
+        return "P0"
+    if re.search(RE_KERNEL_OOPS_BUG, line, re.IGNORECASE):
+        return "P1"
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────
 # Silnik diagnostyczny
 # ──────────────────────────────────────────────────────────────────
@@ -974,6 +987,12 @@ class FindingClassificationPolicy:
         "hardware_thermal_throttling": FindingClassification(
             DiagnosticDomain.HARDWARE,
             FindingKind.HARDWARE_THERMAL_THROTTLING,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "kernel_oops_panic": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_OOPS_PANIC,
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
@@ -1653,6 +1672,38 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "kernel_oops_panic":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            has_panic = d.get("panic_detected", False)
+            event_desc = "Kernel panic" if has_panic else "Kernel oops / BUG"
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"{event_desc} event detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "oops_panic_detected": d.get("oops_panic_detected", False),
+                    "panic_detected": has_panic,
+                    "highest_severity": d.get("highest_severity", "P1"),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "kernel_oops_panic"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1681,6 +1732,7 @@ GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
 GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
 HardwareMceEdacRule = _diagnostic_rules.HardwareMceEdacRule
 HardwareThermalThrottlingRule = _diagnostic_rules.HardwareThermalThrottlingRule
+KernelOopsPanicRule = _diagnostic_rules.KernelOopsPanicRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2250,6 +2302,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "kernel_oops_panic": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_KERNEL_OOPS_PANIC,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2268,6 +2328,7 @@ class SysCheckEngine:
         hardware_mce_edac_result = r.get("hardware_mce_edac")
         filesystem_io_error_result = r.get("filesystem_io_error")
         hardware_thermal_throttling_result = r.get("hardware_thermal_throttling")
+        kernel_oops_panic_result = r.get("kernel_oops_panic")
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2700,6 +2761,42 @@ class SysCheckEngine:
                                 "match_count": len(throttle_matching),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "hardware_thermal_throttling",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy krytyczne jądra (Kernel Panic / Oops / BUG) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            kernel_oops_panic_result
+            and kernel_oops_panic_result.is_ok()
+            and kernel_oops_panic_result.stdout.strip()
+        ):
+            oops_panic_matching = [
+                line
+                for line in kernel_oops_panic_result.stdout.split("\n")
+                if re.search(RE_KERNEL_OOPS_PANIC, line, re.IGNORECASE)
+            ]
+            if oops_panic_matching:
+                severities = [
+                    _kernel_oops_panic_severity(line) for line in oops_panic_matching
+                ]
+                has_panic = any(s == "P0" for s in severities)
+                highest_severity = "P0" if has_panic else "P1"
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-OOPS-PANIC-001",
+                        category="kernel_oops_panic",
+                        payload=_capture_payload(
+                            kernel_oops_panic_result,
+                            {
+                                "oops_panic_detected": True,
+                                "panic_detected": has_panic,
+                                "highest_severity": highest_severity,
+                                "matched_lines": oops_panic_matching[:20],
+                                "match_count": len(oops_panic_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "kernel_oops_panic",
                             },
                         ),
                     )
@@ -3499,6 +3596,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="HW-THERMAL-THROTTLE-001",
                 category="hardware_thermal_throttling",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_oops_panic":
+            return Observation(
+                obs_id="KERNEL-OOPS-PANIC-001",
+                category="kernel_oops_panic",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

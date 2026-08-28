@@ -890,6 +890,87 @@ class HardwareThermalThrottlingRule(DiagnosticRule):
         )
 
 
+class KernelOopsPanicRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-OOPS-PANIC"
+    supported_categories = frozenset({"kernel_oops_panic"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("oops_panic_detected"):
+            return DiagnosticRuleResult()
+
+        highest_severity = observation.details.get("highest_severity", "P1")
+        if highest_severity not in ("P0", "P1"):
+            highest_severity = "P1"
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        is_panic = highest_severity == "P0"
+        title = (
+            "Wykryto awarię krytyczną jądra (Kernel Panic)"
+            if is_panic
+            else "Wykryto błąd jądra (Kernel Oops / BUG)"
+        )
+        interpretation = (
+            (
+                "Dziennik jądra zarejestrował jawny komunikat Kernel Panic w bieżącym rozruchu. "
+                if is_panic
+                else "Dziennik jądra zarejestrował jawny błąd jądra (Oops lub BUG) w bieżącym rozruchu. "
+            )
+            + "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu, modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Zachowaj pełny zrzut dziennika jądra z bieżącego rozruchu przed ewentualnym restartem:\n"
+            "`journalctl -b -k --no-pager > kernel-panic-oops.log`\n"
+            "Sprawdź linie poprzedzające awarię pod kątem śladu wywołań (call trace) i rejestrów procesora."
+        )
+        remediation = (
+            "Nie wykonuj inwazyjnych zmian w systemie bez zabezpieczenia dziennika. "
+            "W razie powtarzających się awarii zweryfikuj stabilność sprzętu (np. pamięć RAM), "
+            "wersję oprogramowania układowego (BIOS/UEFI, mikrokod) oraz moduły jądra i wersję kernela."
+        )
+        verification = (
+            "W kolejnym rozruchu sprawdź, czy nowe zdarzenia błędu lub paniki jądra nadal występują:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'Kernel panic - not syncing|Oops:|kernel BUG at|BUG: unable to handle kernel'`."
+        )
+        risk_level = (
+            "Krytyczne (P0). Awaria jądra uniemożliwia dalszą bezpieczną pracę systemu operacyjnego."
+            if is_panic
+            else "Wysokie (P1). Wystąpienie błędu Oops lub BUG w jądrze wskazuje na naruszenie spójności stanu jądra."
+        )
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity=highest_severity,
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1289,6 +1370,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         HardwareMceEdacRule(eb),
         FilesystemIoErrorRule(eb),
         HardwareThermalThrottlingRule(eb),
+        KernelOopsPanicRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
