@@ -50,6 +50,19 @@ RE_HARDWARE_MCE_EDAC = (
     r"\bEDAC\b.*?(?:\b(?:CE|UE)\b|\b(?:[Cc]orrected|[Uu]ncorrected)\s+error\b)"
     r")"
 )
+RE_FILESYSTEM_IO_ERROR = (
+    r"(?:"
+    r"\bBuffer I/O error\b|"
+    r"\bblk_update_request:\s*I/O error\b|"
+    r"\bI/O error,\s*dev\b|"
+    r"\bEXT4-fs\s+error\b|"
+    r"\bEXT4-fs\s*(?:\([^)]+\))?:\s*(?:error\b|.*?error count\b|initial error\b|last error\b)|"
+    r"\bXFS.*?\bmetadata I/O error\b|"
+    r"\bBTRFS(?::\s*|\s+)(?:error|critical)\b|"
+    r"\bcritical medium error\b"
+    r")"
+)
+
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────
 TRUNCATE_NORMAL = 5000

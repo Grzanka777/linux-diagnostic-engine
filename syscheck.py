@@ -53,6 +53,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_GFX_ERROR,
     RE_KERNEL_ERROR,
     RE_AMDGPU_RESET_FAIL,
+    RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_NVIDIA_XID_79,
@@ -166,6 +167,7 @@ class FindingKind(str, Enum):
     PCIE_AER_ERROR = "pcie_aer_error"
     NVME_CONTROLLER_RELIABILITY = "nvme_controller_reliability"
     HARDWARE_MCE_EDAC_ERROR = "hardware_mce_edac_error"
+    FILESYSTEM_IO_ERROR = "filesystem_io_error"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -827,6 +829,25 @@ def _hardware_mce_edac_severity(line: str) -> Optional[str]:
     return None
 
 
+def _filesystem_io_error_severity(line: str) -> Optional[str]:
+    """Return the severity class encoded in a matched filesystem/block-I/O kernel line."""
+    if not re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE):
+        return None
+    normalized = line.lower()
+    if (
+        "critical medium error" in normalized
+        or "critical" in normalized
+        or "fatal" in normalized
+        or "corrupt" in normalized
+        or "force_shutdown" in normalized
+        or "forced shutdown" in normalized
+        or "shut down due to" in normalized
+        or "remount-ro" in normalized
+    ):
+        return "critical_or_fatal"
+    return "io_error"
+
+
 # ──────────────────────────────────────────────────────────────────
 # Silnik diagnostyczny
 # ──────────────────────────────────────────────────────────────────
@@ -939,6 +960,12 @@ class FindingClassificationPolicy:
         "hardware_mce_edac_error": FindingClassification(
             DiagnosticDomain.HARDWARE,
             FindingKind.HARDWARE_MCE_EDAC_ERROR,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "filesystem_io_error": FindingClassification(
+            DiagnosticDomain.FILESYSTEM,
+            FindingKind.FILESYSTEM_IO_ERROR,
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
@@ -1555,6 +1582,37 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "filesystem_io_error":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            severity = d.get("event_severity", "io_error")
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Filesystem/block-I/O {severity} error detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "fs_io_detected": d.get("fs_io_detected", False),
+                    "event_severity": severity,
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "event_classes": d.get("event_classes", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "filesystem_io_error"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1577,6 +1635,7 @@ DuplicateEvidenceError = _diagnostic_rules.DuplicateEvidenceError
 DuplicateFindingError = _diagnostic_rules.DuplicateFindingError
 FailedSystemUnitRule = _diagnostic_rules.FailedSystemUnitRule
 FailedUserUnitRule = _diagnostic_rules.FailedUserUnitRule
+FilesystemIoErrorRule = _diagnostic_rules.FilesystemIoErrorRule
 GeneralSegfaultRule = _diagnostic_rules.GeneralSegfaultRule
 GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
 GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
@@ -2134,6 +2193,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "filesystem_io_error": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_FILESYSTEM_IO_ERROR,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2150,6 +2217,7 @@ class SysCheckEngine:
         pcie_aer_result = r.get("pcie_aer")
         nvme_controller_reliability_result = r.get("nvme_controller_reliability")
         hardware_mce_edac_result = r.get("hardware_mce_edac")
+        filesystem_io_error_result = r.get("filesystem_io_error")
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2513,6 +2581,46 @@ class SysCheckEngine:
                                 "event_classes": list(dict.fromkeys(severities)),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "hardware_mce_edac",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy I/O systemu plików / podsystemu blokowego — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            filesystem_io_error_result
+            and filesystem_io_error_result.is_ok()
+            and filesystem_io_error_result.stdout.strip()
+        ):
+            fs_io_matching = [
+                line
+                for line in filesystem_io_error_result.stdout.split("\n")
+                if re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE)
+            ]
+            severities = [
+                severity
+                for line in fs_io_matching
+                if (severity := _filesystem_io_error_severity(line)) is not None
+            ]
+            if severities:
+                event_severity = max(
+                    severities,
+                    key={"io_error": 1, "critical_or_fatal": 2}.get,
+                )
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="FS-IO-ERROR-001",
+                        category="filesystem_io_error",
+                        payload=_capture_payload(
+                            filesystem_io_error_result,
+                            {
+                                "fs_io_detected": True,
+                                "event_severity": event_severity,
+                                "matched_lines": fs_io_matching[:20],
+                                "match_count": len(fs_io_matching),
+                                "event_classes": list(dict.fromkeys(severities)),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "filesystem_io_error",
                             },
                         ),
                     )
@@ -3288,6 +3396,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="HW-MCE-EDAC-001",
                 category="hardware_mce_edac_error",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "filesystem_io_error":
+            return Observation(
+                obs_id="FS-IO-ERROR-001",
+                category="filesystem_io_error",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

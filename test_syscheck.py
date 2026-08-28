@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_AMDGPU_RESET_FAIL,
+    RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_NVIDIA_XID_79,
@@ -32,6 +33,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _count_kernel_packages,
     _count_unique_segfaults,
     _deduplicate_journal_lines,
+    _filesystem_io_error_severity,
     _filter_invalid_temperatures,
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
@@ -105,6 +107,7 @@ class TestDiagnosticRuleImportBoundary:
             "PcieAerErrorRule",
             "NvmeControllerReliabilityRule",
             "HardwareMceEdacRule",
+            "FilesystemIoErrorRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -905,6 +908,7 @@ class TestCaptureCompleteness:
             ("pcie_aer_error", "PCIE-AER-001"),
             ("nvme_controller_reliability", "NVME-CONTROLLER-RESET-001"),
             ("hardware_mce_edac_error", "HW-MCE-EDAC-001"),
+            ("filesystem_io_error", "FS-IO-ERROR-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -9611,3 +9615,213 @@ class TestHardwareMceEdacDiagnostic:
             in ("GPU-I915-HANG-001", "AMDGPU-RESET-FAIL-001", "GPU-NVIDIA-XID-79-001")
             for r in engine.raw_diagnostics
         )
+
+
+class TestFilesystemIoErrorDiagnostic:
+    """Deterministic current-boot filesystem / block-I/O error diagnostic tests."""
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=return_code,
+            execution_status=status,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        fs_io: CmdResult,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+        mce_edac: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac or self._cmd(),
+            "filesystem_io_error": fs_io,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: Buffer I/O error on dev sda1, logical block 1234, async page read",
+            "kernel: blk_update_request: I/O error, dev sdb, sector 456 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 0",
+            "kernel: I/O error, dev sda, sector 12345 op 0x0:(READ)",
+        ],
+    )
+    def test_explicit_buffer_and_block_io_errors_match(self, line):
+        assert re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: EXT4-fs error (device sda2): ext4_lookup:1594: deleted inode referenced: 123",
+            "kernel: XFS (dm-0): metadata I/O error in xfs_trans_read_buf_map",
+            "kernel: BTRFS error (device sda): bdev /dev/sda errs: wr 0, rd 1, flush 0, corrupt 0, gen 0",
+            "kernel: critical medium error, dev nvme0n1, sector 1024 op 0x0:(READ)",
+        ],
+    )
+    def test_explicit_filesystem_and_medium_errors_match(self, line):
+        assert re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: EXT4-fs (sda1): mounted filesystem with ordered data mode. Quota mode: none.",
+            "kernel: XFS (dm-0): Mounting V5 Filesystem 4c753b82-6285-4509-9f79-6df7bf860f4e",
+            "kernel: BTRFS info (device nvme0n1p2): disk space caching is enabled",
+            "kernel: systemd[1]: Failed to start OpenSSH Daemon.",
+        ],
+    )
+    def test_filesystem_info_and_unrelated_subsystems_rejected(self, line):
+        assert re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            (
+                "kernel: Buffer I/O error on dev sda1, logical block 1234, async page read",
+                "io_error",
+            ),
+            (
+                "kernel: critical medium error, dev nvme0n1, sector 1024 op 0x0:(READ)",
+                "critical_or_fatal",
+            ),
+        ],
+    )
+    def test_severity_mapping_is_deterministic(self, line, expected):
+        assert _filesystem_io_error_severity(line) == expected
+
+    def test_collector_emits_p2_for_direct_io_error(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_p2")
+        self._collect(
+            engine,
+            self._cmd("kernel: Buffer I/O error on dev sda1, logical block 1234"),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "FS-IO-ERROR-001")
+        assert finding.severity == "P2"
+        assert "Wykryto błąd wejścia/wyjścia" in finding.title
+
+    def test_collector_emits_p1_for_critical_or_fatal_error(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_p1")
+        self._collect(
+            engine,
+            self._cmd("kernel: critical medium error, dev sda, sector 1000"),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "FS-IO-ERROR-001")
+        assert finding.severity == "P1"
+        assert "krytyczny" in finding.title
+
+    def test_mixed_events_highest_severity_p1_wins(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_mixed")
+        lines = "\n".join(
+            [
+                "kernel: Buffer I/O error on dev sda1, logical block 1234",
+                "kernel: critical medium error, dev sda, sector 1000",
+            ]
+        )
+        self._collect(engine, self._cmd(lines))
+        engine._derive_observations()
+        engine._interpret()
+        raw = next(
+            r for r in engine.raw_diagnostics if r.source_id == "FS-IO-ERROR-001"
+        )
+        assert raw.payload["event_severity"] == "critical_or_fatal"
+        assert raw.payload["match_count"] == 2
+        finding = next(f for f in engine.findings if f.finding_id == "FS-IO-ERROR-001")
+        assert finding.severity == "P1"
+
+    @pytest.mark.parametrize(
+        ("status", "stdout", "ret_code"),
+        [
+            ("error", "", 1),
+            ("ok", "", 0),
+        ],
+    )
+    def test_failed_or_empty_journal_query_does_not_emit(
+        self, status, stdout, ret_code
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_empty_or_fail")
+        self._collect(
+            engine,
+            self._cmd(stdout=stdout, status=status, return_code=ret_code),
+        )
+        assert not any(r.source_id == "FS-IO-ERROR-001" for r in engine.raw_diagnostics)
+
+    def test_observation_evidence_and_finding_contract(self):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_contract")
+        line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(
+            o for o in engine.observations if o.obs_id == "FS-IO-ERROR-001"
+        )
+        finding = next(f for f in engine.findings if f.finding_id == "FS-IO-ERROR-001")
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-FS-IO-ERROR-001-001"
+        )
+        assert observation.category == "filesystem_io_error"
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind.FILESYSTEM_IO_ERROR
+        assert finding.domain == DiagnosticDomain.FILESYSTEM
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie wnioskuje o trwałej awarii dysku" in finding.interpretation
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert syscheck.FilesystemIoErrorRule is diagnostic_rules.FilesystemIoErrorRule
+        assert any(
+            rule.rule_id == "RULE-FILESYSTEM-IO-ERROR"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
+
+    def test_filesystem_io_error_isolation_from_nvme_aer_mce(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_isolation")
+        fs_line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        aer_line = "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+        nvme_line = "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"
+        mce_line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(
+            engine,
+            fs_io=self._cmd(fs_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+            mce_edac=self._cmd(mce_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["FS-IO-ERROR-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P3"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
+        assert findings["HW-MCE-EDAC-001"].severity == "P1"

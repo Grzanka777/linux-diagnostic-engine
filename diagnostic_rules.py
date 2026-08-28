@@ -760,6 +760,74 @@ class HardwareMceEdacRule(DiagnosticRule):
         )
 
 
+class FilesystemIoErrorRule(DiagnosticRule):
+    rule_id = "RULE-FILESYSTEM-IO-ERROR"
+    supported_categories = frozenset({"filesystem_io_error"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        event_severity = observation.details.get("event_severity")
+        severity_map = {"io_error": "P2", "critical_or_fatal": "P1"}
+        if event_severity not in severity_map:
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = (
+            "Wykryto krytyczny błąd I/O systemu plików / podsystemu blokowego"
+            if event_severity == "critical_or_fatal"
+            else "Wykryto błąd wejścia/wyjścia systemu plików / podsystemu blokowego"
+        )
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity=severity_map[event_severity],
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Dziennik jądra zarejestrował jawne zdarzenie błędu wejścia/wyjścia (I/O) "
+                    "lub błędu systemu plików w bieżącym bocie. Diagnostyka rejestruje zdarzenie "
+                    "na podstawie dziennika i nie wnioskuje o trwałej awarii dysku, uszkodzeniu kabla "
+                    "ani trwałym uszkodzeniu systemu plików lub konieczności wymiany sprzętu."
+                ),
+                recommended_diagnostics=(
+                    "Zachowaj dokładne linie błędu i sprawdź, czy problem się powtarza:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'Buffer I/O|blk_update_request|EXT4-fs|XFS|BTRFS|critical medium error'`\n"
+                    "Sprawdź stan systemu plików odpowiednim narzędziem diagnostycznym w trybie tylko do odczytu."
+                ),
+                remediation=(
+                    "Nie wykonuj inwazyjnych zmian ani nie wymieniaj podzespołów wyłącznie na podstawie pojedynczego wpisu. "
+                    "W razie powtarzających się błędów przeanalizuj kontekst dziennika i stan nośnika."
+                ),
+                verification=(
+                    "W kolejnym bocie sprawdź dziennik pod kątem nowych zdarzeń błędów I/O:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'Buffer I/O|blk_update_request|EXT4-fs|XFS|BTRFS|critical medium error'`."
+                ),
+                risk_level=(
+                    "Umiarkowane dla standardowych błędów I/O (P2), wysokie dla błędów krytycznych/fatalnych (P1). "
+                    "Sam wpis w dzienniku nie ustala trwałego uszkodzenia nośnika ani utraty danych."
+                ),
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1157,6 +1225,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         PcieAerErrorRule(eb),
         NvmeControllerReliabilityRule(eb),
         HardwareMceEdacRule(eb),
+        FilesystemIoErrorRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
