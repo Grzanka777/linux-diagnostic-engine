@@ -62,6 +62,13 @@ RE_FILESYSTEM_IO_ERROR = (
     r"\bcritical medium error\b"
     r")"
 )
+RE_HARDWARE_THERMAL_THROTTLE = (
+    r"(?:"
+    r"\b(?:Core|Package)\s+temperature\s+above\s+threshold,\s*cpu\s+clock\s+throttled\b|"
+    r"\b(?:Core|Package)\s+temperature\s+above\s+threshold\b.*?\bthrottl\w*\b|"
+    r"\b(?:temperature\s+above\s+(?:thermal\s+)?threshold|thermal\s+threshold\s+(?:exceeded|reached)|critical\s+temperature\s+threshold\s+reached)\b.*?\bthrottl\w*\b"
+    r")"
+)
 
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────

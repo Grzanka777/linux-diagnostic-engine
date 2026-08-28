@@ -20,6 +20,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
+    RE_HARDWARE_THERMAL_THROTTLE,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
@@ -108,6 +109,7 @@ class TestDiagnosticRuleImportBoundary:
             "NvmeControllerReliabilityRule",
             "HardwareMceEdacRule",
             "FilesystemIoErrorRule",
+            "HardwareThermalThrottlingRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -909,6 +911,7 @@ class TestCaptureCompleteness:
             ("nvme_controller_reliability", "NVME-CONTROLLER-RESET-001"),
             ("hardware_mce_edac_error", "HW-MCE-EDAC-001"),
             ("filesystem_io_error", "FS-IO-ERROR-001"),
+            ("hardware_thermal_throttling", "HW-THERMAL-THROTTLE-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -9821,6 +9824,194 @@ class TestFilesystemIoErrorDiagnostic:
         engine._derive_observations()
         engine._interpret()
         findings = {f.finding_id: f for f in engine.findings}
+        assert findings["FS-IO-ERROR-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P3"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
+        assert findings["HW-MCE-EDAC-001"].severity == "P1"
+
+
+class TestHardwareThermalThrottlingDiagnostic:
+    """Deterministic current-boot kernel thermal-throttling diagnostic tests."""
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=return_code,
+            execution_status=status,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        thermal_throttle: CmdResult,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+        mce_edac: CmdResult | None = None,
+        fs_io: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac or self._cmd(),
+            "filesystem_io_error": fs_io or self._cmd(),
+            "hardware_thermal_throttling": thermal_throttle,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)",
+            "kernel: CPU3: Package temperature above threshold, cpu clock throttled (total events = 42)",
+            "kernel: [  123.456] CPU1: Core temperature above threshold, cpu clock throttled",
+            "kernel: thermal thermal_zone0: critical temperature threshold reached, cpu clock throttled",
+            "kernel: thermal thermal_zone1: temperature above thermal threshold, throttling CPU",
+        ],
+    )
+    def test_explicit_thermal_throttling_kernel_lines_match(self, line):
+        assert re.search(RE_HARDWARE_THERMAL_THROTTLE, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: Core 0: temperature 85 C",
+            "kernel: ACPI: Temperature 82 C",
+            "kernel: thermal: zone0: registered",
+            "kernel: Intel thermal monitoring enabled",
+        ],
+    )
+    def test_temperature_only_and_init_rejected(self, line):
+        assert re.search(RE_HARDWARE_THERMAL_THROTTLE, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: CPU0: Core temperature/speed normal",
+            "kernel: CPU1: Package temperature/speed normal",
+            "kernel: ACPI: Fan [FAN0] (on)",
+        ],
+    )
+    def test_clearing_events_and_cooling_registration_rejected(self, line):
+        assert re.search(RE_HARDWARE_THERMAL_THROTTLE, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: cpu clock throttled",
+            "kernel: cgroup: cpu bandwidth throttled",
+            "kernel: CPU0: Core power limit exceeded, cpu clock throttled",
+            "kernel: CPU0: Current limit exceeded, cpu clock throttled",
+        ],
+    )
+    def test_generic_and_power_limit_throttling_rejected(self, line):
+        assert re.search(RE_HARDWARE_THERMAL_THROTTLE, line, re.IGNORECASE) is None
+
+    def test_collector_emits_p2_finding(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_thermal_throttle_p2")
+        line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "HW-THERMAL-THROTTLE-001"
+        )
+        assert finding.severity == "P2"
+        assert "dławienia termicznego" in finding.title
+
+    @pytest.mark.parametrize(
+        ("status", "stdout", "ret_code"),
+        [
+            ("error", "", 1),
+            ("ok", "", 0),
+        ],
+    )
+    def test_failed_or_empty_journal_query_does_not_emit(
+        self, status, stdout, ret_code
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_thermal_empty_or_fail")
+        self._collect(
+            engine,
+            self._cmd(stdout=stdout, status=status, return_code=ret_code),
+        )
+        assert not any(
+            r.source_id == "HW-THERMAL-THROTTLE-001" for r in engine.raw_diagnostics
+        )
+
+    def test_observation_evidence_and_finding_contract(self):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_thermal_contract")
+        line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(
+            o for o in engine.observations if o.obs_id == "HW-THERMAL-THROTTLE-001"
+        )
+        finding = next(
+            f for f in engine.findings if f.finding_id == "HW-THERMAL-THROTTLE-001"
+        )
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-HW-THERMAL-THROTTLE-001-001"
+        )
+        assert observation.category == "hardware_thermal_throttling"
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind.HARDWARE_THERMAL_THROTTLING
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie wnioskuje o awarii układu chłodzenia" in finding.interpretation
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert (
+            syscheck.HardwareThermalThrottlingRule
+            is diagnostic_rules.HardwareThermalThrottlingRule
+        )
+        assert any(
+            rule.rule_id == "RULE-HARDWARE-THERMAL-THROTTLING"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
+
+    def test_thermal_throttling_isolation_from_other_hardware_diagnostics(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_thermal_isolation")
+        thermal_line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        fs_line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        aer_line = "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+        nvme_line = "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"
+        mce_line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(
+            engine,
+            thermal_throttle=self._cmd(thermal_line),
+            fs_io=self._cmd(fs_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+            mce_edac=self._cmd(mce_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
         assert findings["FS-IO-ERROR-001"].severity == "P2"
         assert findings["PCIE-AER-001"].severity == "P3"
         assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"

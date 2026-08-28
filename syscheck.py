@@ -56,6 +56,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
+    RE_HARDWARE_THERMAL_THROTTLE,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
@@ -168,6 +169,7 @@ class FindingKind(str, Enum):
     NVME_CONTROLLER_RELIABILITY = "nvme_controller_reliability"
     HARDWARE_MCE_EDAC_ERROR = "hardware_mce_edac_error"
     FILESYSTEM_IO_ERROR = "filesystem_io_error"
+    HARDWARE_THERMAL_THROTTLING = "hardware_thermal_throttling"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -969,6 +971,12 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
+        "hardware_thermal_throttling": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.HARDWARE_THERMAL_THROTTLING,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
     }
 
     _SEGFAULT_WP = FindingClassification(
@@ -1613,6 +1621,38 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "hardware_thermal_throttling":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Hardware thermal throttling event detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "thermal_throttle_detected": d.get(
+                        "thermal_throttle_detected", False
+                    ),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "hardware_thermal_throttling"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1640,6 +1680,7 @@ GeneralSegfaultRule = _diagnostic_rules.GeneralSegfaultRule
 GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
 GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
 HardwareMceEdacRule = _diagnostic_rules.HardwareMceEdacRule
+HardwareThermalThrottlingRule = _diagnostic_rules.HardwareThermalThrottlingRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2201,6 +2242,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "hardware_thermal_throttling": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_HARDWARE_THERMAL_THROTTLE,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2218,6 +2267,7 @@ class SysCheckEngine:
         nvme_controller_reliability_result = r.get("nvme_controller_reliability")
         hardware_mce_edac_result = r.get("hardware_mce_edac")
         filesystem_io_error_result = r.get("filesystem_io_error")
+        hardware_thermal_throttling_result = r.get("hardware_thermal_throttling")
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2621,6 +2671,35 @@ class SysCheckEngine:
                                 "event_classes": list(dict.fromkeys(severities)),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "filesystem_io_error",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź dławienie termiczne procesora (Hardware Thermal Throttling) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            hardware_thermal_throttling_result
+            and hardware_thermal_throttling_result.is_ok()
+            and hardware_thermal_throttling_result.stdout.strip()
+        ):
+            throttle_matching = [
+                line
+                for line in hardware_thermal_throttling_result.stdout.split("\n")
+                if re.search(RE_HARDWARE_THERMAL_THROTTLE, line, re.IGNORECASE)
+            ]
+            if throttle_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="HW-THERMAL-THROTTLE-001",
+                        category="hardware_thermal_throttling",
+                        payload=_capture_payload(
+                            hardware_thermal_throttling_result,
+                            {
+                                "thermal_throttle_detected": True,
+                                "matched_lines": throttle_matching[:20],
+                                "match_count": len(throttle_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "hardware_thermal_throttling",
                             },
                         ),
                     )
@@ -3408,6 +3487,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="FS-IO-ERROR-001",
                 category="filesystem_io_error",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "hardware_thermal_throttling":
+            return Observation(
+                obs_id="HW-THERMAL-THROTTLE-001",
+                category="hardware_thermal_throttling",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

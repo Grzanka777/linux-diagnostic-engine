@@ -828,6 +828,68 @@ class FilesystemIoErrorRule(DiagnosticRule):
         )
 
 
+class HardwareThermalThrottlingRule(DiagnosticRule):
+    rule_id = "RULE-HARDWARE-THERMAL-THROTTLING"
+    supported_categories = frozenset({"hardware_thermal_throttling"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("thermal_throttle_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title="Wykryto zdarzenie dławienia termicznego procesora (thermal throttling)",
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Dziennik jądra zarejestrował jawne przekroczenie progu termicznego i zdarzenie dławienia "
+                    "zegara procesora (thermal throttling) w bieżącym bocie. Diagnostyka rejestruje zdarzenie "
+                    "na podstawie dziennika i nie wnioskuje o awarii układu chłodzenia, zużyciu pasty termoprzewodzącej, "
+                    "zablokowanym przepływie powietrza, uszkodzeniu wentylatora, błędzie BIOS/UEFI, trwałym uszkodzeniu "
+                    "procesora ani o trwałym spadku wydajności lub dławieniu prądowym/zasilaniowym."
+                ),
+                recommended_diagnostics=(
+                    "Zachowaj dokładne linie zdarzeń i sprawdź, czy dławienie termiczne się powtarza:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'temperature above threshold.*throttl|thermal threshold.*throttl'`\n"
+                    "Sprawdź bieżące temperatury i limity chłodzenia narzędziami systemowymi (np. sensors)."
+                ),
+                remediation=(
+                    "Nie podejmuj inwazyjnych działań sprzętowych wyłącznie na podstawie pojedynczego wpisu w dzienniku. "
+                    "W razie powtarzających się zdarzeń zweryfikuj warunki termiczne systemu pod obciążeniem oraz konfigurację profilu zasilania i chłodzenia."
+                ),
+                verification=(
+                    "W kolejnym bocie lub po zakończeniu obciążenia sprawdź dziennik pod kątem nowych zdarzeń dławienia termicznego:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'temperature above threshold.*throttl|thermal threshold.*throttl'`."
+                ),
+                risk_level=(
+                    "Średnie (P2). Zdarzenie wskazuje na zadziałanie mechanizmu ochronnego procesora przy przekroczeniu progu temperatury. "
+                    "Sam wpis w dzienniku nie ustala trwałego uszkodzenia podzespołów ani permanentnego spadku wydajności."
+                ),
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1226,6 +1288,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         NvmeControllerReliabilityRule(eb),
         HardwareMceEdacRule(eb),
         FilesystemIoErrorRule(eb),
+        HardwareThermalThrottlingRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
