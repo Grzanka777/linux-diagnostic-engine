@@ -54,6 +54,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_KERNEL_ERROR,
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
+    RE_HARDWARE_MCE_EDAC,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
@@ -164,6 +165,7 @@ class FindingKind(str, Enum):
     GPU_NVIDIA_XID_79 = "gpu_nvidia_xid_79"
     PCIE_AER_ERROR = "pcie_aer_error"
     NVME_CONTROLLER_RELIABILITY = "nvme_controller_reliability"
+    HARDWARE_MCE_EDAC_ERROR = "hardware_mce_edac_error"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -809,6 +811,22 @@ def _nvme_controller_reliability_severity(line: str) -> Optional[str]:
     return None
 
 
+def _hardware_mce_edac_severity(line: str) -> Optional[str]:
+    """Return the severity class encoded in a matched MCE/EDAC kernel line."""
+    normalized = line.lower()
+    if (
+        "machine check" in normalized
+        or "uncorrected" in normalized
+        or "mce:" in normalized
+        or "[hardware error]" in normalized
+        or re.search(r"\bUE\b", line)
+    ):
+        return "uncorrected"
+    if "corrected" in normalized or re.search(r"\bCE\b", line):
+        return "corrected"
+    return None
+
+
 # ──────────────────────────────────────────────────────────────────
 # Silnik diagnostyczny
 # ──────────────────────────────────────────────────────────────────
@@ -915,6 +933,12 @@ class FindingClassificationPolicy:
         "nvme_controller_reliability": FindingClassification(
             DiagnosticDomain.HARDWARE,
             FindingKind.NVME_CONTROLLER_RELIABILITY,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "hardware_mce_edac_error": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.HARDWARE_MCE_EDAC_ERROR,
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
@@ -1500,6 +1524,37 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "hardware_mce_edac_error":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            severity = d.get("event_severity", "uncorrected")
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Hardware MCE/EDAC {severity} error detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "mce_edac_detected": d.get("mce_edac_detected", False),
+                    "event_severity": severity,
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "event_classes": d.get("event_classes", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "hardware_mce_edac"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1525,6 +1580,7 @@ FailedUserUnitRule = _diagnostic_rules.FailedUserUnitRule
 GeneralSegfaultRule = _diagnostic_rules.GeneralSegfaultRule
 GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
 GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
+HardwareMceEdacRule = _diagnostic_rules.HardwareMceEdacRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2070,6 +2126,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "hardware_mce_edac": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_HARDWARE_MCE_EDAC,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2085,6 +2149,7 @@ class SysCheckEngine:
         gpu_nvidia_xid_79_result = r["gpu_nvidia_xid_79"]
         pcie_aer_result = r.get("pcie_aer")
         nvme_controller_reliability_result = r.get("nvme_controller_reliability")
+        hardware_mce_edac_result = r.get("hardware_mce_edac")
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2408,6 +2473,46 @@ class SysCheckEngine:
                                 "event_classes": list(dict.fromkeys(severities)),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "nvme_controller_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy sprzętowe MCE / EDAC — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            hardware_mce_edac_result
+            and hardware_mce_edac_result.is_ok()
+            and hardware_mce_edac_result.stdout.strip()
+        ):
+            mce_edac_matching = [
+                line
+                for line in hardware_mce_edac_result.stdout.split("\n")
+                if re.search(RE_HARDWARE_MCE_EDAC, line, re.IGNORECASE)
+            ]
+            severities = [
+                severity
+                for line in mce_edac_matching
+                if (severity := _hardware_mce_edac_severity(line)) is not None
+            ]
+            if severities:
+                event_severity = max(
+                    severities,
+                    key={"corrected": 1, "uncorrected": 2}.get,
+                )
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="HW-MCE-EDAC-001",
+                        category="hardware_mce_edac_error",
+                        payload=_capture_payload(
+                            hardware_mce_edac_result,
+                            {
+                                "mce_edac_detected": True,
+                                "event_severity": event_severity,
+                                "matched_lines": mce_edac_matching[:20],
+                                "match_count": len(mce_edac_matching),
+                                "event_classes": list(dict.fromkeys(severities)),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "hardware_mce_edac",
                             },
                         ),
                     )
@@ -3171,6 +3276,18 @@ class SysCheckEngine:
             return Observation(
                 obs_id="NVME-CONTROLLER-RESET-001",
                 category="nvme_controller_reliability",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "hardware_mce_edac_error":
+            return Observation(
+                obs_id="HW-MCE-EDAC-001",
+                category="hardware_mce_edac_error",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

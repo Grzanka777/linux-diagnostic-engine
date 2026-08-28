@@ -690,6 +690,76 @@ class NvmeControllerReliabilityRule(DiagnosticRule):
         )
 
 
+class HardwareMceEdacRule(DiagnosticRule):
+    rule_id = "RULE-HARDWARE-MCE-EDAC-ERROR"
+    supported_categories = frozenset({"hardware_mce_edac_error"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        event_severity = observation.details.get("event_severity")
+        severity_map = {"corrected": "P2", "uncorrected": "P1"}
+        if event_severity not in severity_map:
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = (
+            "Wykryto zdarzenie MCE / EDAC: skorygowane błędy sprzętowe"
+            if event_severity == "corrected"
+            else "Wykryto zdarzenie MCE / EDAC: Machine Check / błąd nieskorygowany"
+        )
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity=severity_map[event_severity],
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=(
+                    "Dziennik jądra zarejestrował jawne zdarzenie MCE (Machine Check Exception) "
+                    "lub błędy EDAC w bieżącym bocie. Diagnostyka rejestruje zdarzenie na podstawie "
+                    "dziennika i nie wnioskuje o trwałej awarii pamięci RAM, procesora ani "
+                    "płyty głównej, ani nie przesądza o trwałym uszkodzeniu podzespołów."
+                ),
+                recommended_diagnostics=(
+                    "Zachowaj dokładne linie zdarzeń i sprawdź, czy problem się powtarza:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'mce|edac'`\n"
+                    "Sprawdź status podsystemów diagnostyki sprzętowej (jeśli są zainstalowane):\n"
+                    "`rasdaemon --status` lub `edac-util -v`"
+                ),
+                remediation=(
+                    "Nie wymieniaj komponentów na podstawie pojedynczego wpisu. "
+                    "Jeśli błędy się powtarzają, zweryfikuj stabilność zasilania, chłodzenia "
+                    "oraz aktualność mikrokodu procesora i oprogramowania układowego (BIOS/UEFI)."
+                ),
+                verification=(
+                    "W kolejnym bocie sprawdź dziennik pod kątem nowych zdarzeń MCE/EDAC:\n"
+                    "`journalctl -b -k --no-pager | grep -iE 'mce|edac'`."
+                ),
+                risk_level=(
+                    "Umiarkowane dla błędów skorygowanych (P2), wysokie dla zdarzeń Machine Check lub błędów nieskorygowanych (P1). "
+                    "Sam wpis w dzienniku nie ustala trwałego uszkodzenia podzespołów."
+                ),
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1086,6 +1156,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         GpuNvidiaXid79Rule(eb),
         PcieAerErrorRule(eb),
         NvmeControllerReliabilityRule(eb),
+        HardwareMceEdacRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),

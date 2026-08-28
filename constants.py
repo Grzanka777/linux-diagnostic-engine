@@ -41,6 +41,15 @@ RE_NVME_CONTROLLER_RELIABILITY = (
     r"Device not ready;\s*aborting reset\b"
     r")"
 )
+RE_HARDWARE_MCE_EDAC = (
+    r"(?:"
+    r"\bmce:\s*\[Hardware Error\]|"
+    r"\[Hardware Error\]:.*?\bMachine Check\b|"
+    r"\bMachine Check Exception\b|"
+    r"\bMachine check events logged\b|"
+    r"\bEDAC\b.*?(?:\b(?:CE|UE)\b|\b(?:[Cc]orrected|[Uu]ncorrected)\s+error\b)"
+    r")"
+)
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────
 TRUNCATE_NORMAL = 5000

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_AMDGPU_RESET_FAIL,
     RE_GPU_I915_HANG,
+    RE_HARDWARE_MCE_EDAC,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
@@ -35,6 +36,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
     _get_bootable_kernels_from_modules,
+    _hardware_mce_edac_severity,
     _journal_count_command,
     _journal_filter_command,
     _oom_collector_command,
@@ -100,6 +102,9 @@ class TestDiagnosticRuleImportBoundary:
             "GpuI915HangRule",
             "AmdgpuResetFailRule",
             "GpuNvidiaXid79Rule",
+            "PcieAerErrorRule",
+            "NvmeControllerReliabilityRule",
+            "HardwareMceEdacRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -899,6 +904,7 @@ class TestCaptureCompleteness:
         [
             ("pcie_aer_error", "PCIE-AER-001"),
             ("nvme_controller_reliability", "NVME-CONTROLLER-RESET-001"),
+            ("hardware_mce_edac_error", "HW-MCE-EDAC-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -9284,3 +9290,324 @@ class TestNvidiaXid79CollectorPath:
             r for r in engine.raw_diagnostics if r.source_id == "SEGFAULT-WP-001"
         ]
         assert len(wp_raws) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Test: MCE / EDAC Hardware Error Diagnostic (Iteration 38)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestHardwareMceEdacDiagnostic:
+    """Deterministic current-boot MCE/EDAC hardware error diagnostic tests."""
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=return_code,
+            execution_status=status,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        mce_edac: CmdResult,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: mce: [Hardware Error]: Machine check events logged",
+            "kernel: mce: [Hardware Error]: CPU 0: Machine Check: 0 Bank 4: b200000000030005",
+            "kernel: [Hardware Error]: CPU 1: Machine Check: 0 Bank 1: b200000000000175",
+            "kernel: Machine Check Exception: 0000000000000004",
+            "kernel: Machine check events logged",
+        ],
+    )
+    def test_explicit_mce_hardware_error_events_match(self, line):
+        assert re.search(RE_HARDWARE_MCE_EDAC, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0",
+            "kernel: EDAC MC1: 1 UE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0",
+            "kernel: EDAC MC0: CE page 0x1234, offset 0x0, grain 8, syndrome 0x0",
+            "kernel: EDAC MC0: UE page 0x1234, offset 0x0, grain 8, syndrome 0x0",
+            "kernel: EDAC pci: Corrected error on 0000:00:00.0",
+            "kernel: EDAC pci: Uncorrected error on 0000:00:00.0",
+        ],
+    )
+    def test_explicit_edac_events_match(self, line):
+        assert re.search(RE_HARDWARE_MCE_EDAC, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: EDAC MC: Ver: 3.0.0",
+            "kernel: EDAC MC0: Giving out device to module i7core_edac.c controller ...",
+            "kernel: EDAC PCI0: Giving out device to module ...",
+            "kernel: EDAC driver initialized",
+            "kernel: EDAC MC: loaded ...",
+            "kernel: mce: CPU supports 6 MCE banks",
+            "kernel: mce: enabled",
+            "kernel: pcieport 0000:00:01.0: PCIe Bus Error: severity=Corrected",
+            "kernel: pcieport 0000:00:01.0: AER: Corrected error received",
+            "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting",
+            "kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0",
+            "kernel: i915 0000:00:02.0: GPU HANG: ecode 9:1",
+            "kernel: amdgpu 0000:01:00.0: amdgpu: GPU reset failed!",
+            "kernel: NVRM: Xid (PCI:0000:01:00): 79",
+            "kernel: mysqld invoked oom-killer: gfp_mask=0xcc0",
+            "kernel: Out of memory: Killed process 1234 (mysqld)",
+        ],
+    )
+    def test_generic_text_and_unrelated_subsystems_do_not_match(self, line):
+        assert re.search(RE_HARDWARE_MCE_EDAC, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            (
+                "kernel: EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0",
+                "corrected",
+            ),
+            ("kernel: EDAC pci: Corrected error on 0000:00:00.0", "corrected"),
+            (
+                "kernel: EDAC MC0: CE page 0x1234, offset 0x0, grain 8, syndrome 0x0",
+                "corrected",
+            ),
+            (
+                "kernel: EDAC MC1: 1 UE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0",
+                "uncorrected",
+            ),
+            ("kernel: EDAC pci: Uncorrected error on 0000:00:00.0", "uncorrected"),
+            (
+                "kernel: EDAC MC0: UE page 0x1234, offset 0x0, grain 8, syndrome 0x0",
+                "uncorrected",
+            ),
+            (
+                "kernel: mce: [Hardware Error]: Machine check events logged",
+                "uncorrected",
+            ),
+            (
+                "kernel: mce: [Hardware Error]: CPU 0: Machine Check: 0 Bank 4: b200000000030005",
+                "uncorrected",
+            ),
+            ("kernel: Machine Check Exception: 0000000000000004", "uncorrected"),
+        ],
+    )
+    def test_explicit_event_severity_is_deterministic(self, line, expected):
+        assert _hardware_mce_edac_severity(line) == expected
+
+    def test_collector_preserves_corrected_as_p2(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_corrected")
+        self._collect(
+            engine,
+            self._cmd(
+                "kernel: EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0"
+            ),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "HW-MCE-EDAC-001")
+        assert finding.severity == "P2"
+        assert "skorygowane" in finding.title
+
+    def test_collector_preserves_uncorrected_as_p1(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_uncorrected")
+        self._collect(
+            engine,
+            self._cmd(
+                "kernel: EDAC MC1: 1 UE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0"
+            ),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "HW-MCE-EDAC-001")
+        assert finding.severity == "P1"
+        assert "Machine Check / błąd nieskorygowany" in finding.title
+
+    def test_collector_preserves_machine_check_as_p1(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_machine_check")
+        self._collect(
+            engine,
+            self._cmd("kernel: mce: [Hardware Error]: Machine check events logged"),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "HW-MCE-EDAC-001")
+        assert finding.severity == "P1"
+
+    def test_mixed_events_use_highest_severity_p1(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_mixed")
+        lines = "\n".join(
+            [
+                "kernel: EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0",
+                "kernel: mce: [Hardware Error]: Machine check events logged",
+            ]
+        )
+        self._collect(engine, self._cmd(lines))
+        engine._derive_observations()
+        engine._interpret()
+        raw = next(
+            r for r in engine.raw_diagnostics if r.source_id == "HW-MCE-EDAC-001"
+        )
+        assert raw.payload["event_severity"] == "uncorrected"
+        assert raw.payload["match_count"] == 2
+        finding = next(f for f in engine.findings if f.finding_id == "HW-MCE-EDAC-001")
+        assert finding.severity == "P1"
+
+    @pytest.mark.parametrize("status", ["error", "not_found"])
+    def test_failed_or_unavailable_journal_query_does_not_emit(self, status):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_failure")
+        self._collect(engine, self._cmd(status=status, return_code=1))
+        assert not any(r.source_id == "HW-MCE-EDAC-001" for r in engine.raw_diagnostics)
+
+    def test_empty_journal_output_does_not_emit(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_empty")
+        self._collect(engine, self._cmd(""))
+        assert not any(r.source_id == "HW-MCE-EDAC-001" for r in engine.raw_diagnostics)
+
+    def test_observation_evidence_and_finding_contract(self):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_edac_contract")
+        line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(
+            o for o in engine.observations if o.obs_id == "HW-MCE-EDAC-001"
+        )
+        finding = next(f for f in engine.findings if f.finding_id == "HW-MCE-EDAC-001")
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == "EVIDENCE-HW-MCE-EDAC-001-001"
+        )
+        assert observation.category == "hardware_mce_edac_error"
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind.HARDWARE_MCE_EDAC_ERROR
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert (
+            "nie wnioskuje o trwałej awarii pamięci RAM, procesora ani płyty głównej"
+            in finding.interpretation
+        )
+
+    def test_rule_is_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert syscheck.HardwareMceEdacRule is diagnostic_rules.HardwareMceEdacRule
+        assert any(
+            rule.rule_id == "RULE-HARDWARE-MCE-EDAC-ERROR"
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        )
+
+    def test_mce_edac_only_does_not_emit_or_depend_on_aer_or_nvme(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_only")
+        self._collect(
+            engine,
+            self._cmd("kernel: mce: [Hardware Error]: Machine check events logged"),
+            aer=self._cmd(),
+            nvme=self._cmd(),
+        )
+        source_ids = {raw.source_id for raw in engine.raw_diagnostics}
+        assert "HW-MCE-EDAC-001" in source_ids
+        assert "PCIE-AER-001" not in source_ids
+        assert "NVME-CONTROLLER-RESET-001" not in source_ids
+
+    def test_aer_only_does_not_emit_mce_edac(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_aer_only_mce")
+        self._collect(
+            engine,
+            self._cmd(),
+            aer=self._cmd(
+                "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+            ),
+            nvme=self._cmd(),
+        )
+        source_ids = {raw.source_id for raw in engine.raw_diagnostics}
+        assert "PCIE-AER-001" in source_ids
+        assert "HW-MCE-EDAC-001" not in source_ids
+
+    def test_nvme_only_does_not_emit_mce_edac(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_nvme_only_mce")
+        self._collect(
+            engine,
+            self._cmd(),
+            aer=self._cmd(),
+            nvme=self._cmd("kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"),
+        )
+        source_ids = {raw.source_id for raw in engine.raw_diagnostics}
+        assert "NVME-CONTROLLER-RESET-001" in source_ids
+        assert "HW-MCE-EDAC-001" not in source_ids
+
+    def test_combined_mce_aer_and_nvme_emit_independent_diagnostics(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_combined_mce_aer_nvme")
+        mce_line = (
+            "kernel: EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#0_DIMM#0"
+        )
+        aer_line = "kernel: pcieport 0000:00:01.0: PCIe Bus Error: severity=Uncorrected (Fatal)"
+        nvme_line = "kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0"
+        self._collect(
+            engine,
+            self._cmd(mce_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["HW-MCE-EDAC-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P1"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P1"
+
+    def test_existing_oom_unchanged(self):
+        """Hardware MCE collector does not interfere with OOM detection."""
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_regr_oom")
+        self._collect(
+            engine,
+            mce_edac=self._cmd(),
+        )
+        # Verify clean collection without OOM false triggers
+        assert not any(r.source_id == "KERNEL-OOM-001" for r in engine.raw_diagnostics)
+
+    def test_existing_gpu_diagnostics_unchanged(self):
+        """Hardware MCE collector does not interfere with GPU diagnostics."""
+        engine = SysCheckEngine(output_dir="/tmp/test_mce_regr_gpu")
+        self._collect(
+            engine,
+            mce_edac=self._cmd(),
+        )
+        assert not any(
+            r.source_id
+            in ("GPU-I915-HANG-001", "AMDGPU-RESET-FAIL-001", "GPU-NVIDIA-XID-79-001")
+            for r in engine.raw_diagnostics
+        )
