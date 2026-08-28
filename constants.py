@@ -85,6 +85,34 @@ RE_KERNEL_OOPS_PANIC = (
     r"\bBUG:\s*unable to handle kernel\b"
     r")"
 )
+RE_KERNEL_SOFT_LOCKUP = (
+    r"(?:\b(?:watchdog:\s+)?BUG:\s*soft lockup\s*-\s*CPU#\d+\s+stuck\s+for\s+\d+s!?\b)"
+)
+RE_KERNEL_HARD_LOCKUP = (
+    r"(?:"
+    r"\b(?:(?:NMI\s+)?watchdog:\s+)?(?:Watchdog detected\s+|BUG:\s*)hard\s+LOCKUP\b|"
+    r"\bhard\s+LOCKUP\s+on\s+cpu\b"
+    r")"
+)
+RE_KERNEL_HUNG_TASK = (
+    r"(?:\b(?:INFO:\s+)?task\s+\S+?\s+blocked for more than\s+\d+\s+seconds\b)"
+)
+RE_KERNEL_RCU_STALL = (
+    r"(?:"
+    r"\b(?:rcu:\s+)?(?:INFO:\s+)?rcu(?:_[a-z_]+)?\s+(?:(?:self-)?detected\s+(?:expedited\s+)?stalls?|kthread\s+starved)\b|"
+    r"\brcu(?:_[a-z_]+)?\s+(?:self-)?detected\s+(?:expedited\s+)?stalls?\b"
+    r")"
+)
+RE_KERNEL_STALL_RELIABILITY = (
+    r"(?:"
+    r"\b(?:watchdog:\s+)?BUG:\s*soft lockup\s*-\s*CPU#\d+\s+stuck\s+for\s+\d+s!?\b|"
+    r"\b(?:(?:NMI\s+)?watchdog:\s+)?(?:Watchdog detected\s+|BUG:\s*)hard\s+LOCKUP\b|"
+    r"\bhard\s+LOCKUP\s+on\s+cpu\b|"
+    r"\b(?:INFO:\s+)?task\s+\S+?\s+blocked for more than\s+\d+\s+seconds\b|"
+    r"\b(?:rcu:\s+)?(?:INFO:\s+)?rcu(?:_[a-z_]+)?\s+(?:(?:self-)?detected\s+(?:expedited\s+)?stalls?|kthread\s+starved)\b|"
+    r"\brcu(?:_[a-z_]+)?\s+(?:self-)?detected\s+(?:expedited\s+)?stalls?\b"
+    r")"
+)
 
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────

@@ -57,9 +57,14 @@ from constants import (  # type: ignore[import-untyped]
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_KERNEL_HARD_LOCKUP,
+    RE_KERNEL_HUNG_TASK,
     RE_KERNEL_OOPS_BUG,
     RE_KERNEL_OOPS_PANIC,
     RE_KERNEL_PANIC,
+    RE_KERNEL_RCU_STALL,
+    RE_KERNEL_SOFT_LOCKUP,
+    RE_KERNEL_STALL_RELIABILITY,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
@@ -174,6 +179,10 @@ class FindingKind(str, Enum):
     FILESYSTEM_IO_ERROR = "filesystem_io_error"
     HARDWARE_THERMAL_THROTTLING = "hardware_thermal_throttling"
     KERNEL_OOPS_PANIC = "kernel_oops_panic"
+    KERNEL_SOFT_LOCKUP = "kernel_soft_lockup"
+    KERNEL_HARD_LOCKUP = "kernel_hard_lockup"
+    KERNEL_HUNG_TASK = "kernel_hung_task"
+    KERNEL_RCU_STALL = "kernel_rcu_stall"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -996,6 +1005,30 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
+        "kernel_soft_lockup": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_SOFT_LOCKUP,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "kernel_hard_lockup": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_HARD_LOCKUP,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "kernel_hung_task": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_HUNG_TASK,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "kernel_rcu_stall": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_RCU_STALL,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
     }
 
     _SEGFAULT_WP = FindingClassification(
@@ -1704,6 +1737,118 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "kernel_soft_lockup":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Kernel watchdog soft lockup detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "soft_lockup_detected": d.get("soft_lockup_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "kernel_stall_reliability"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "kernel_hard_lockup":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Kernel watchdog hard LOCKUP detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "hard_lockup_detected": d.get("hard_lockup_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "kernel_stall_reliability"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "kernel_hung_task":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Kernel hung task detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "hung_task_detected": d.get("hung_task_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "kernel_stall_reliability"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "kernel_rcu_stall":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Kernel RCU stall / starvation detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "rcu_stall_detected": d.get("rcu_stall_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get("source_query", "kernel_stall_reliability"),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1733,6 +1878,10 @@ GpuNvidiaXid79Rule = _diagnostic_rules.GpuNvidiaXid79Rule
 HardwareMceEdacRule = _diagnostic_rules.HardwareMceEdacRule
 HardwareThermalThrottlingRule = _diagnostic_rules.HardwareThermalThrottlingRule
 KernelOopsPanicRule = _diagnostic_rules.KernelOopsPanicRule
+KernelSoftLockupRule = _diagnostic_rules.KernelSoftLockupRule
+KernelHardLockupRule = _diagnostic_rules.KernelHardLockupRule
+KernelHungTaskRule = _diagnostic_rules.KernelHungTaskRule
+KernelRcuStallRule = _diagnostic_rules.KernelRcuStallRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2310,6 +2459,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "kernel_stall_reliability": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_KERNEL_STALL_RELIABILITY,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2329,6 +2486,15 @@ class SysCheckEngine:
         filesystem_io_error_result = r.get("filesystem_io_error")
         hardware_thermal_throttling_result = r.get("hardware_thermal_throttling")
         kernel_oops_panic_result = r.get("kernel_oops_panic")
+        kernel_stall_reliability_result = r.get("kernel_stall_reliability")
+        soft_lockup_result = (
+            r.get("kernel_soft_lockup") or kernel_stall_reliability_result
+        )
+        hard_lockup_result = (
+            r.get("kernel_hard_lockup") or kernel_stall_reliability_result
+        )
+        hung_task_result = r.get("kernel_hung_task") or kernel_stall_reliability_result
+        rcu_stall_result = r.get("kernel_rcu_stall") or kernel_stall_reliability_result
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -2797,6 +2963,122 @@ class SysCheckEngine:
                                 "match_count": len(oops_panic_matching),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "kernel_oops_panic",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź zablokowanie programowe procesora (Kernel Soft Lockup) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            soft_lockup_result
+            and soft_lockup_result.is_ok()
+            and soft_lockup_result.stdout.strip()
+        ):
+            soft_matching = [
+                line
+                for line in soft_lockup_result.stdout.split("\n")
+                if re.search(RE_KERNEL_SOFT_LOCKUP, line, re.IGNORECASE)
+            ]
+            if soft_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-SOFT-LOCKUP-001",
+                        category="kernel_soft_lockup",
+                        payload=_capture_payload(
+                            soft_lockup_result,
+                            {
+                                "soft_lockup_detected": True,
+                                "matched_lines": soft_matching[:20],
+                                "match_count": len(soft_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "kernel_stall_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź zablokowanie sprzętowe procesora (Kernel Hard Lockup) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            hard_lockup_result
+            and hard_lockup_result.is_ok()
+            and hard_lockup_result.stdout.strip()
+        ):
+            hard_matching = [
+                line
+                for line in hard_lockup_result.stdout.split("\n")
+                if re.search(RE_KERNEL_HARD_LOCKUP, line, re.IGNORECASE)
+            ]
+            if hard_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-HARD-LOCKUP-001",
+                        category="kernel_hard_lockup",
+                        payload=_capture_payload(
+                            hard_lockup_result,
+                            {
+                                "hard_lockup_detected": True,
+                                "matched_lines": hard_matching[:20],
+                                "match_count": len(hard_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "kernel_stall_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź zablokowane zadania jądra (Kernel Hung Task) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            hung_task_result
+            and hung_task_result.is_ok()
+            and hung_task_result.stdout.strip()
+        ):
+            hung_matching = [
+                line
+                for line in hung_task_result.stdout.split("\n")
+                if re.search(RE_KERNEL_HUNG_TASK, line, re.IGNORECASE)
+            ]
+            if hung_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-HUNG-TASK-001",
+                        category="kernel_hung_task",
+                        payload=_capture_payload(
+                            hung_task_result,
+                            {
+                                "hung_task_detected": True,
+                                "matched_lines": hung_matching[:20],
+                                "match_count": len(hung_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "kernel_stall_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź zablokowania podsystemu RCU (Kernel RCU Stall) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            rcu_stall_result
+            and rcu_stall_result.is_ok()
+            and rcu_stall_result.stdout.strip()
+        ):
+            rcu_matching = [
+                line
+                for line in rcu_stall_result.stdout.split("\n")
+                if re.search(RE_KERNEL_RCU_STALL, line, re.IGNORECASE)
+            ]
+            if rcu_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-RCU-STALL-001",
+                        category="kernel_rcu_stall",
+                        payload=_capture_payload(
+                            rcu_stall_result,
+                            {
+                                "rcu_stall_detected": True,
+                                "matched_lines": rcu_matching[:20],
+                                "match_count": len(rcu_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "kernel_stall_reliability",
                             },
                         ),
                     )
@@ -3608,6 +3890,54 @@ class SysCheckEngine:
             return Observation(
                 obs_id="KERNEL-OOPS-PANIC-001",
                 category="kernel_oops_panic",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_soft_lockup":
+            return Observation(
+                obs_id="KERNEL-SOFT-LOCKUP-001",
+                category="kernel_soft_lockup",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_hard_lockup":
+            return Observation(
+                obs_id="KERNEL-HARD-LOCKUP-001",
+                category="kernel_hard_lockup",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_hung_task":
+            return Observation(
+                obs_id="KERNEL-HUNG-TASK-001",
+                category="kernel_hung_task",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_rcu_stall":
+            return Observation(
+                obs_id="KERNEL-RCU-STALL-001",
+                category="kernel_rcu_stall",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

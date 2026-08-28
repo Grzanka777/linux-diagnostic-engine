@@ -21,9 +21,14 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_KERNEL_HARD_LOCKUP,
+    RE_KERNEL_HUNG_TASK,
     RE_KERNEL_OOPS_BUG,
     RE_KERNEL_OOPS_PANIC,
     RE_KERNEL_PANIC,
+    RE_KERNEL_RCU_STALL,
+    RE_KERNEL_SOFT_LOCKUP,
+    RE_KERNEL_STALL_RELIABILITY,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
@@ -115,6 +120,10 @@ class TestDiagnosticRuleImportBoundary:
             "FilesystemIoErrorRule",
             "HardwareThermalThrottlingRule",
             "KernelOopsPanicRule",
+            "KernelSoftLockupRule",
+            "KernelHardLockupRule",
+            "KernelHungTaskRule",
+            "KernelRcuStallRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -918,6 +927,10 @@ class TestCaptureCompleteness:
             ("filesystem_io_error", "FS-IO-ERROR-001"),
             ("hardware_thermal_throttling", "HW-THERMAL-THROTTLE-001"),
             ("kernel_oops_panic", "KERNEL-OOPS-PANIC-001"),
+            ("kernel_soft_lockup", "KERNEL-SOFT-LOCKUP-001"),
+            ("kernel_hard_lockup", "KERNEL-HARD-LOCKUP-001"),
+            ("kernel_hung_task", "KERNEL-HUNG-TASK-001"),
+            ("kernel_rcu_stall", "KERNEL-RCU-STALL-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -10252,6 +10265,387 @@ class TestKernelOopsPanicDiagnostic:
         engine._derive_observations()
         engine._interpret()
         findings = {f.finding_id: f for f in engine.findings}
+        assert findings["KERNEL-OOPS-PANIC-001"].severity == "P0"
+        assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
+        assert findings["FS-IO-ERROR-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P3"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
+        assert findings["HW-MCE-EDAC-001"].severity == "P1"
+
+
+class TestKernelStallReliabilityPack:
+    """Deterministic current-boot kernel stall & scheduler reliability diagnostics."""
+
+    @staticmethod
+    def _cmd(stdout: str = "", status: str = "ok", return_code: int = 0) -> CmdResult:
+        return CmdResult(
+            command="test",
+            stdout=stdout,
+            stderr="",
+            return_code=return_code,
+            execution_status=status,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        kernel_stall_reliability: CmdResult,
+        kernel_oops_panic: CmdResult | None = None,
+        thermal_throttle: CmdResult | None = None,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+        mce_edac: CmdResult | None = None,
+        fs_io: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac or self._cmd(),
+            "filesystem_io_error": fs_io or self._cmd(),
+            "hardware_thermal_throttling": thermal_throttle or self._cmd(),
+            "kernel_oops_panic": kernel_oops_panic or self._cmd(),
+            "kernel_stall_reliability": kernel_stall_reliability,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [kworker/u16:1:123]",
+            "kernel: BUG: soft lockup - CPU#0 stuck for 23s!",
+            "kernel: [  123.456] watchdog: BUG: soft lockup - CPU#4 stuck for 21s! [mysqld:5678]",
+        ],
+    )
+    def test_explicit_kernel_soft_lockup_matches(self, line):
+        assert re.search(RE_KERNEL_SOFT_LOCKUP, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: watchdog: Watchdog detected hard LOCKUP on cpu 0",
+            "kernel: NMI watchdog: Watchdog detected hard LOCKUP on cpu 1",
+            "kernel: Watchdog detected hard LOCKUP on cpu 2",
+            "kernel: NMI watchdog: BUG: hard LOCKUP at ffffffff81023456",
+            "kernel: [  200.123] hard LOCKUP on cpu 3",
+        ],
+    )
+    def test_explicit_kernel_hard_lockup_matches(self, line):
+        assert re.search(RE_KERNEL_HARD_LOCKUP, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: INFO: task mysqld:1234 blocked for more than 120 seconds.",
+            "kernel: task jbd2/dm-0-8:456 blocked for more than 120 seconds.",
+            "kernel: [  234.567] INFO: task kworker/u16:1:123 blocked for more than 60 seconds.",
+        ],
+    )
+    def test_explicit_kernel_hung_task_matches(self, line):
+        assert re.search(RE_KERNEL_HUNG_TASK, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: [ 100.123] INFO: rcu_sched detected stalls on CPUs/tasks: 0-...",
+            "kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks:",
+            "kernel: INFO: rcu_sched self-detected stall on CPU 2",
+            "kernel: rcu_preempt self-detected stall on CPU",
+            "kernel: rcu_tasks detected stalls on CPUs/tasks: 3-...",
+            "kernel: rcu_sched kthread starved for 2500 jiffies",
+        ],
+    )
+    def test_explicit_kernel_rcu_stall_matches(self, line):
+        assert re.search(RE_KERNEL_RCU_STALL, line, re.IGNORECASE)
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "logger: watchdog timer reset by user",
+            "systemd: watchdog keepalive ping sent",
+            "app: soft lockup threshold configured to 30",
+            "logger: hard lockup detector initialized successfully",
+            "systemd: service blocked for more than 30 seconds waiting on network",
+            "worker: thread blocked for more than 10 seconds",
+            "logger: rcu config loaded",
+            "app: pipeline stall detected in render loop",
+            "kernel: echo 0 > /proc/sys/kernel/hung_task_timeout_secs",
+        ],
+    )
+    def test_generic_watchdog_and_userspace_rejected(self, line):
+        assert re.search(RE_KERNEL_SOFT_LOCKUP, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_HARD_LOCKUP, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_HUNG_TASK, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_RCU_STALL, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: rcu: Hierarchical RCU implementation.",
+            "kernel: rcu: RCU restricting CPUs from NR_CPUS=512 to nr_cpu_ids=16.",
+            "kernel: rcu: RCU calculated value of scheduler-enlistment delay is 25 jiffies.",
+            "kernel: rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=16",
+            "kernel: rcu: Hierarchical SRCU implementation.",
+            "kernel: rcu: Tasks RCU initialized.",
+        ],
+    )
+    def test_normal_rcu_boot_messages_rejected(self, line):
+        assert re.search(RE_KERNEL_RCU_STALL, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: Kernel panic - not syncing: Fatal exception",
+            "kernel: Oops: 0000 [#1] PREEMPT SMP",
+            "kernel: mce: [Hardware Error]: Machine Check Exception",
+            "kernel: CPU0: Core temperature above threshold, cpu clock throttled",
+            "kernel: Buffer I/O error on dev sda1",
+            "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting",
+        ],
+    )
+    def test_unrelated_diagnostics_rejected(self, line):
+        assert re.search(RE_KERNEL_SOFT_LOCKUP, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_HARD_LOCKUP, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_HUNG_TASK, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_RCU_STALL, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_STALL_RELIABILITY, line, re.IGNORECASE) is None
+
+    def test_collector_emits_soft_lockup_p1(self):
+        from syscheck import FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_soft_lockup")
+        line = "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [kworker/u16:1:123]"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-SOFT-LOCKUP-001"
+        )
+        assert finding.severity == "P1"
+        assert finding.kind == FindingKind.KERNEL_SOFT_LOCKUP
+        assert "Kernel Soft Lockup" in finding.title
+
+    def test_collector_emits_hard_lockup_p1(self):
+        from syscheck import FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_hard_lockup")
+        line = "kernel: NMI watchdog: Watchdog detected hard LOCKUP on cpu 2"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-HARD-LOCKUP-001"
+        )
+        assert finding.severity == "P1"
+        assert finding.kind == FindingKind.KERNEL_HARD_LOCKUP
+        assert "Kernel Hard Lockup" in finding.title
+
+    def test_collector_emits_hung_task_p2(self):
+        from syscheck import FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_hung_task")
+        line = "kernel: INFO: task mysqld:1234 blocked for more than 120 seconds."
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-HUNG-TASK-001"
+        )
+        assert finding.severity == "P2"
+        assert finding.kind == FindingKind.KERNEL_HUNG_TASK
+        assert "Kernel Hung Task" in finding.title
+
+    def test_collector_emits_rcu_stall_p1(self):
+        from syscheck import FindingKind
+
+        engine = SysCheckEngine(output_dir="/tmp/test_rcu_stall")
+        line = "kernel: INFO: rcu_sched detected stalls on CPUs/tasks: 0-..."
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "KERNEL-RCU-STALL-001"
+        )
+        assert finding.severity == "P1"
+        assert finding.kind == FindingKind.KERNEL_RCU_STALL
+        assert "Kernel RCU Stall" in finding.title
+
+    def test_collector_coexistence_all_four_stall_families_in_shared_capture(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_stall_coexistence")
+        lines = "\n".join(
+            [
+                "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [kworker/u16:1:123]",
+                "kernel: NMI watchdog: Watchdog detected hard LOCKUP on cpu 2",
+                "kernel: INFO: task mysqld:1234 blocked for more than 120 seconds.",
+                "kernel: rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks:",
+            ]
+        )
+        self._collect(engine, self._cmd(lines))
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert "KERNEL-SOFT-LOCKUP-001" in findings
+        assert "KERNEL-HARD-LOCKUP-001" in findings
+        assert "KERNEL-HUNG-TASK-001" in findings
+        assert "KERNEL-RCU-STALL-001" in findings
+        assert findings["KERNEL-SOFT-LOCKUP-001"].severity == "P1"
+        assert findings["KERNEL-HARD-LOCKUP-001"].severity == "P1"
+        assert findings["KERNEL-HUNG-TASK-001"].severity == "P2"
+        assert findings["KERNEL-RCU-STALL-001"].severity == "P1"
+
+    @pytest.mark.parametrize(
+        ("status", "stdout", "ret_code"),
+        [
+            ("error", "", 1),
+            ("ok", "", 0),
+        ],
+    )
+    def test_failed_or_empty_journal_does_not_emit_stall_diagnostics(
+        self, status, stdout, ret_code
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_stall_empty_or_fail")
+        self._collect(
+            engine,
+            self._cmd(stdout=stdout, status=status, return_code=ret_code),
+        )
+        assert not any(
+            r.source_id
+            in {
+                "KERNEL-SOFT-LOCKUP-001",
+                "KERNEL-HARD-LOCKUP-001",
+                "KERNEL-HUNG-TASK-001",
+                "KERNEL-RCU-STALL-001",
+            }
+            for r in engine.raw_diagnostics
+        )
+
+    @pytest.mark.parametrize(
+        ("cat", "source_id", "expected_severity", "expected_kind", "line"),
+        [
+            (
+                "kernel_soft_lockup",
+                "KERNEL-SOFT-LOCKUP-001",
+                "P1",
+                "kernel_soft_lockup",
+                "kernel: watchdog: BUG: soft lockup - CPU#2 stuck for 22s! [test:99]",
+            ),
+            (
+                "kernel_hard_lockup",
+                "KERNEL-HARD-LOCKUP-001",
+                "P1",
+                "kernel_hard_lockup",
+                "kernel: NMI watchdog: Watchdog detected hard LOCKUP on cpu 0",
+            ),
+            (
+                "kernel_hung_task",
+                "KERNEL-HUNG-TASK-001",
+                "P2",
+                "kernel_hung_task",
+                "kernel: INFO: task worker:55 blocked for more than 120 seconds.",
+            ),
+            (
+                "kernel_rcu_stall",
+                "KERNEL-RCU-STALL-001",
+                "P1",
+                "kernel_rcu_stall",
+                "kernel: INFO: rcu_sched self-detected stall on CPU 1",
+            ),
+        ],
+    )
+    def test_observation_evidence_and_finding_contracts_all_four_families(
+        self, cat, source_id, expected_severity, expected_kind, line
+    ):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir=f"/tmp/test_contract_{cat}")
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(o for o in engine.observations if o.obs_id == source_id)
+        finding = next(f for f in engine.findings if f.finding_id == source_id)
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == f"EVIDENCE-{source_id}-001"
+        )
+        assert observation.category == cat
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind(expected_kind)
+        assert finding.severity == expected_severity
+        assert finding.domain == DiagnosticDomain.KERNEL
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie przypisuje przyczyny źródłowej" in finding.interpretation
+
+    def test_rules_are_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert syscheck.KernelSoftLockupRule is diagnostic_rules.KernelSoftLockupRule
+        assert syscheck.KernelHardLockupRule is diagnostic_rules.KernelHardLockupRule
+        assert syscheck.KernelHungTaskRule is diagnostic_rules.KernelHungTaskRule
+        assert syscheck.KernelRcuStallRule is diagnostic_rules.KernelRcuStallRule
+
+        engine_rules = {
+            rule.rule_id: rule
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        }
+        assert "RULE-KERNEL-SOFT-LOCKUP" in engine_rules
+        assert "RULE-KERNEL-HARD-LOCKUP" in engine_rules
+        assert "RULE-KERNEL-HUNG-TASK" in engine_rules
+        assert "RULE-KERNEL-RCU-STALL" in engine_rules
+
+    def test_stall_diagnostics_isolation_from_hardware_and_fs_diagnostics(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_stall_isolation")
+        stall_lines = "\n".join(
+            [
+                "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [kworker:1]",
+                "kernel: NMI watchdog: Watchdog detected hard LOCKUP on cpu 2",
+                "kernel: INFO: task mysqld:1234 blocked for more than 120 seconds.",
+                "kernel: INFO: rcu_sched detected stalls on CPUs/tasks:",
+            ]
+        )
+        panic_line = "kernel: Kernel panic - not syncing: Fatal exception"
+        thermal_line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        fs_line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        aer_line = "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+        nvme_line = "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"
+        mce_line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(
+            engine,
+            kernel_stall_reliability=self._cmd(stall_lines),
+            kernel_oops_panic=self._cmd(panic_line),
+            thermal_throttle=self._cmd(thermal_line),
+            fs_io=self._cmd(fs_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+            mce_edac=self._cmd(mce_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["KERNEL-SOFT-LOCKUP-001"].severity == "P1"
+        assert findings["KERNEL-HARD-LOCKUP-001"].severity == "P1"
+        assert findings["KERNEL-HUNG-TASK-001"].severity == "P2"
+        assert findings["KERNEL-RCU-STALL-001"].severity == "P1"
         assert findings["KERNEL-OOPS-PANIC-001"].severity == "P0"
         assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
         assert findings["FS-IO-ERROR-001"].severity == "P2"

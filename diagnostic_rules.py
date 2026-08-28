@@ -971,6 +971,268 @@ class KernelOopsPanicRule(DiagnosticRule):
         )
 
 
+class KernelSoftLockupRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-SOFT-LOCKUP"
+    supported_categories = frozenset({"kernel_soft_lockup"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("soft_lockup_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto zablokowanie programowe procesora (Kernel Soft Lockup)"
+        interpretation = (
+            "Dziennik jądra zarejestrował zdarzenie soft lockup watchdog w bieżącym rozruchu, "
+            "wskazujące na zablokowanie jądra w pętli bez oddania czasu procesora przez co najmniej 20 sekund. "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu, modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Przejrzyj ślad wywołań (call trace) powiązany ze zdarzeniem soft lockup w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 20 'soft lockup'`\n"
+            "Zidentyfikuj funkcje jądra lub procedury obsługi przerwań obecne na szczycie stosu wywołań."
+        )
+        remediation = (
+            "W razie powtarzających się zdarzeń zweryfikuj obciążenie systemu, "
+            "zaktualizuj jądro i oprogramowanie układowe (BIOS/UEFI) oraz sprawdź konfigurację parametrów watchdoga."
+        )
+        verification = (
+            "Sprawdź, czy w kolejnych rozruchach pojawiają się nowe zdarzenia soft lockup:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'soft lockup'`."
+        )
+        risk_level = "Wysokie (P1). Długotrwałe zablokowanie rdzenia procesora może prowadzić do niestabilności całego systemu lub degradacji czasu odpowiedzi."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P1",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class KernelHardLockupRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-HARD-LOCKUP"
+    supported_categories = frozenset({"kernel_hard_lockup"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("hard_lockup_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto zablokowanie sprzętowe procesora (Kernel Hard Lockup)"
+        interpretation = (
+            "Dziennik jądra zarejestrował zdarzenie hard lockup (watchdog / NMI) w bieżącym rozruchu, "
+            "oznaczające brak obsługi przerwań zegarowych przez procesor przez krytyczny czas. "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu, modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Przeanalizuj zrzut rejestrów i ślad wywołań z przerwania NMI w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 20 -iE 'hard lockup'`\n"
+            "Sprawdź stan magistral i podsystemu zasilania/chłodzenia procesora."
+        )
+        remediation = (
+            "W razie nawrotów zablokowań NMI zweryfikuj stabilność sprzętową procesora i płyty głównej, "
+            "zaktualizuj mikrokod procesora oraz oprogramowanie układowe BIOS/UEFI."
+        )
+        verification = (
+            "Monitoruj dziennik jądra w kolejnych sesjach pod kątem zdarzeń NMI watchdog:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'hard lockup'`."
+        )
+        risk_level = "Wysokie (P1). Zablokowanie obsługi przerwań przez procesor może uniemożliwić dalszą pracę jądra i wymaga natychmiastowej uwagi."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P1",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class KernelHungTaskRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-HUNG-TASK"
+    supported_categories = frozenset({"kernel_hung_task"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("hung_task_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto zablokowane zadanie jądra (Kernel Hung Task)"
+        interpretation = (
+            "Dziennik jądra zarejestrował proces lub wątek zablokowany w stanie nieprzerywalnym (D state) "
+            "przez ponad dopuszczalny próg czasu (zazwyczaj 120 sekund). "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu, modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Zidentyfikuj proces oraz funkcję, na której zablokowało się zadanie:\n"
+            "`journalctl -b -k --no-pager | grep -C 15 -iE 'blocked for more than'`\n"
+            "Sprawdź powiązane operacje wejścia/wyjścia (I/O) lub blokady synchronizacji."
+        )
+        remediation = (
+            "Zweryfikuj stan podsystemu pamięci masowej, zdalnych systemów plików (NFS/CIFS) "
+            "lub zasobów, na które oczekuje zablokowany proces. "
+            "Rozważ dostosowanie sysctl `vm.dirty_ratio` lub `kernel.hung_task_timeout_secs`."
+        )
+        verification = (
+            "Sprawdź, czy procesy wychodzą ze stanu D i czy nie pojawiają się nowe komunikaty o zawieszonych zadaniach:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'blocked for more than'`."
+        )
+        risk_level = "Średnie (P2). Zawieszenie pojedynczych zadań w stanie D powoduje degradację responsywności aplikacji i potencjalne narastanie kolejki wejścia/wyjścia."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class KernelRcuStallRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-RCU-STALL"
+    supported_categories = frozenset({"kernel_rcu_stall"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("rcu_stall_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto zablokowanie podsystemu RCU (Kernel RCU Stall)"
+        interpretation = (
+            "Dziennik jądra zarejestrował komunikat detektora RCU stall / starvation w bieżącym rozruchu, "
+            "co oznacza, że procesor lub zadanie nie przeszło przez stan spoczynku (quiescent state) "
+            "w wymaganym okresie łaski (grace period). "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu, modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Przeanalizuj szczegóły dotyczące zablokowanego okresu łaski RCU w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 20 -iE 'rcu.*(?:detected.*stall|starved)'`\n"
+            "Zwróć uwagę na maskę zablokowanych CPU i stan procedur obsługi wywołań zwrotnych (callbacks)."
+        )
+        remediation = (
+            "Zweryfikuj obciążenie wątków systemowych (kthreads) o wysokim priorytecie oraz procedur przerwaniowych (softirq). "
+            "W razie nawrotów sprawdź konfigurację `rcutree.kthread_prio` i zaktualizuj jądro."
+        )
+        verification = (
+            "Sprawdź obecność nowych komunikatów o zablokowaniach RCU w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'rcu.*(?:detected.*stall|starved)'`."
+        )
+        risk_level = "Wysokie (P1). Zablokowanie podsystemu RCU uniemożliwia zwalnianie struktur pamięci jądra i może prowadzić do wyczerpania pamięci lub załamania całego systemu."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P1",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1371,6 +1633,10 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         FilesystemIoErrorRule(eb),
         HardwareThermalThrottlingRule(eb),
         KernelOopsPanicRule(eb),
+        KernelSoftLockupRule(eb),
+        KernelHardLockupRule(eb),
+        KernelHungTaskRule(eb),
+        KernelRcuStallRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
