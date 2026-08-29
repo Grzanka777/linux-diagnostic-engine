@@ -23,6 +23,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_HARDWARE_THERMAL_THROTTLE,
     RE_KERNEL_HARD_LOCKUP,
     RE_KERNEL_HUNG_TASK,
+    RE_KERNEL_ERROR,
     RE_KERNEL_OOPS_BUG,
     RE_KERNEL_OOPS_PANIC,
     RE_KERNEL_PANIC,
@@ -57,6 +58,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _journal_filter_command,
     _kernel_oops_panic_severity,
     _oom_collector_command,
+    build_snapshot,
     _nvme_controller_reliability_severity,
     _pcie_aer_severity,
     _parse_storage_usage,
@@ -1372,7 +1374,7 @@ class TestConfidenceDerivation:
 
 
 class TestStorageStableIDs:
-    """T8-T10: Storage classification uses explicit fields, not ID prefix parsing."""
+    """Storage classification uses explicit fields, not ID prefix parsing."""
 
     def test_storage_observation_uses_stable_id(self):
         """Storage observation has stable ID, not dynamic prefix-based."""
@@ -1388,7 +1390,7 @@ class TestStorageStableIDs:
         assert obs.obs_id == "STORAGE-USAGE-WARNING"
         assert (
             obs.obs_id == "STORAGE-USAGE-WARNING"
-        )  # Stable - same for different mountpoints
+        )  # Historical root ID remains stable.
 
     def test_storage_details_explicit_fields(self):
         """Storage classification uses explicit fields, not parsed from ID."""
@@ -3047,7 +3049,7 @@ class TestBtrfsDeviceErrorRuleEvidence:
         assert result.finding.title == "Btrfs device stats wykazują błędy we/wy"
 
     def test_interpretation_preserved(self):
-        """Interpretation text is unchanged."""
+        """Interpretation stays descriptive when taint cause is unknown."""
         eb = EvidenceBuilder()
         rule = BtrfsDeviceErrorRule(eb)
         obs = Observation(obs_id="BTRFS-ERR-001", category="btrfs_error")
@@ -4544,7 +4546,8 @@ class TestKernelTaintRuleEvidence:
         obs = Observation(obs_id="KERNEL-TAINT-001", category="tainted")
         policy = FindingClassificationPolicy()
         result = rule.evaluate(obs, policy.classify(obs))
-        assert "moduł spoza drzewa jądra" in result.finding.interpretation
+        assert "przyczyna nie została ustalona" in result.finding.interpretation
+        assert "moduł spoza drzewa jądra" not in result.finding.interpretation
 
     def test_risk_level_preserved(self):
         """Risk level is unchanged."""
@@ -11100,3 +11103,375 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert findings["PCIE-AER-001"].severity == "P3"
         assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
         assert findings["HW-MCE-EDAC-001"].severity == "P1"
+
+
+class TestIteration44RIntegrityCompletenessRemediation:
+    """Direct regressions for Iteration 44R integrity and completeness fixes."""
+
+    @staticmethod
+    def _result(
+        stdout: str = "",
+        *,
+        command: str = "test-command",
+        stderr: str = "",
+        return_code: int = 0,
+        status: str = "ok",
+        collected_at: str = "",
+        truncated: bool = False,
+    ) -> CmdResult:
+        return CmdResult(
+            command=command,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            execution_status=status,
+            collected_at=collected_at,
+            truncated=truncated,
+        )
+
+    def _storage_results(self, **overrides) -> dict:
+        results = {
+            "lsblk": self._result(command="lsblk"),
+            "df_h": self._result(
+                "Filesystem Size Used Avail Use% Mounted on\n"
+                "/dev/root 100G 95G 5G 95% /\n"
+                "/dev/data 100G 96G 4G 96% /dev/data",
+                command="df -h",
+            ),
+            "df_i": self._result(command="df -i"),
+            "btrfs_show": self._result(command="btrfs filesystem show /"),
+            "btrfs_df": self._result(command="btrfs filesystem df /"),
+            "btrfs_stats": self._result(command="btrfs device stats /"),
+            "btrfs_scrub": self._result(command="btrfs scrub status /"),
+            "nvme_list": self._result(command="nvme list"),
+        }
+        results.update(overrides)
+        return results
+
+    def _kernel_results(self, **overrides) -> dict:
+        keys = (
+            "dmesg_restrict",
+            "kernel_errors",
+            "segfaults",
+            "firmware_msgs",
+            "oom_events",
+            "gpu_i915_hang",
+            "amdgpu_reset_fail",
+            "gpu_nvidia_xid_79",
+            "pcie_aer",
+            "nvme_controller_reliability",
+            "hardware_mce_edac",
+            "filesystem_io_error",
+            "hardware_thermal_throttling",
+            "kernel_oops_panic",
+            "kernel_stall_reliability",
+            "platform_device_reliability",
+            "platform_acpi_firmware_error",
+            "kernel_firmware_load_fail",
+            "usb_enumeration_fail",
+            "iommu_fault",
+            "lspci",
+            "lsusb",
+        )
+        results = {key: self._result(command=key) for key in keys}
+        results["dmesg_restrict"] = self._result("0", command="dmesg_restrict")
+        results.update(overrides)
+        return results
+
+    def test_i44_01_multiple_qualifying_mounts_have_deterministic_unique_ids(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_storage_ids")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(),
+        ):
+            engine.collect_storage()
+
+        raw_ids = [
+            raw.source_id
+            for raw in engine.raw_diagnostics
+            if raw.category == "storage_usage"
+        ]
+        assert raw_ids == [
+            "STORAGE-USAGE-CRITICAL",
+            "STORAGE-USAGE-CRITICAL-MOUNT-%2Fdev%2Fdata",
+        ]
+        engine._derive_observations()
+        engine._interpret()
+        assert len({obs.obs_id for obs in engine.observations}) == 2
+        assert len({finding.finding_id for finding in engine.findings}) == 2
+
+        second = SysCheckEngine(output_dir="/tmp/test_i44r_storage_ids_2")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(),
+        ):
+            second.collect_storage()
+        assert [
+            raw.source_id
+            for raw in second.raw_diagnostics
+            if raw.category == "storage_usage"
+        ] == raw_ids
+
+    def test_i44_02_truncated_current_boot_no_match_records_non_authoritative_limit(
+        self,
+    ):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_truncated_boot")
+        results = self._kernel_results(
+            oom_events=self._result(
+                "retained prefix without an OOM line",
+                command="journalctl -b -k | grep OOM",
+                truncated=True,
+            )
+        )
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+        assert not any(raw.category == "oom_event" for raw in engine.raw_diagnostics)
+        assert any(
+            "current-boot query oom_events" in restriction
+            and "not authoritative" in restriction
+            for restriction in engine.restrictions
+        )
+
+    @pytest.mark.parametrize(
+        ("category", "source_id", "payload"),
+        [
+            (
+                "btrfs_error",
+                "BTRFS-ERR-001",
+                {"device_error_counters": {"write_io_errs": 1}},
+            ),
+            (
+                "systemd_failed",
+                "SYSD-SYS-FAIL-001",
+                {"scope": "system", "units": ["broken.service"]},
+            ),
+            (
+                "boot_time",
+                "BOOT-SLOW-001",
+                {"userspace_time": 31.0, "threshold": 30.0},
+            ),
+            ("kernel_count", "KRNL-INFO-001", {"count": 4}),
+            (
+                "storage_usage",
+                "STORAGE-USAGE-WARNING-MOUNT-%2Fvar",
+                {
+                    "mountpoint": "/var",
+                    "usage_percent": 81,
+                    "threshold_state": "warning",
+                },
+            ),
+        ],
+    )
+    def test_i44_03_legacy_producers_propagate_truncation_to_evidence(
+        self, category, source_id, payload
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_legacy_completeness")
+        engine.raw_diagnostics.append(
+            RawDiagnostic(
+                source_id=source_id,
+                category=category,
+                payload={**payload, "capture_truncated": True},
+            )
+        )
+        engine._derive_observations()
+        engine._interpret()
+
+        assert engine.observations[0].data_complete is False
+        assert engine.evidence_objects[0].completeness.value == "partial"
+        assert engine.findings[0].confidence == "Guessing"
+
+    def test_i44_04_kernel_taint_scan_does_not_use_tail_and_keeps_older_match(self):
+        from shlex import quote
+        from unittest.mock import patch
+
+        older_taint = "kernel: Tainted: G W"
+        suffix = "\n".join(f"kernel: harmless line {n}" for n in range(50))
+        command = _oom_collector_command(
+            f"printf %s {quote(older_taint + chr(10) + suffix)}",
+            RE_KERNEL_ERROR,
+        )
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0
+        assert older_taint in result.stdout
+
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_taint")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(),
+        ) as parallel:
+            engine.collect_kernel_hw()
+        kernel_errors_command = parallel.call_args.args[0]["kernel_errors"][0]
+        assert "tail -50" not in " ".join(kernel_errors_command)
+
+    def test_i44_05_snapshot_persists_complete_finding_lineage_roundtrip(
+        self, tmp_path
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_lineage")
+        engine.hostname = "test-host"
+        engine.active_kernel = "test-kernel"
+        engine.distro_id = "arch"
+        engine.raw_diagnostics.append(
+            RawDiagnostic(
+                source_id="RAW-KERNEL-COUNT-001",
+                category="kernel_count",
+                payload={"count": 4},
+                collected_at="2026-08-29T12:00:00",
+                provenance={"command": "pacman -Q | grep kernel", "truncated": False},
+            )
+        )
+        engine._derive_observations()
+        engine._interpret()
+
+        snapshot = build_snapshot(engine)
+        payload = snapshot.to_dict()
+        assert payload["findings"][0]["evidence_ids"]
+        assert payload["evidence"][0]["source_observation_ids"]
+        assert payload["evidence"][0]["source_raw_ids"] == ["RAW-KERNEL-COUNT-001"]
+        assert payload["raw_diagnostics"][0]["source_id"] == "RAW-KERNEL-COUNT-001"
+
+        path = tmp_path / "snapshot.json"
+        snapshot.to_json(path)
+        loaded = SystemSnapshot.from_json(path)
+        assert loaded.findings[0].evidence_ids == tuple(
+            payload["findings"][0]["evidence_ids"]
+        )
+        assert loaded.evidence[0].source_observation_ids == ("KRNL-INFO-001",)
+        assert loaded.raw_diagnostics[0].source_id == "RAW-KERNEL-COUNT-001"
+
+    def test_i44_05_legacy_v3_snapshot_without_lineage_still_loads(self):
+        legacy = {
+            "schema_version": 3,
+            "metadata": {
+                "hostname": "legacy-host",
+                "kernel": "legacy-kernel",
+                "syscheck_version": "legacy",
+            },
+            "observations": [{"obs_id": "O1", "category": "test"}],
+            "findings": [
+                {"finding_id": "F1", "severity": "P2", "confidence": "Certain"}
+            ],
+            "execution": {},
+        }
+        loaded = SystemSnapshot._from_validated(legacy)
+        assert loaded.findings[0].evidence_ids == ()
+        assert loaded.evidence == ()
+        assert loaded.raw_diagnostics == ()
+
+    def test_i44_06_taint_finding_does_not_claim_unsupported_cause(self):
+        from syscheck import (
+            EvidenceBuilder,
+            FindingClassificationPolicy,
+            KernelTaintRule,
+        )
+
+        rule = KernelTaintRule(EvidenceBuilder())
+        policy = FindingClassificationPolicy()
+        for flags in ("G W", "O"):
+            result = rule.evaluate(
+                Observation(
+                    obs_id="KERNEL-TAINT-001",
+                    category="tainted",
+                    details={"tainted": True, "matched_lines": [f"Tainted: {flags}"]},
+                ),
+                policy.classify(
+                    Observation(obs_id="KERNEL-TAINT-001", category="tainted")
+                ),
+            )
+            text = f"{result.finding.interpretation} {result.finding.remediation}"
+            assert "przyczyna nie została ustalona" in text
+            assert "moduł spoza drzewa jądra" not in text
+            assert "otwarte sterowniki" not in text
+
+    def test_i44_07_btrfs_scrub_inactive_is_not_never_run(self):
+        from syscheck import (
+            BtrfsScrubStatusRule,
+            EvidenceBuilder,
+            FindingClassificationPolicy,
+        )
+
+        inactive = self._result("No scrub is running")
+        never_run = self._result("No scrub found on /")
+        assert _classify_btrfs_status(inactive) == "scrub_inactive"
+        assert _classify_btrfs_status(never_run) == "no_scrub"
+
+        rule = BtrfsScrubStatusRule(EvidenceBuilder())
+        observation = Observation(
+            obs_id="BTRFS-SCRUB-001",
+            category="btrfs_scrub",
+            details={"scrub_status": "scrub_inactive"},
+        )
+        result = rule.evaluate(
+            observation, FindingClassificationPolicy().classify(observation)
+        )
+        assert result.finding is None
+
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_scrub")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(btrfs_scrub=inactive),
+        ):
+            engine.collect_storage()
+        assert not any(raw.category == "btrfs_scrub" for raw in engine.raw_diagnostics)
+        assert any(
+            "nie jest obecnie uruchomiony" in line for line in engine.report_lines
+        )
+
+        engine2 = SysCheckEngine(output_dir="/tmp/test_i44r_scrub_history")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(btrfs_scrub=never_run),
+        ):
+            engine2.collect_storage()
+        scrub_raw = next(
+            raw for raw in engine2.raw_diagnostics if raw.category == "btrfs_scrub"
+        )
+        assert scrub_raw.payload["scrub_semantics"] == "never_run"
+
+    def test_i44_08_cmdresult_collection_metadata_survives_raw_snapshot_roundtrip(
+        self, tmp_path
+    ):
+        from unittest.mock import patch
+
+        stats = self._result(
+            "[/dev/sda].write_io_errs 1",
+            command="btrfs device stats /",
+            collected_at="2026-08-29T12:34:56",
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_i44r_provenance")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(btrfs_stats=stats),
+        ):
+            engine.collect_storage()
+        raw = next(
+            raw for raw in engine.raw_diagnostics if raw.category == "btrfs_error"
+        )
+        assert raw.collected_at == "2026-08-29T12:34:56"
+        assert raw.provenance["command"] == "btrfs device stats /"
+        assert raw.provenance["collected_at"] == "2026-08-29T12:34:56"
+
+        engine.hostname = "test-host"
+        engine.active_kernel = "test-kernel"
+        engine.distro_id = "arch"
+        engine._derive_observations()
+        engine._interpret()
+        path = tmp_path / "provenance-snapshot.json"
+        build_snapshot(engine).to_json(path)
+        loaded = SystemSnapshot.from_json(path)
+        assert loaded.raw_diagnostics[0].collected_at == "2026-08-29T12:34:56"
+        assert loaded.raw_diagnostics[0].provenance["command"] == (
+            "btrfs device stats /"
+        )

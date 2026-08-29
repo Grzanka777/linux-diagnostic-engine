@@ -123,6 +123,8 @@ class BtrfsScrubStatusRule(DiagnosticRule):
         self._evidence_builder = evidence_builder
 
     def evaluate(self, observation, classification):
+        if observation.details.get("scrub_status") == "scrub_inactive":
+            return DiagnosticRuleResult()
         conf = _syscheck().derive_confidence(
             direct_measurement=observation.direct_measurement,
             data_complete=observation.data_complete,
@@ -135,7 +137,7 @@ class BtrfsScrubStatusRule(DiagnosticRule):
         return DiagnosticRuleResult(
             finding=_syscheck().Finding(
                 finding_id=obs_id,
-                title="Btrfs scrub nigdy nie był wykonany",
+                title="Btrfs scrub nie ma zapisanej historii",
                 severity="P2",
                 confidence=conf,
                 evidence="Brak historii skrubowania.",
@@ -307,9 +309,16 @@ class KernelTaintRule(DiagnosticRule):
                 severity="P2",
                 confidence=conf,
                 evidence="Wykryto 'taint' w logach.",
-                interpretation="Załadowano moduł spoza drzewa jądra.",
+                interpretation=(
+                    "Wykryto znacznik taint w logach jądra; jego przyczyna "
+                    "nie została ustalona."
+                ),
                 recommended_diagnostics="`cat /proc/sys/kernel/tainted`",
-                remediation="Rozważ przejście na otwarte sterowniki.",
+                remediation=(
+                    "Zweryfikuj znaczenie znaczników taint oraz załadowane "
+                    "moduły i sterowniki; nie wnioskuj o przyczynie bez "
+                    "dodatkowych dowodów."
+                ),
                 verification="`cat /proc/sys/kernel/tainted` — 0",
                 risk_level="Niskie. Informacja, nie awaria.",
                 domain=classification.domain,
@@ -1768,7 +1777,7 @@ class StorageUsageRule(DiagnosticRule):
         pct = details.get("usage_percent", 0)
         if state == "critical":
             fid, title, sev, interp, risk = (
-                "STORAGE-USAGE-CRITICAL",
+                observation.obs_id,
                 f"Krytyczne użycie miejsca na {mp}: {pct}%",
                 "P1",
                 f"Przekroczono {pct}% — ryzyko braku miejsca.",
@@ -1776,7 +1785,7 @@ class StorageUsageRule(DiagnosticRule):
             )
         else:
             fid, title, sev, interp, risk = (
-                "STORAGE-USAGE-WARNING",
+                observation.obs_id,
                 f"Znaczące użycie miejsca na {mp}: {pct}%",
                 "P2",
                 f"Zalecane monitorowanie użycia {mp}.",

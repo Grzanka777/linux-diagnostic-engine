@@ -35,6 +35,7 @@ import datetime
 import re
 import sys
 import threading
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
@@ -265,13 +266,34 @@ class RawDiagnostic:
     """Surowy rekord diagnostyczny (Stage 1: RAW output).
 
     Produkowany przez collect_*(), konsumowany przez _derive_observations().
-    Nie zawiera interpretacji, severity, confidence, ani rekomendacji.
+    Nie zawiera interpretacji, severity, confidence, ani rekomendacji. Metadane
+    pochodzenia są przechowywane osobno od payloadu diagnostycznego.
     """
 
     source_id: str
     category: str
     payload: dict
     collected_at: str = ""
+    provenance: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "source_id": self.source_id,
+            "category": self.category,
+            "payload": dict(self.payload),
+            "collected_at": self.collected_at,
+            "provenance": dict(self.provenance),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RawDiagnostic":
+        return cls(
+            source_id=str(data.get("source_id", "")),
+            category=str(data.get("category", "")),
+            payload=dict(data.get("payload", {})),
+            collected_at=str(data.get("collected_at", "")),
+            provenance=dict(data.get("provenance", {})),
+        )
 
 
 # ── Confidence derivation ────────────────────────────────────────
@@ -440,6 +462,48 @@ def _capture_payload(result: CmdResult, payload: dict) -> dict:
     if result.truncated:
         payload["capture_truncated"] = True
     return payload
+
+
+def _cmd_result_provenance(result: CmdResult) -> dict:
+    """Return non-sensitive execution metadata for a raw diagnostic."""
+    return {
+        "command": result.command,
+        "return_code": result.return_code,
+        "execution_status": result.execution_status,
+        "privilege_required": result.privilege_required,
+        "optional_dependency": result.optional_dependency,
+        "truncated": result.truncated,
+        "collected_at": result.collected_at,
+    }
+
+
+def _raw_from_result(
+    result: CmdResult, *, source_id: str, category: str, payload: dict
+) -> RawDiagnostic:
+    """Build a RAW record without dropping command capture metadata."""
+    return RawDiagnostic(
+        source_id=source_id,
+        category=category,
+        payload=_capture_payload(result, payload),
+        collected_at=result.collected_at,
+        provenance=_cmd_result_provenance(result),
+    )
+
+
+def _storage_diagnostic_id(threshold_state: str, mountpoint: str) -> str:
+    """Return a deterministic, mount-specific storage diagnostic ID.
+
+    Keep the historical root IDs stable while encoding every other mountpoint
+    injectively so two qualifying mounts cannot share an Observation/Finding ID.
+    """
+    base = (
+        "STORAGE-USAGE-CRITICAL"
+        if threshold_state == "critical"
+        else "STORAGE-USAGE-WARNING"
+    )
+    if mountpoint == "/":
+        return base
+    return f"{base}-MOUNT-{quote(mountpoint, safe='')}"
 
 
 def _write_new_text(path: str | Path, text: str) -> None:
@@ -622,7 +686,12 @@ def _filter_invalid_temperatures(text: str) -> str:
 def _classify_btrfs_status(cmd_result: CmdResult) -> str:
     """
     Klasyfikuje wynik polecenia btrfs.
-    Zwraca: "ok", "no_scrub", "permission_denied", "command_not_found", "device_missing", "error"
+    Zwraca: "ok", "no_scrub", "scrub_inactive", "permission_denied",
+    "command_not_found", "device_missing", "error".
+
+    ``no_scrub`` means that the command reported no scrub history. A status
+    such as ``No scrub is running`` only means that a scrub is inactive; it
+    must not be interpreted as evidence that a scrub has never run.
     """
     if cmd_result.execution_status == "not_found":
         return "command_not_found"
@@ -641,9 +710,23 @@ def _classify_btrfs_status(cmd_result: CmdResult) -> str:
     ):
         return "permission_denied"
 
-    # Sprawdź status scrub (przy rc=0 też się pojawia)
-    if "no scrub" in stdout_lower or "no scrub" in stderr_lower:
+    # Distinguish no history from a currently inactive scrub.
+    if "no scrub data" in stdout_lower or "no scrub data" in stderr_lower:
         return "no_scrub"
+    if (
+        "no scrub found" in stdout_lower
+        or "no scrub found" in stderr_lower
+        or "no scrub has been run" in stdout_lower
+        or "no scrub has been run" in stderr_lower
+    ):
+        return "no_scrub"
+    if (
+        "no scrub is running" in stdout_lower
+        or "no scrub is running" in stderr_lower
+        or "scrub not running" in stdout_lower
+        or "scrub not running" in stderr_lower
+    ):
+        return "scrub_inactive"
 
     # Sprawdź missing device
     if "missing" in stdout_lower:
@@ -1190,7 +1273,11 @@ class EvidenceBuilder:
                 data={"scope": d.get("scope", ""), "units": list(d.get("units", []))},
                 strength=EvidenceStrength.STRONG,
                 directness=EvidenceDirectness.DIRECT,
-                completeness=EvidenceCompleteness.COMPLETE,
+                completeness=(
+                    EvidenceCompleteness.COMPLETE
+                    if observation.data_complete
+                    else EvidenceCompleteness.PARTIAL
+                ),
             )
         if cat == "storage_usage":
             return Evidence(
@@ -1205,7 +1292,11 @@ class EvidenceBuilder:
                 },
                 strength=EvidenceStrength.STRONG,
                 directness=EvidenceDirectness.DIRECT,
-                completeness=EvidenceCompleteness.COMPLETE,
+                completeness=(
+                    EvidenceCompleteness.COMPLETE
+                    if observation.data_complete
+                    else EvidenceCompleteness.PARTIAL
+                ),
             )
         if cat == "segfault":
             # Derive quality from observation flags
@@ -1282,7 +1373,11 @@ class EvidenceBuilder:
                 data={"count": d.get("count", 0)},
                 strength=EvidenceStrength.STRONG,
                 directness=EvidenceDirectness.DIRECT,
-                completeness=EvidenceCompleteness.COMPLETE,
+                completeness=(
+                    EvidenceCompleteness.COMPLETE
+                    if observation.data_complete
+                    else EvidenceCompleteness.PARTIAL
+                ),
             )
         if cat == "btrfs_scrub":
             return Evidence(
@@ -2126,6 +2221,19 @@ class SysCheckEngine:
             self.restrictions.append(f"Brak sudo: {cmd[0]}")
         return fallback if fallback else result.to_fallback_text()
 
+    def _record_truncated_capture(
+        self, result: Optional[CmdResult], source_name: str
+    ) -> None:
+        """Record that a bounded result cannot prove absence of a finding."""
+        if result is None or not result.truncated:
+            return
+        restriction = (
+            f"Capture truncated for {source_name}; absence of matching data "
+            "is not authoritative."
+        )
+        if restriction not in self.restrictions:
+            self.restrictions.append(restriction)
+
     # ── Równoległe wykonanie grupy komend ────────────────────────
     def _parallel(self, tasks: Dict[str, Tuple[List[str], int]]) -> Dict[str, str]:
         """
@@ -2415,6 +2523,9 @@ class SysCheckEngine:
         btrfs_stats = r["btrfs_stats"]
         btrfs_scrub = r["btrfs_scrub"]
 
+        for name, result in r.items():
+            self._record_truncated_capture(result, f"storage command {name}")
+
         # Sprawdź czy Btrfs wymaga roota
         for name, result in [
             ("show", btrfs_show),
@@ -2445,7 +2556,8 @@ class SysCheckEngine:
                             pass
             if has_errors:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        btrfs_stats,
                         source_id="BTRFS-ERR-001",
                         category="btrfs_error",
                         payload={
@@ -2453,20 +2565,34 @@ class SysCheckEngine:
                         },
                     )
                 )
-            if not has_errors:
+            if not has_errors and not btrfs_stats.truncated:
                 self.report_lines.append(
                     "✅ Liczniki błędów Btrfs: wszystkie zerowe.\n\n"
+                )
+            elif not has_errors:
+                self.report_lines.append(
+                    "⚠️ Liczniki błędów Btrfs są niepełne z powodu obcięcia capture; "
+                    "brak błędów nie jest rozstrzygający.\n\n"
                 )
 
         # Analiza Btrfs scrub status
         scrub_status = _classify_btrfs_status(btrfs_scrub)
         if scrub_status == "no_scrub":
             self.raw_diagnostics.append(
-                RawDiagnostic(
+                _raw_from_result(
+                    btrfs_scrub,
                     source_id="BTRFS-SCRUB-001",
                     category="btrfs_scrub",
-                    payload={"scrub_status": scrub_status},
+                    payload={
+                        "scrub_status": scrub_status,
+                        "scrub_semantics": "never_run",
+                    },
                 )
+            )
+        elif scrub_status == "scrub_inactive":
+            self.report_lines.append(
+                "ℹ️ Btrfs scrub nie jest obecnie uruchomiony; status nie oznacza "
+                "braku wcześniejszej historii scrubowania.\n\n"
             )
         elif scrub_status == "permission_denied":
             self.restrictions.append(
@@ -2481,8 +2607,9 @@ class SysCheckEngine:
                 if mount == "/" or mount.startswith("/dev/"):
                     if pct >= STORAGE_CRITICAL_PERCENT:
                         self.raw_diagnostics.append(
-                            RawDiagnostic(
-                                source_id="STORAGE-USAGE-CRITICAL",
+                            _raw_from_result(
+                                r["df_h"],
+                                source_id=_storage_diagnostic_id("critical", mount),
                                 category="storage_usage",
                                 payload={
                                     "mountpoint": mount,
@@ -2493,8 +2620,9 @@ class SysCheckEngine:
                         )
                     elif pct >= STORAGE_WARNING_PERCENT:
                         self.raw_diagnostics.append(
-                            RawDiagnostic(
-                                source_id="STORAGE-USAGE-WARNING",
+                            _raw_from_result(
+                                r["df_h"],
+                                source_id=_storage_diagnostic_id("warning", mount),
                                 category="storage_usage",
                                 payload={
                                     "mountpoint": mount,
@@ -2521,7 +2649,6 @@ class SysCheckEngine:
                 _oom_collector_command(
                     "journalctl -b -k --no-pager 2>/dev/null",
                     RE_KERNEL_ERROR,
-                    tail_lines=50,
                 ),
                 TIMEOUT_LONG,
                 False,
@@ -2537,7 +2664,6 @@ class SysCheckEngine:
                 _oom_collector_command(
                     "journalctl -b --no-pager 2>/dev/null",
                     RE_FIRMWARE,
-                    tail_lines=20,
                 ),
                 TIMEOUT_LONG,
                 False,
@@ -2643,6 +2769,10 @@ class SysCheckEngine:
         }
         r = self._parallel_cmd(tasks_cmd)
 
+        for name, result in r.items():
+            if name not in {"lspci", "lsusb"}:
+                self._record_truncated_capture(result, f"current-boot query {name}")
+
         dmesg_restrict_result = r["dmesg_restrict"]
         kernel_errors_result = r["kernel_errors"]
         segfaults_result = r["segfaults"]
@@ -2741,44 +2871,36 @@ class SysCheckEngine:
             if all_wireplumber and unique_segfault_count <= 10:
                 # Wireplumber/libcamera segfault
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        segfaults_result,
                         source_id="SEGFAULT-WP-001",
                         category="segfault",
-                        payload=_capture_payload(
-                            segfaults_result,
-                            {
-                                "segfault_type": "wireplumber",
-                                "count": unique_segfault_count,
-                            },
-                        ),
+                        payload={
+                            "segfault_type": "wireplumber",
+                            "count": unique_segfault_count,
+                        },
                     )
                 )
             else:
                 # Poważniejsze segfaulty — wiele procesów lub nieznana przyczyna
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        segfaults_result,
                         source_id="SEGFAULT-SYS-001",
                         category="segfault",
-                        payload=_capture_payload(
-                            segfaults_result,
-                            {
-                                "segfault_type": "system_wide",
-                                "count": unique_segfault_count,
-                            },
-                        ),
+                        payload={
+                            "segfault_type": "system_wide",
+                            "count": unique_segfault_count,
+                        },
                     )
                 )
         elif unique_segfault_count > 0:
             self.raw_diagnostics.append(
-                RawDiagnostic(
+                _raw_from_result(
+                    segfaults_result,
                     source_id="SEGFAULT-MIN-001",
                     category="segfault_minor",
-                    payload=_capture_payload(
-                        segfaults_result,
-                        {
-                            "count": unique_segfault_count,
-                        },
-                    ),
+                    payload={"count": unique_segfault_count},
                 )
             )
 
@@ -2788,10 +2910,18 @@ class SysCheckEngine:
             r"\bTainted:\s", kernel_errors_result.stdout, re.IGNORECASE
         ):
             self.raw_diagnostics.append(
-                RawDiagnostic(
+                _raw_from_result(
+                    kernel_errors_result,
                     source_id="KERNEL-TAINT-001",
                     category="tainted",
-                    payload=_capture_payload(kernel_errors_result, {"tainted": True}),
+                    payload={
+                        "tainted": True,
+                        "matched_lines": [
+                            line
+                            for line in kernel_errors_result.stdout.splitlines()
+                            if re.search(r"\bTainted:\s", line, re.IGNORECASE)
+                        ][:20],
+                    },
                 )
             )
 
@@ -2824,20 +2954,18 @@ class SysCheckEngine:
                         match_classes.append(cls)
 
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        oom_events_result,
                         source_id="KERNEL-OOM-001",
                         category="oom_event",
-                        payload=_capture_payload(
-                            oom_events_result,
-                            {
-                                "oom_detected": True,
-                                "matched_lines": oom_matching[:20],
-                                "match_count": len(oom_matching),
-                                "match_classes": match_classes,
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "oom_events",
-                            },
-                        ),
+                        payload={
+                            "oom_detected": True,
+                            "matched_lines": oom_matching[:20],
+                            "match_count": len(oom_matching),
+                            "match_classes": match_classes,
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "oom_events",
+                        },
                     )
                 )
 
@@ -2851,21 +2979,19 @@ class SysCheckEngine:
             ]
             if hang_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        gpu_i915_hang_result,
                         source_id="GPU-I915-HANG-001",
                         category="gpu_i915_hang",
-                        payload=_capture_payload(
-                            gpu_i915_hang_result,
-                            {
-                                "hang_detected": True,
-                                "matched_lines": hang_matching[:20],
-                                "match_count": len(hang_matching),
-                                "driver": "i915",
-                                "driver_attribution_source": "in_message",
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "gpu_i915_hang",
-                            },
-                        ),
+                        payload={
+                            "hang_detected": True,
+                            "matched_lines": hang_matching[:20],
+                            "match_count": len(hang_matching),
+                            "driver": "i915",
+                            "driver_attribution_source": "in_message",
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "gpu_i915_hang",
+                        },
                     )
                 )
 
@@ -2879,21 +3005,19 @@ class SysCheckEngine:
             ]
             if reset_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        amdgpu_reset_fail_result,
                         source_id="AMDGPU-RESET-FAIL-001",
                         category="amdgpu_reset_fail",
-                        payload=_capture_payload(
-                            amdgpu_reset_fail_result,
-                            {
-                                "reset_failure_detected": True,
-                                "matched_lines": reset_matching[:20],
-                                "match_count": len(reset_matching),
-                                "driver": "amdgpu",
-                                "driver_attribution_source": "in_message",
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "amdgpu_reset_fail",
-                            },
-                        ),
+                        payload={
+                            "reset_failure_detected": True,
+                            "matched_lines": reset_matching[:20],
+                            "match_count": len(reset_matching),
+                            "driver": "amdgpu",
+                            "driver_attribution_source": "in_message",
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "amdgpu_reset_fail",
+                        },
                     )
                 )
 
@@ -2907,22 +3031,20 @@ class SysCheckEngine:
             ]
             if xid79_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        gpu_nvidia_xid_79_result,
                         source_id="GPU-NVIDIA-XID-79-001",
                         category="gpu_nvidia_xid_79",
-                        payload=_capture_payload(
-                            gpu_nvidia_xid_79_result,
-                            {
-                                "xid_detected": True,
-                                "xid_code": 79,
-                                "matched_lines": xid79_matching[:20],
-                                "match_count": len(xid79_matching),
-                                "driver": "nvidia",
-                                "driver_attribution_source": "in_message",
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "gpu_nvidia_xid_79",
-                            },
-                        ),
+                        payload={
+                            "xid_detected": True,
+                            "xid_code": 79,
+                            "matched_lines": xid79_matching[:20],
+                            "match_count": len(xid79_matching),
+                            "driver": "nvidia",
+                            "driver_attribution_source": "in_message",
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "gpu_nvidia_xid_79",
+                        },
                     )
                 )
 
@@ -2948,20 +3070,18 @@ class SysCheckEngine:
                     key={"corrected": 1, "non_fatal": 2, "fatal": 3}.get,
                 )
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        pcie_aer_result,
                         source_id="PCIE-AER-001",
                         category="pcie_aer_error",
-                        payload=_capture_payload(
-                            pcie_aer_result,
-                            {
-                                "aer_detected": True,
-                                "aer_severity": aer_severity,
-                                "matched_lines": aer_matching[:20],
-                                "match_count": len(aer_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "pcie_aer",
-                            },
-                        ),
+                        payload={
+                            "aer_detected": True,
+                            "aer_severity": aer_severity,
+                            "matched_lines": aer_matching[:20],
+                            "match_count": len(aer_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "pcie_aer",
+                        },
                     )
                 )
 
@@ -2987,21 +3107,19 @@ class SysCheckEngine:
                     key={"timeout_or_reset": 1, "reset_failure": 2}.get,
                 )
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        nvme_controller_reliability_result,
                         source_id="NVME-CONTROLLER-RESET-001",
                         category="nvme_controller_reliability",
-                        payload=_capture_payload(
-                            nvme_controller_reliability_result,
-                            {
-                                "nvme_detected": True,
-                                "event_severity": event_severity,
-                                "matched_lines": nvme_matching[:20],
-                                "match_count": len(nvme_matching),
-                                "event_classes": list(dict.fromkeys(severities)),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "nvme_controller_reliability",
-                            },
-                        ),
+                        payload={
+                            "nvme_detected": True,
+                            "event_severity": event_severity,
+                            "matched_lines": nvme_matching[:20],
+                            "match_count": len(nvme_matching),
+                            "event_classes": list(dict.fromkeys(severities)),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "nvme_controller_reliability",
+                        },
                     )
                 )
 
@@ -3027,21 +3145,19 @@ class SysCheckEngine:
                     key={"corrected": 1, "uncorrected": 2}.get,
                 )
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        hardware_mce_edac_result,
                         source_id="HW-MCE-EDAC-001",
                         category="hardware_mce_edac_error",
-                        payload=_capture_payload(
-                            hardware_mce_edac_result,
-                            {
-                                "mce_edac_detected": True,
-                                "event_severity": event_severity,
-                                "matched_lines": mce_edac_matching[:20],
-                                "match_count": len(mce_edac_matching),
-                                "event_classes": list(dict.fromkeys(severities)),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "hardware_mce_edac",
-                            },
-                        ),
+                        payload={
+                            "mce_edac_detected": True,
+                            "event_severity": event_severity,
+                            "matched_lines": mce_edac_matching[:20],
+                            "match_count": len(mce_edac_matching),
+                            "event_classes": list(dict.fromkeys(severities)),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "hardware_mce_edac",
+                        },
                     )
                 )
 
@@ -3067,21 +3183,19 @@ class SysCheckEngine:
                     key={"io_error": 1, "critical_or_fatal": 2}.get,
                 )
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        filesystem_io_error_result,
                         source_id="FS-IO-ERROR-001",
                         category="filesystem_io_error",
-                        payload=_capture_payload(
-                            filesystem_io_error_result,
-                            {
-                                "fs_io_detected": True,
-                                "event_severity": event_severity,
-                                "matched_lines": fs_io_matching[:20],
-                                "match_count": len(fs_io_matching),
-                                "event_classes": list(dict.fromkeys(severities)),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "filesystem_io_error",
-                            },
-                        ),
+                        payload={
+                            "fs_io_detected": True,
+                            "event_severity": event_severity,
+                            "matched_lines": fs_io_matching[:20],
+                            "match_count": len(fs_io_matching),
+                            "event_classes": list(dict.fromkeys(severities)),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "filesystem_io_error",
+                        },
                     )
                 )
 
@@ -3098,19 +3212,17 @@ class SysCheckEngine:
             ]
             if throttle_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        hardware_thermal_throttling_result,
                         source_id="HW-THERMAL-THROTTLE-001",
                         category="hardware_thermal_throttling",
-                        payload=_capture_payload(
-                            hardware_thermal_throttling_result,
-                            {
-                                "thermal_throttle_detected": True,
-                                "matched_lines": throttle_matching[:20],
-                                "match_count": len(throttle_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "hardware_thermal_throttling",
-                            },
-                        ),
+                        payload={
+                            "thermal_throttle_detected": True,
+                            "matched_lines": throttle_matching[:20],
+                            "match_count": len(throttle_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "hardware_thermal_throttling",
+                        },
                     )
                 )
 
@@ -3132,21 +3244,19 @@ class SysCheckEngine:
                 has_panic = any(s == "P0" for s in severities)
                 highest_severity = "P0" if has_panic else "P1"
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        kernel_oops_panic_result,
                         source_id="KERNEL-OOPS-PANIC-001",
                         category="kernel_oops_panic",
-                        payload=_capture_payload(
-                            kernel_oops_panic_result,
-                            {
-                                "oops_panic_detected": True,
-                                "panic_detected": has_panic,
-                                "highest_severity": highest_severity,
-                                "matched_lines": oops_panic_matching[:20],
-                                "match_count": len(oops_panic_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "kernel_oops_panic",
-                            },
-                        ),
+                        payload={
+                            "oops_panic_detected": True,
+                            "panic_detected": has_panic,
+                            "highest_severity": highest_severity,
+                            "matched_lines": oops_panic_matching[:20],
+                            "match_count": len(oops_panic_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "kernel_oops_panic",
+                        },
                     )
                 )
 
@@ -3163,19 +3273,17 @@ class SysCheckEngine:
             ]
             if soft_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        soft_lockup_result,
                         source_id="KERNEL-SOFT-LOCKUP-001",
                         category="kernel_soft_lockup",
-                        payload=_capture_payload(
-                            soft_lockup_result,
-                            {
-                                "soft_lockup_detected": True,
-                                "matched_lines": soft_matching[:20],
-                                "match_count": len(soft_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "kernel_stall_reliability",
-                            },
-                        ),
+                        payload={
+                            "soft_lockup_detected": True,
+                            "matched_lines": soft_matching[:20],
+                            "match_count": len(soft_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "kernel_stall_reliability",
+                        },
                     )
                 )
 
@@ -3192,19 +3300,17 @@ class SysCheckEngine:
             ]
             if hard_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        hard_lockup_result,
                         source_id="KERNEL-HARD-LOCKUP-001",
                         category="kernel_hard_lockup",
-                        payload=_capture_payload(
-                            hard_lockup_result,
-                            {
-                                "hard_lockup_detected": True,
-                                "matched_lines": hard_matching[:20],
-                                "match_count": len(hard_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "kernel_stall_reliability",
-                            },
-                        ),
+                        payload={
+                            "hard_lockup_detected": True,
+                            "matched_lines": hard_matching[:20],
+                            "match_count": len(hard_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "kernel_stall_reliability",
+                        },
                     )
                 )
 
@@ -3221,19 +3327,17 @@ class SysCheckEngine:
             ]
             if hung_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        hung_task_result,
                         source_id="KERNEL-HUNG-TASK-001",
                         category="kernel_hung_task",
-                        payload=_capture_payload(
-                            hung_task_result,
-                            {
-                                "hung_task_detected": True,
-                                "matched_lines": hung_matching[:20],
-                                "match_count": len(hung_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "kernel_stall_reliability",
-                            },
-                        ),
+                        payload={
+                            "hung_task_detected": True,
+                            "matched_lines": hung_matching[:20],
+                            "match_count": len(hung_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "kernel_stall_reliability",
+                        },
                     )
                 )
 
@@ -3250,19 +3354,17 @@ class SysCheckEngine:
             ]
             if rcu_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        rcu_stall_result,
                         source_id="KERNEL-RCU-STALL-001",
                         category="kernel_rcu_stall",
-                        payload=_capture_payload(
-                            rcu_stall_result,
-                            {
-                                "rcu_stall_detected": True,
-                                "matched_lines": rcu_matching[:20],
-                                "match_count": len(rcu_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "kernel_stall_reliability",
-                            },
-                        ),
+                        payload={
+                            "rcu_stall_detected": True,
+                            "matched_lines": rcu_matching[:20],
+                            "match_count": len(rcu_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "kernel_stall_reliability",
+                        },
                     )
                 )
 
@@ -3279,19 +3381,17 @@ class SysCheckEngine:
             ]
             if acpi_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        acpi_firmware_result,
                         source_id="PLATFORM-ACPI-FIRMWARE-ERROR-001",
                         category="platform_acpi_firmware_error",
-                        payload=_capture_payload(
-                            acpi_firmware_result,
-                            {
-                                "acpi_firmware_error_detected": True,
-                                "matched_lines": acpi_matching[:20],
-                                "match_count": len(acpi_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "platform_device_reliability",
-                            },
-                        ),
+                        payload={
+                            "acpi_firmware_error_detected": True,
+                            "matched_lines": acpi_matching[:20],
+                            "match_count": len(acpi_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "platform_device_reliability",
+                        },
                     )
                 )
 
@@ -3308,19 +3408,17 @@ class SysCheckEngine:
             ]
             if fw_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        firmware_load_result,
                         source_id="KERNEL-FIRMWARE-LOAD-FAIL-001",
                         category="kernel_firmware_load_fail",
-                        payload=_capture_payload(
-                            firmware_load_result,
-                            {
-                                "firmware_load_fail_detected": True,
-                                "matched_lines": fw_matching[:20],
-                                "match_count": len(fw_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "platform_device_reliability",
-                            },
-                        ),
+                        payload={
+                            "firmware_load_fail_detected": True,
+                            "matched_lines": fw_matching[:20],
+                            "match_count": len(fw_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "platform_device_reliability",
+                        },
                     )
                 )
 
@@ -3337,19 +3435,17 @@ class SysCheckEngine:
             ]
             if usb_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        usb_enum_result,
                         source_id="USB-ENUMERATION-FAIL-001",
                         category="usb_enumeration_fail",
-                        payload=_capture_payload(
-                            usb_enum_result,
-                            {
-                                "usb_enumeration_fail_detected": True,
-                                "matched_lines": usb_matching[:20],
-                                "match_count": len(usb_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "platform_device_reliability",
-                            },
-                        ),
+                        payload={
+                            "usb_enumeration_fail_detected": True,
+                            "matched_lines": usb_matching[:20],
+                            "match_count": len(usb_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "platform_device_reliability",
+                        },
                     )
                 )
 
@@ -3366,19 +3462,17 @@ class SysCheckEngine:
             ]
             if iommu_matching:
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        iommu_fault_result,
                         source_id="IOMMU-FAULT-001",
                         category="iommu_fault",
-                        payload=_capture_payload(
-                            iommu_fault_result,
-                            {
-                                "iommu_fault_detected": True,
-                                "matched_lines": iommu_matching[:20],
-                                "match_count": len(iommu_matching),
-                                "journal_scope": "current_boot_kernel",
-                                "source_query": "platform_device_reliability",
-                            },
-                        ),
+                        payload={
+                            "iommu_fault_detected": True,
+                            "matched_lines": iommu_matching[:20],
+                            "match_count": len(iommu_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "platform_device_reliability",
+                        },
                     )
                 )
 
@@ -3427,6 +3521,9 @@ class SysCheckEngine:
         }
         r = self._parallel_cmd(tasks_cmd)
 
+        for name, result in r.items():
+            self._record_truncated_capture(result, f"systemd command {name}")
+
         self.report_lines.append(heading(2, "5. Systemd i proces uruchamiania"))
         for title, key in [
             ("systemctl --failed (system)", "sys_failed"),
@@ -3450,7 +3547,8 @@ class SysCheckEngine:
         if sys_failed.is_ok() and self._has_failed_units(sys_failed.stdout):
             _sys_units = self._extract_failed_unit_names(sys_failed.stdout)
             self.raw_diagnostics.append(
-                RawDiagnostic(
+                _raw_from_result(
+                    sys_failed,
                     source_id="SYSD-SYS-FAIL-001",
                     category="systemd_failed",
                     payload={"scope": "system", "units": _sys_units},
@@ -3462,7 +3560,8 @@ class SysCheckEngine:
         if usr_failed.is_ok() and self._has_failed_units(usr_failed.stdout):
             _failed_units = self._extract_failed_unit_names(usr_failed.stdout)
             self.raw_diagnostics.append(
-                RawDiagnostic(
+                _raw_from_result(
+                    usr_failed,
                     source_id="SYSD-USR-FAIL-001",
                     category="systemd_failed",
                     payload={"scope": "user", "units": _failed_units},
@@ -3525,8 +3624,11 @@ class SysCheckEngine:
                 if fstrim_in_critical_chain is not None:
                     payload["fstrim_in_critical_chain"] = fstrim_in_critical_chain
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
-                        source_id="BOOT-SLOW-001", category="boot_time", payload=payload
+                    _raw_from_result(
+                        r["analyze"],
+                        source_id="BOOT-SLOW-001",
+                        category="boot_time",
+                        payload=payload,
                     )
                 )
 
@@ -3560,6 +3662,9 @@ class SysCheckEngine:
             "kernels": (cfg["pkg_query_kernels"], cfg["pkg_timeout"], False),
         }
         r = self._parallel_cmd(tasks_cmd)
+
+        for name, result in r.items():
+            self._record_truncated_capture(result, f"package command {name}")
 
         orphans_result = r["orphans"]
         foreign_result = r["foreign"]
@@ -3650,7 +3755,8 @@ class SysCheckEngine:
                 )
 
                 self.raw_diagnostics.append(
-                    RawDiagnostic(
+                    _raw_from_result(
+                        kernels_result,
                         source_id="KRNL-INFO-001",
                         category="kernel_count",
                         payload={"count": bootable_count},
@@ -3951,7 +4057,7 @@ class SysCheckEngine:
                 category="btrfs_error",
                 details={**payload, "error_type": "device_stats"},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -4024,7 +4130,7 @@ class SysCheckEngine:
                 category="systemd_failed",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -4036,7 +4142,7 @@ class SysCheckEngine:
                 category="kernel_count",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -4048,7 +4154,7 @@ class SysCheckEngine:
                 category="boot_time",
                 details={**payload},
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -4056,21 +4162,17 @@ class SysCheckEngine:
             )
         elif cat == "storage_usage":
             state = payload.get("threshold_state", "warning")
-            obs_id = (
-                "STORAGE-USAGE-CRITICAL"
-                if state == "critical"
-                else "STORAGE-USAGE-WARNING"
-            )
             return Observation(
-                obs_id=obs_id,
+                obs_id=src_id,
                 category="storage_usage",
                 details={
                     "mountpoint": payload.get("mountpoint", "/"),
                     "usage_percent": payload.get("usage_percent", 0),
                     "threshold_state": state,
+                    "capture_truncated": payload.get("capture_truncated", False),
                 },
                 direct_measurement=True,
-                data_complete=True,
+                data_complete=capture_complete,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
@@ -4873,6 +4975,81 @@ class ObservationSnapshot:
 
 
 @dataclass(frozen=True)
+class EvidenceSnapshot:
+    """Persisted Evidence with both upstream lineage reference sets."""
+
+    evidence_id: str = ""
+    evidence_type: str = ""
+    data: dict = field(default_factory=dict)
+    source_observation_ids: tuple = ()
+    source_raw_ids: tuple = ()
+    summary: str = ""
+    strength: str = ""
+    directness: str = ""
+    completeness: str = ""
+    contradictory: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "evidence_id": self.evidence_id,
+            "evidence_type": self.evidence_type,
+            "data": self.data,
+            "source_observation_ids": list(self.source_observation_ids),
+            "source_raw_ids": list(self.source_raw_ids),
+            "summary": self.summary,
+            "strength": self.strength,
+            "directness": self.directness,
+            "completeness": self.completeness,
+            "contradictory": self.contradictory,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EvidenceSnapshot":
+        return cls(
+            evidence_id=str(data.get("evidence_id", "")),
+            evidence_type=str(data.get("evidence_type", "")),
+            data=dict(data.get("data", {})),
+            source_observation_ids=tuple(data.get("source_observation_ids", [])),
+            source_raw_ids=tuple(data.get("source_raw_ids", [])),
+            summary=str(data.get("summary", "")),
+            strength=str(data.get("strength", "")),
+            directness=str(data.get("directness", "")),
+            completeness=str(data.get("completeness", "")),
+            contradictory=bool(data.get("contradictory", False)),
+        )
+
+
+@dataclass(frozen=True)
+class RawDiagnosticSnapshot:
+    """Persisted bounded command output and its non-sensitive provenance."""
+
+    source_id: str = ""
+    category: str = ""
+    payload: dict = field(default_factory=dict)
+    collected_at: str = ""
+    provenance: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "source_id": self.source_id,
+            "category": self.category,
+            "payload": self.payload,
+            "collected_at": self.collected_at,
+            "provenance": self.provenance,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RawDiagnosticSnapshot":
+        return cls(
+            source_id=str(data.get("source_id", "")),
+            category=str(data.get("category", "")),
+            payload=dict(data.get("payload", {})),
+            collected_at=str(data.get("collected_at", "")),
+            provenance=dict(data.get("provenance", {})),
+        )
+
+
+@dataclass(frozen=True)
 class FindingSnapshot:
     finding_id: str = ""
     title: str = ""
@@ -4889,6 +5066,7 @@ class FindingSnapshot:
     actionability: str = ""
     recommendation_intent: str = ""
     source_observation_ids: tuple = ()
+    evidence_ids: tuple = ()
 
     def to_dict(self) -> dict:
         return {
@@ -4907,6 +5085,7 @@ class FindingSnapshot:
             "actionability": self.actionability,
             "recommendation_intent": self.recommendation_intent,
             "source_observation_ids": list(self.source_observation_ids),
+            "evidence_ids": list(self.evidence_ids),
         }
 
     @classmethod
@@ -4927,6 +5106,7 @@ class FindingSnapshot:
             actionability=str(data.get("actionability", "")),
             recommendation_intent=str(data.get("recommendation_intent", "")),
             source_observation_ids=tuple(data.get("source_observation_ids", [])),
+            evidence_ids=tuple(data.get("evidence_ids", [])),
         )
 
 
@@ -4938,6 +5118,8 @@ class SystemSnapshot:
     metadata: SnapshotMetadata = field(default_factory=SnapshotMetadata)
     environment: EnvironmentSnapshot = field(default_factory=EnvironmentSnapshot)
     observations: tuple = ()
+    evidence: tuple = ()
+    raw_diagnostics: tuple = ()
     findings: tuple = ()
     recommendations: tuple = ()
     restrictions: tuple = ()
@@ -4950,6 +5132,8 @@ class SystemSnapshot:
             "metadata": self.metadata.to_dict(),
             "environment": self.environment.to_dict(),
             "observations": [o.to_dict() for o in self.observations],
+            "evidence": [e.to_dict() for e in self.evidence],
+            "raw_diagnostics": [r.to_dict() for r in self.raw_diagnostics],
             "findings": [f.to_dict() for f in self.findings],
             "recommendations": [r.to_dict() for r in self.recommendations],
             "restrictions": list(self.restrictions),
@@ -5000,6 +5184,18 @@ class SystemSnapshot:
             raise ValueError("observations must be a list")
         observations = tuple(ObservationSnapshot.from_dict(o) for o in obs_raw)
 
+        evidence_raw = data.get("evidence", [])
+        if not isinstance(evidence_raw, list):
+            raise ValueError("evidence must be a list")
+        evidence = tuple(EvidenceSnapshot.from_dict(e) for e in evidence_raw)
+
+        raw_diagnostics_raw = data.get("raw_diagnostics", [])
+        if not isinstance(raw_diagnostics_raw, list):
+            raise ValueError("raw_diagnostics must be a list")
+        raw_diagnostics = tuple(
+            RawDiagnosticSnapshot.from_dict(r) for r in raw_diagnostics_raw
+        )
+
         find_raw = data.get("findings", [])
         if not isinstance(find_raw, list):
             raise ValueError("findings must be a list")
@@ -5015,6 +5211,8 @@ class SystemSnapshot:
             metadata=metadata,
             environment=env,
             observations=observations,
+            evidence=evidence,
+            raw_diagnostics=raw_diagnostics,
             findings=findings,
             recommendations=recommendations,
             restrictions=restrictions,
@@ -5040,6 +5238,14 @@ class SystemSnapshot:
         if len(finding_ids) != len(set(finding_ids)):
             errors.append("Duplicate finding IDs detected")
 
+        evidence_ids = [e.evidence_id for e in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            errors.append("Duplicate evidence IDs detected")
+
+        raw_ids = [r.source_id for r in self.raw_diagnostics]
+        if len(raw_ids) != len(set(raw_ids)):
+            errors.append("Duplicate raw diagnostic IDs detected")
+
         for f in self.findings:
             if f.severity and f.severity not in VALID_SEVERITIES:
                 errors.append(
@@ -5049,6 +5255,51 @@ class SystemSnapshot:
                 errors.append(
                     f"Invalid confidence '{f.confidence}' in finding '{f.finding_id}'"
                 )
+
+        # Legacy v3 snapshots predate persisted lineage. Validate references
+        # whenever the new collections are present, while allowing those old
+        # snapshots to load unchanged.
+        if (
+            self.evidence
+            or self.raw_diagnostics
+            or any(f.evidence_ids for f in self.findings)
+        ):
+            observation_id_set = set(obs_ids)
+            evidence_id_set = set(evidence_ids)
+            raw_id_set = set(raw_ids)
+            for finding in self.findings:
+                for obs_id in finding.source_observation_ids:
+                    if obs_id not in observation_id_set:
+                        errors.append(
+                            f"Finding '{finding.finding_id}' references missing "
+                            f"observation '{obs_id}'"
+                        )
+                for evidence_id in finding.evidence_ids:
+                    if evidence_id not in evidence_id_set:
+                        errors.append(
+                            f"Finding '{finding.finding_id}' references missing "
+                            f"evidence '{evidence_id}'"
+                        )
+            for ev in self.evidence:
+                for obs_id in ev.source_observation_ids:
+                    if obs_id not in observation_id_set:
+                        errors.append(
+                            f"Evidence '{ev.evidence_id}' references missing "
+                            f"observation '{obs_id}'"
+                        )
+                for raw_id in ev.source_raw_ids:
+                    if raw_id not in raw_id_set:
+                        errors.append(
+                            f"Evidence '{ev.evidence_id}' references missing raw "
+                            f"diagnostic '{raw_id}'"
+                        )
+            for obs in self.observations:
+                for raw_id in obs.source_raw_ids:
+                    if raw_id not in raw_id_set:
+                        errors.append(
+                            f"Observation '{obs.obs_id}' references missing raw "
+                            f"diagnostic '{raw_id}'"
+                        )
 
         if self.metadata.hostname and not isinstance(self.metadata.hostname, str):
             errors.append("metadata.hostname must be string")
@@ -5072,10 +5323,16 @@ class SnapshotBuilder:
         environment: EnvironmentSnapshot,
         observations: list,
         findings: list,
-        recommendations: list = None,
-        restrictions: list = None,
-        execution: ExecutionSnapshot = None,
+        evidence: Optional[List[dict]] = None,
+        raw_diagnostics: Optional[List[dict]] = None,
+        recommendations: Optional[List[dict | DiagnosticRecommendation]] = None,
+        restrictions: Optional[List[str]] = None,
+        execution: Optional[ExecutionSnapshot] = None,
     ) -> SystemSnapshot:
+        if evidence is None:
+            evidence = []
+        if raw_diagnostics is None:
+            raw_diagnostics = []
         if recommendations is None:
             recommendations = []
         if restrictions is None:
@@ -5098,6 +5355,33 @@ class SnapshotBuilder:
             for o in observations
         )
 
+        evidence_snapshots = tuple(
+            EvidenceSnapshot(
+                evidence_id=str(e.get("evidence_id", "")),
+                evidence_type=str(e.get("evidence_type", "")),
+                data=e.get("data", {}),
+                source_observation_ids=tuple(e.get("source_observation_ids", [])),
+                source_raw_ids=tuple(e.get("source_raw_ids", [])),
+                summary=str(e.get("summary", "")),
+                strength=str(e.get("strength", "")),
+                directness=str(e.get("directness", "")),
+                completeness=str(e.get("completeness", "")),
+                contradictory=bool(e.get("contradictory", False)),
+            )
+            for e in evidence
+        )
+
+        raw_snapshots = tuple(
+            RawDiagnosticSnapshot(
+                source_id=str(r.get("source_id", "")),
+                category=str(r.get("category", "")),
+                payload=r.get("payload", {}),
+                collected_at=str(r.get("collected_at", "")),
+                provenance=r.get("provenance", {}),
+            )
+            for r in raw_diagnostics
+        )
+
         find_snapshots = tuple(
             FindingSnapshot(
                 finding_id=str(f.get("finding_id", "")),
@@ -5115,8 +5399,14 @@ class SnapshotBuilder:
                 actionability=str(f.get("actionability", "")),
                 recommendation_intent=str(f.get("recommendation_intent", "")),
                 source_observation_ids=tuple(f.get("source_observation_ids", [])),
+                evidence_ids=tuple(f.get("evidence_ids", [])),
             )
             for f in findings
+        )
+
+        recommendation_objects = tuple(
+            DiagnosticRecommendation.from_dict(r) if isinstance(r, dict) else r
+            for r in recommendations
         )
 
         return SystemSnapshot(
@@ -5124,8 +5414,10 @@ class SnapshotBuilder:
             metadata=metadata,
             environment=environment,
             observations=obs_snapshots,
+            evidence=evidence_snapshots,
+            raw_diagnostics=raw_snapshots,
             findings=find_snapshots,
-            recommendations=tuple(recommendations),
+            recommendations=recommendation_objects,
             restrictions=tuple(restrictions),
             execution=execution,
         )
@@ -5208,9 +5500,13 @@ def build_snapshot(engine: "SysCheckEngine") -> SystemSnapshot:
             if isinstance(f.recommendation_intent, RecommendationIntent)
             else str(f.recommendation_intent),
             "source_observation_ids": f.source_observation_ids,
+            "evidence_ids": f.evidence_ids,
         }
         for f in engine.findings
     ]
+
+    evidence_data = [e.to_dict() for e in engine.evidence_objects]
+    raw_diagnostics_data = [r.to_dict() for r in engine.raw_diagnostics]
 
     execution = ExecutionSnapshot(
         commands_count=len(engine.commands_used),
@@ -5228,6 +5524,8 @@ def build_snapshot(engine: "SysCheckEngine") -> SystemSnapshot:
         environment=environment,
         observations=observations_data,
         findings=findings_data,
+        evidence=evidence_data,
+        raw_diagnostics=raw_diagnostics_data,
         recommendations=recs_data,
         restrictions=list(engine.restrictions),
         execution=execution,
