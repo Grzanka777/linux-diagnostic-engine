@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linux-diagnostic-engine"
+version = "0.1.0"
+description = "Read-only Linux system diagnostics and snapshot comparison CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+lde = "syscheck:main"
+
+[tool.setuptools]
+py-modules = ["constants", "diagnostic_rules", "syscheck"]
