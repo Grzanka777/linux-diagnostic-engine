@@ -2061,7 +2061,7 @@ class TestSnapshotSerializationTyped:
     def test_typed_roundtrip(self, tmp_path):
         snap = SystemSnapshot(
             metadata=SnapshotMetadata(
-                hostname="test", kernel="6.18.40", syscheck_version="2.2.0"
+                hostname="test", kernel="6.18.40", syscheck_version="legacy"
             ),
             environment=EnvironmentSnapshot(
                 storage=({"mountpoint": "/", "usage_percent": 81},)

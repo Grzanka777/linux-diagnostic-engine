@@ -1,41 +1,43 @@
 """Focused packaging contract tests for the flat-module LDE distribution."""
 
 from pathlib import Path
-import tomllib
+import subprocess
+import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _project_metadata() -> dict:
-    with (PROJECT_ROOT / "pyproject.toml").open("rb") as manifest:
-        return tomllib.load(manifest)
+def _manifest_text() -> str:
+    return (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
 
 class TestPackagingContract:
     def test_manifest_declares_supported_project_and_empty_runtime_dependencies(self):
-        project = _project_metadata()["project"]
+        manifest = _manifest_text()
 
-        assert project["name"] == "linux-diagnostic-engine"
-        assert project["version"] == "0.1.0"
-        assert project["requires-python"] == ">=3.10"
-        assert project["dependencies"] == []
+        assert 'name = "linux-diagnostic-engine"' in manifest
+        assert 'version = "0.1.0"' in manifest
+        assert 'requires-python = ">=3.10"' in manifest
+        assert "dependencies = []" in manifest
+
+    def test_manifest_declares_mit_license_and_repository_contains_license(self):
+        manifest = _manifest_text()
+
+        assert 'license = "MIT"' in manifest
+        assert 'license-files = ["LICENSE"]' in manifest
+        assert (PROJECT_ROOT / "LICENSE").is_file()
 
     def test_manifest_uses_flat_modules_without_source_relocation(self):
-        setuptools = _project_metadata()["tool"]["setuptools"]
+        manifest = _manifest_text()
+        modules = ["constants", "diagnostic_rules", "syscheck"]
 
-        assert setuptools["py-modules"] == [
-            "constants",
-            "diagnostic_rules",
-            "syscheck",
-        ]
-        for module in setuptools["py-modules"]:
+        assert 'py-modules = ["constants", "diagnostic_rules", "syscheck"]' in manifest
+        for module in modules:
             assert (PROJECT_ROOT / f"{module}.py").is_file()
 
     def test_manifest_exposes_canonical_lde_console_script(self):
-        scripts = _project_metadata()["project"]["scripts"]
-
-        assert scripts == {"lde": "syscheck:main"}
+        assert 'lde = "syscheck:main"' in _manifest_text()
 
     def test_direct_execution_guard_remains_available(self):
         source = (PROJECT_ROOT / "syscheck.py").read_text(encoding="utf-8")
@@ -48,5 +50,29 @@ class TestPackagingContract:
 
         assert "uv build --wheel" in documentation
         assert "/linux_diagnostic_engine-0.1.0-py3-none-any.whl" in documentation
+        assert "/tmp/lde-venv/bin/lde --version" in documentation
         assert "/tmp/lde-venv/bin/lde --help" in documentation
         assert "python3 syscheck.py --help" in documentation
+
+    def test_public_cli_version_and_help_use_current_identity(self):
+        version = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "syscheck.py"), "--version"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        help_output = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "syscheck.py"), "--help"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert version.returncode == 0
+        assert version.stdout.strip() == "Linux Diagnostic Engine 0.1.0"
+        assert version.stderr == ""
+        assert help_output.returncode == 0
+        assert "Linux Diagnostic Engine (LDE)" in help_output.stdout
+        assert "syscheck —" not in help_output.stdout

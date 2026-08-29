@@ -23,10 +23,18 @@ uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_
 The installed command is `lde`:
 
 ```text
+/tmp/lde-venv/bin/lde --version
 /tmp/lde-venv/bin/lde --help
 /tmp/lde-venv/bin/lde run --help
 /tmp/lde-venv/bin/lde compare --help
 ```
+
+The public product version is `0.1.0`; `lde --version` prints
+`Linux Diagnostic Engine 0.1.0`. The legacy flat module remains named
+`syscheck.py`, and the package entry point remains `lde = syscheck:main` for
+compatibility. The schema-3 snapshot field `syscheck_version` and the related
+report metadata retain `2.1.0` only as explicitly labelled legacy
+report/snapshot compatibility metadata. It is not the product version.
 
 The package contains no network, database, service, or system-mutation
 installation step. The diagnostic run itself is read-only and writes only the
@@ -42,5 +50,4 @@ python3 syscheck.py run --output-dir /tmp/lde-reports --snapshot /tmp/lde-report
 python3 syscheck.py compare /tmp/lde-reports/first.json /tmp/lde-reports/second.json
 ```
 
-Installed package version: `0.1.0`. The diagnostic report's existing
-`SCRIPT_VERSION` metadata is kept separately for snapshot/report compatibility.
+The distribution is released under the MIT License; see [LICENSE](LICENSE).

@@ -1,12 +1,20 @@
 """
-Stałe konfiguracyjne dla syscheck.
+Stałe konfiguracyjne dla Linux Diagnostic Engine.
 Wydzielone dla czytelności i łatwej modyfikacji.
 """
 
 from pathlib import Path
 
-# ── Metadane skryptu ─────────────────────────────────────────────
-SCRIPT_VERSION = "2.1.0"
+# ── Metadane produktu i kompatybilności ──────────────────────────
+PRODUCT_NAME = "Linux Diagnostic Engine"
+PRODUCT_SHORT_NAME = "LDE"
+PRODUCT_VERSION = "0.1.0"
+
+# Legacy report/snapshot compatibility metadata; this is not the product
+# release version.  SCRIPT_VERSION remains as a compatibility alias for
+# existing imports and for the schema-3 ``syscheck_version`` field.
+REPORT_COMPATIBILITY_VERSION = "2.1.0"
+SCRIPT_VERSION = REPORT_COMPATIBILITY_VERSION
 MODEL_NAME = "<REDACTED-PROVIDER>"
 AGENT_NAME = "<REDACTED-ROLE>"
 

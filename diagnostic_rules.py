@@ -1545,7 +1545,7 @@ class GpuNvidiaXid79Rule(DiagnosticRule):
                     "celowe odłączenie eGPU, "
                     "niepełną reinicjalizację po zawieszeniu/resume, "
                     "lub interakcję sterownika z firmware/platformą. "
-                    "SysCheck nie rozróżnia tych przyczyn "
+                    "Linux Diagnostic Engine (LDE) nie rozróżnia tych przyczyn "
                     "na podstawie pojedynczej linii zdarzenia.\n\n"
                     "Uwaga: brak wykrytego zdarzenia nie dowodzi, "
                     "że nie wystąpiło — "

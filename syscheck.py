@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-syscheck — kompleksowa, tylko do odczytu diagnostyka systemu Linux.
+Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
+systemu Linux.
 
 Autor:      <REDACTED-ROLE>
 Model:      <REDACTED-PROVIDER>
 Licencja:   MIT
-Wersja:     2.2.0
+Wersja produktu:                         0.1.0
+Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
   Stage 1: RAW   — zbiór surowych wyników poleceń (CmdResult).
@@ -23,6 +25,7 @@ Zasady:
   - Wspiera Arch/CachyOS, Debian/Ubuntu, RHEL/Fedora (pakiety).
 
 Użycie:
+  lde [--version]
   python syscheck.py [--output-dir KATALOG] [--quiet] [--full]
 """
 
@@ -49,6 +52,10 @@ from constants import (  # type: ignore[import-untyped]
     MAX_RECOMMENDED_KERNELS,
     MODEL_NAME,
     OUTPUT_DIR_DEFAULT,
+    PRODUCT_NAME,
+    PRODUCT_SHORT_NAME,
+    PRODUCT_VERSION,
+    REPORT_COMPATIBILITY_VERSION,
     RE_AUTH_FAIL,
     RE_FIRMWARE,
     RE_GFX_ERROR,
@@ -76,7 +83,6 @@ from constants import (  # type: ignore[import-untyped]
     RE_OOM,
     RE_PCIE_AER,
     RE_SEGFAULT,
-    SCRIPT_VERSION,
     SEGFAULT_ALERT_THRESHOLD,
     TIMEOUT_LONG,
     TIMEOUT_MEDIUM,
@@ -2369,10 +2375,19 @@ class SysCheckEngine:
         wayland_disp = os.environ.get("WAYLAND_DISPLAY", "?")
         xdg_desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
 
-        self.report_lines.append(heading(1, "Raport diagnostyczny syscheck"))
+        self.report_lines.append(
+            heading(1, f"{PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) — Raport diagnostyczny")
+        )
+        self.report_lines.append(
+            f"**Produkt:** `{PRODUCT_NAME} ({PRODUCT_SHORT_NAME})`  \n"
+        )
+        self.report_lines.append(f"**Wersja produktu:** `{PRODUCT_VERSION}`  \n")
+        self.report_lines.append(
+            "**Kompatybilność raportów/snapshotów:** "
+            f"`{REPORT_COMPATIBILITY_VERSION}`  \n"
+        )
         self.report_lines.append(f"**Internal metadata:** `{AGENT_NAME}`  \n")
         self.report_lines.append(f"**Internal metadata:** `{MODEL_NAME}`  \n")
-        self.report_lines.append(f"**Wersja skryptu:** `{SCRIPT_VERSION}`  \n")
         self.report_lines.append(
             f"**Data rozpoczęcia (UTC):** {self.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}  \n"
         )
@@ -4428,7 +4443,7 @@ class SysCheckEngine:
 
         Żadna faza nie zależy od następnej. Interpretacja nie czyta RAW.
         """
-        self.log("syscheck v" + SCRIPT_VERSION + " — rozpoczynanie diagnostyki...\n")
+        self.log(f"{PRODUCT_NAME} {PRODUCT_VERSION} — rozpoczynanie diagnostyki...\n")
 
         # Stage 1: RAW data collection
         self.log("=== Stage 1: Zbieranie surowych danych (RAW) ===")
@@ -4456,13 +4471,14 @@ class SysCheckEngine:
         self.report_lines.append("\n---\n")
         self.report_lines.append(
             f"*Raport wygenerowany {self.start_time_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-            f"przez {AGENT_NAME} (skrypt v{SCRIPT_VERSION})*\n"
+            f"przez {AGENT_NAME}; wersja produktu {PRODUCT_VERSION}; "
+            f"kompatybilność raportów/snapshotów {REPORT_COMPATIBILITY_VERSION}*\n"
         )
 
         # Zapis
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = self.start_time_local.strftime("%Y%m%d-%H%M%S")
-        report_filename = f"syscheck-{self.hostname}-{timestamp}.md"
+        report_filename = f"lde-{self.hostname}-{timestamp}.md"
         report_path = self.output_dir / report_filename
 
         full_report = "".join(self.report_lines)
@@ -5438,7 +5454,8 @@ def build_snapshot(engine: "SysCheckEngine") -> SystemSnapshot:
         hostname=engine.hostname,
         kernel=engine.active_kernel,
         distro=engine.distro_id,
-        syscheck_version=SCRIPT_VERSION,
+        # Keep the legacy schema-3 key and value for snapshot compatibility.
+        syscheck_version=REPORT_COMPATIBILITY_VERSION,
         timestamp_utc=engine.start_time.isoformat(),
         timestamp_local=engine.start_time_local.isoformat(),
     )
@@ -5810,8 +5827,16 @@ def format_comparison_markdown(comp: SnapshotComparison) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="syscheck — tylko do odczytu diagnostyka systemu Linux",
+        description=(
+            f"{PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) — "
+            "tylko do odczytu diagnostyka systemu Linux"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{PRODUCT_NAME} {PRODUCT_VERSION}",
     )
     subparsers = parser.add_subparsers(dest="command", help="Komendy")
 
@@ -5887,11 +5912,11 @@ def main() -> None:
 
     if not getattr(cmd_args, "quiet", False):
         print("╔══════════════════════════════════════════════╗", file=sys.stderr)
-        print("║   syscheck — diagnostyka systemu Linux      ║", file=sys.stderr)
+        print("║   Linux Diagnostic Engine (LDE)             ║", file=sys.stderr)
         print("║   Tylko do odczytu | Bez sudo | Bez zmian   ║", file=sys.stderr)
         print("╚══════════════════════════════════════════════╝", file=sys.stderr)
         print(
-            f"  Agent: {AGENT_NAME}   Model: {MODEL_NAME}   v{SCRIPT_VERSION}",
+            f"  Produkt: {PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) {PRODUCT_VERSION}",
             file=sys.stderr,
         )
         print(
