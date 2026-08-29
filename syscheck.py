@@ -65,6 +65,11 @@ from constants import (  # type: ignore[import-untyped]
     RE_KERNEL_RCU_STALL,
     RE_KERNEL_SOFT_LOCKUP,
     RE_KERNEL_STALL_RELIABILITY,
+    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
+    RE_KERNEL_FIRMWARE_LOAD_FAIL,
+    RE_USB_ENUMERATION_FAIL,
+    RE_IOMMU_FAULT,
+    RE_PLATFORM_DEVICE_RELIABILITY,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
@@ -183,6 +188,10 @@ class FindingKind(str, Enum):
     KERNEL_HARD_LOCKUP = "kernel_hard_lockup"
     KERNEL_HUNG_TASK = "kernel_hung_task"
     KERNEL_RCU_STALL = "kernel_rcu_stall"
+    PLATFORM_ACPI_FIRMWARE_ERROR = "platform_acpi_firmware_error"
+    KERNEL_FIRMWARE_LOAD_FAIL = "kernel_firmware_load_fail"
+    USB_ENUMERATION_FAIL = "usb_enumeration_fail"
+    IOMMU_FAULT = "iommu_fault"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -1029,6 +1038,30 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
+        "platform_acpi_firmware_error": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.PLATFORM_ACPI_FIRMWARE_ERROR,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "kernel_firmware_load_fail": FindingClassification(
+            DiagnosticDomain.KERNEL,
+            FindingKind.KERNEL_FIRMWARE_LOAD_FAIL,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "usb_enumeration_fail": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.USB_ENUMERATION_FAIL,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "iommu_fault": FindingClassification(
+            DiagnosticDomain.HARDWARE,
+            FindingKind.IOMMU_FAULT,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
     }
 
     _SEGFAULT_WP = FindingClassification(
@@ -1849,6 +1882,132 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat == "platform_acpi_firmware_error":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Platform ACPI BIOS / interpreter error detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "acpi_firmware_error_detected": d.get(
+                        "acpi_firmware_error_detected", False
+                    ),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "platform_device_reliability"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "kernel_firmware_load_fail":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"Kernel firmware loader failure detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "firmware_load_fail_detected": d.get(
+                        "firmware_load_fail_detected", False
+                    ),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "platform_device_reliability"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "usb_enumeration_fail":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"USB descriptor / enumeration failure detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "usb_enumeration_fail_detected": d.get(
+                        "usb_enumeration_fail_detected", False
+                    ),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "platform_device_reliability"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
+        if cat == "iommu_fault":
+            strength = EvidenceStrength.STRONG
+            directness = EvidenceDirectness.DIRECT
+            completeness = EvidenceCompleteness.COMPLETE
+            if not observation.data_complete:
+                completeness = EvidenceCompleteness.PARTIAL
+
+            count = d.get("match_count", 0)
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    f"IOMMU DMA translation fault detected "
+                    f"during current boot ({count} matching journal line(s))"
+                ),
+                data={
+                    "iommu_fault_detected": d.get("iommu_fault_detected", False),
+                    "match_count": count,
+                    "matched_lines": d.get("matched_lines", []),
+                    "journal_scope": d.get("journal_scope", "current_boot_kernel"),
+                    "source_query": d.get(
+                        "source_query", "platform_device_reliability"
+                    ),
+                },
+                strength=strength,
+                directness=directness,
+                completeness=completeness,
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -1882,6 +2041,10 @@ KernelSoftLockupRule = _diagnostic_rules.KernelSoftLockupRule
 KernelHardLockupRule = _diagnostic_rules.KernelHardLockupRule
 KernelHungTaskRule = _diagnostic_rules.KernelHungTaskRule
 KernelRcuStallRule = _diagnostic_rules.KernelRcuStallRule
+PlatformAcpiFirmwareErrorRule = _diagnostic_rules.PlatformAcpiFirmwareErrorRule
+KernelFirmwareLoadFailRule = _diagnostic_rules.KernelFirmwareLoadFailRule
+UsbEnumerationFailRule = _diagnostic_rules.UsbEnumerationFailRule
+IommuFaultRule = _diagnostic_rules.IommuFaultRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2467,6 +2630,14 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
+            "platform_device_reliability": (
+                _oom_collector_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    RE_PLATFORM_DEVICE_RELIABILITY,
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
@@ -2495,6 +2666,17 @@ class SysCheckEngine:
         )
         hung_task_result = r.get("kernel_hung_task") or kernel_stall_reliability_result
         rcu_stall_result = r.get("kernel_rcu_stall") or kernel_stall_reliability_result
+        platform_device_reliability_result = r.get("platform_device_reliability")
+        acpi_firmware_result = (
+            r.get("platform_acpi_firmware_error") or platform_device_reliability_result
+        )
+        firmware_load_result = (
+            r.get("kernel_firmware_load_fail") or platform_device_reliability_result
+        )
+        usb_enum_result = (
+            r.get("usb_enumeration_fail") or platform_device_reliability_result
+        )
+        iommu_fault_result = r.get("iommu_fault") or platform_device_reliability_result
         lspci_result = r["lspci"]
         lsusb_result = r["lsusb"]
 
@@ -3079,6 +3261,122 @@ class SysCheckEngine:
                                 "match_count": len(rcu_matching),
                                 "journal_scope": "current_boot_kernel",
                                 "source_query": "kernel_stall_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy ACPI / BIOS (Platform ACPI Firmware Error) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            acpi_firmware_result
+            and acpi_firmware_result.is_ok()
+            and acpi_firmware_result.stdout.strip()
+        ):
+            acpi_matching = [
+                line
+                for line in acpi_firmware_result.stdout.split("\n")
+                if re.search(RE_PLATFORM_ACPI_FIRMWARE_ERROR, line, re.IGNORECASE)
+            ]
+            if acpi_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="PLATFORM-ACPI-FIRMWARE-ERROR-001",
+                        category="platform_acpi_firmware_error",
+                        payload=_capture_payload(
+                            acpi_firmware_result,
+                            {
+                                "acpi_firmware_error_detected": True,
+                                "matched_lines": acpi_matching[:20],
+                                "match_count": len(acpi_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "platform_device_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy ładowania oprogramowania układowego (Kernel Firmware Load Fail) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            firmware_load_result
+            and firmware_load_result.is_ok()
+            and firmware_load_result.stdout.strip()
+        ):
+            fw_matching = [
+                line
+                for line in firmware_load_result.stdout.split("\n")
+                if re.search(RE_KERNEL_FIRMWARE_LOAD_FAIL, line, re.IGNORECASE)
+            ]
+            if fw_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="KERNEL-FIRMWARE-LOAD-FAIL-001",
+                        category="kernel_firmware_load_fail",
+                        payload=_capture_payload(
+                            firmware_load_result,
+                            {
+                                "firmware_load_fail_detected": True,
+                                "matched_lines": fw_matching[:20],
+                                "match_count": len(fw_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "platform_device_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy enumeracji USB (USB Enumeration Fail) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            usb_enum_result
+            and usb_enum_result.is_ok()
+            and usb_enum_result.stdout.strip()
+        ):
+            usb_matching = [
+                line
+                for line in usb_enum_result.stdout.split("\n")
+                if re.search(RE_USB_ENUMERATION_FAIL, line, re.IGNORECASE)
+            ]
+            if usb_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="USB-ENUMERATION-FAIL-001",
+                        category="usb_enumeration_fail",
+                        payload=_capture_payload(
+                            usb_enum_result,
+                            {
+                                "usb_enumeration_fail_detected": True,
+                                "matched_lines": usb_matching[:20],
+                                "match_count": len(usb_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "platform_device_reliability",
+                            },
+                        ),
+                    )
+                )
+
+        # Sprawdź błędy translacji IOMMU (IOMMU Fault) — tylko jawne komunikaty z bieżącego bootu.
+        if (
+            iommu_fault_result
+            and iommu_fault_result.is_ok()
+            and iommu_fault_result.stdout.strip()
+        ):
+            iommu_matching = [
+                line
+                for line in iommu_fault_result.stdout.split("\n")
+                if re.search(RE_IOMMU_FAULT, line, re.IGNORECASE)
+            ]
+            if iommu_matching:
+                self.raw_diagnostics.append(
+                    RawDiagnostic(
+                        source_id="IOMMU-FAULT-001",
+                        category="iommu_fault",
+                        payload=_capture_payload(
+                            iommu_fault_result,
+                            {
+                                "iommu_fault_detected": True,
+                                "matched_lines": iommu_matching[:20],
+                                "match_count": len(iommu_matching),
+                                "journal_scope": "current_boot_kernel",
+                                "source_query": "platform_device_reliability",
                             },
                         ),
                     )
@@ -3938,6 +4236,54 @@ class SysCheckEngine:
             return Observation(
                 obs_id="KERNEL-RCU-STALL-001",
                 category="kernel_rcu_stall",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "platform_acpi_firmware_error":
+            return Observation(
+                obs_id="PLATFORM-ACPI-FIRMWARE-ERROR-001",
+                category="platform_acpi_firmware_error",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "kernel_firmware_load_fail":
+            return Observation(
+                obs_id="KERNEL-FIRMWARE-LOAD-FAIL-001",
+                category="kernel_firmware_load_fail",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "usb_enumeration_fail":
+            return Observation(
+                obs_id="USB-ENUMERATION-FAIL-001",
+                category="usb_enumeration_fail",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "iommu_fault":
+            return Observation(
+                obs_id="IOMMU-FAULT-001",
+                category="iommu_fault",
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,

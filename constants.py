@@ -113,6 +113,62 @@ RE_KERNEL_STALL_RELIABILITY = (
     r"\brcu(?:_[a-z_]+)?\s+(?:self-)?detected\s+(?:expedited\s+)?stalls?\b"
     r")"
 )
+RE_PLATFORM_ACPI_FIRMWARE_ERROR = (
+    r"(?:"
+    r"\bACPI\s+(?:BIOS\s+)?Error(?:\s*\([^)]+\))?:\s*\S+|"
+    r"\bACPI\s+(?:BIOS\s+)?Exception:\s*AE_\w+"
+    r")"
+)
+RE_KERNEL_FIRMWARE_LOAD_FAIL = (
+    r"(?:"
+    r"\bDirect firmware load for \S+ failed with error -?\d+\b|"
+    r"\bfirmware:\s+failed to load \S+ \(-?\d+\)|"
+    r"\b(?:failed|Failed) to load firmware ['\"]?\S+?['\"]?(?:\s|$)|"
+    r"\brequest_firmware(?:_direct|_into_buf)?(?:\s+for\s+\S+)?\s+failed(?::|\s+with\s+error)?\s+-?\d+\b|"
+    r"\brequest_firmware failed for \S+"
+    r")"
+)
+RE_USB_ENUMERATION_FAIL = (
+    r"(?:"
+    r"\bdevice descriptor read\/(?:64|8|all),\s+error\s+-?\d+\b|"
+    r"\bunable to enumerate USB device\b|"
+    r"\bdevice not accepting address\s+\d+,\s+error\s+-?\d+\b|"
+    r"\bcan't set address\s+\d+,\s+error\s+-?\d+\b|"
+    r"\bcan't read configurations,\s+error\s+-?\d+\b"
+    r")"
+)
+RE_IOMMU_FAULT = (
+    r"(?:"
+    r"\bAMD-Vi:\s+(?:Event logged\s+\[[A-Z_]+|Completion-Wait loop timed out)\b|"
+    r"\bDMAR:\s+\[DMA (?:Read|Write)[^\]]*\]\s+Request device\b|"
+    r"\bDMAR:\s+DRHD:\s+handling fault status\b|"
+    r"\bDMAR:\s+\[INTR-REMAP\]\s+Request device\b|"
+    r"\b(?:arm-smmu[0-9a-z.-]*:\s+)?Unhandled context fault\b|"
+    r"\bIOMMU:\s+(?:DMA\s+)?translation fault\b"
+    r")"
+)
+RE_PLATFORM_DEVICE_RELIABILITY = (
+    r"(?:"
+    r"\bACPI\s+(?:BIOS\s+)?Error(?:\s*\([^)]+\))?:\s*\S+|"
+    r"\bACPI\s+(?:BIOS\s+)?Exception:\s*AE_\w+|"
+    r"\bDirect firmware load for \S+ failed with error -?\d+\b|"
+    r"\bfirmware:\s+failed to load \S+ \(-?\d+\)|"
+    r"\b(?:failed|Failed) to load firmware ['\"]?\S+?['\"]?(?:\s|$)|"
+    r"\brequest_firmware(?:_direct|_into_buf)?(?:\s+for\s+\S+)?\s+failed(?::|\s+with\s+error)?\s+-?\d+\b|"
+    r"\brequest_firmware failed for \S+|"
+    r"\bdevice descriptor read\/(?:64|8|all),\s+error\s+-?\d+\b|"
+    r"\bunable to enumerate USB device\b|"
+    r"\bdevice not accepting address\s+\d+,\s+error\s+-?\d+\b|"
+    r"\bcan't set address\s+\d+,\s+error\s+-?\d+\b|"
+    r"\bcan't read configurations,\s+error\s+-?\d+\b|"
+    r"\bAMD-Vi:\s+(?:Event logged\s+\[[A-Z_]+|Completion-Wait loop timed out)\b|"
+    r"\bDMAR:\s+\[DMA (?:Read|Write)[^\]]*\]\s+Request device\b|"
+    r"\bDMAR:\s+DRHD:\s+handling fault status\b|"
+    r"\bDMAR:\s+\[INTR-REMAP\]\s+Request device\b|"
+    r"\b(?:arm-smmu[0-9a-z.-]*:\s+)?Unhandled context fault\b|"
+    r"\bIOMMU:\s+(?:DMA\s+)?translation fault\b"
+    r")"
+)
 
 
 # ── Maksymalna długość outputu w raporcie ────────────────────────

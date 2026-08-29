@@ -29,6 +29,11 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_KERNEL_RCU_STALL,
     RE_KERNEL_SOFT_LOCKUP,
     RE_KERNEL_STALL_RELIABILITY,
+    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
+    RE_KERNEL_FIRMWARE_LOAD_FAIL,
+    RE_USB_ENUMERATION_FAIL,
+    RE_IOMMU_FAULT,
+    RE_PLATFORM_DEVICE_RELIABILITY,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
@@ -124,6 +129,10 @@ class TestDiagnosticRuleImportBoundary:
             "KernelHardLockupRule",
             "KernelHungTaskRule",
             "KernelRcuStallRule",
+            "PlatformAcpiFirmwareErrorRule",
+            "KernelFirmwareLoadFailRule",
+            "UsbEnumerationFailRule",
+            "IommuFaultRule",
             "FailedSystemUnitRule",
             "FailedUserUnitRule",
             "KernelCountRule",
@@ -931,6 +940,10 @@ class TestCaptureCompleteness:
             ("kernel_hard_lockup", "KERNEL-HARD-LOCKUP-001"),
             ("kernel_hung_task", "KERNEL-HUNG-TASK-001"),
             ("kernel_rcu_stall", "KERNEL-RCU-STALL-001"),
+            ("platform_acpi_firmware_error", "PLATFORM-ACPI-FIRMWARE-ERROR-001"),
+            ("kernel_firmware_load_fail", "KERNEL-FIRMWARE-LOAD-FAIL-001"),
+            ("usb_enumeration_fail", "USB-ENUMERATION-FAIL-001"),
+            ("iommu_fault", "IOMMU-FAULT-001"),
         ],
     )
     def test_truncated_raw_capture_degrades_observation(self, category, source_id):
@@ -10646,6 +10659,441 @@ class TestKernelStallReliabilityPack:
         assert findings["KERNEL-HARD-LOCKUP-001"].severity == "P1"
         assert findings["KERNEL-HUNG-TASK-001"].severity == "P2"
         assert findings["KERNEL-RCU-STALL-001"].severity == "P1"
+        assert findings["KERNEL-OOPS-PANIC-001"].severity == "P0"
+        assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
+        assert findings["FS-IO-ERROR-001"].severity == "P2"
+        assert findings["PCIE-AER-001"].severity == "P3"
+        assert findings["NVME-CONTROLLER-RESET-001"].severity == "P2"
+        assert findings["HW-MCE-EDAC-001"].severity == "P1"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Test Platform, Firmware & Device Reliability Pack
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPlatformFirmwareDeviceReliabilityPack:
+    @staticmethod
+    def _cmd(
+        stdout: str = "",
+        stderr: str = "",
+        return_code: int = 0,
+        status: str = "ok",
+        truncated: bool = False,
+    ) -> CmdResult:
+        return CmdResult(
+            command="test",
+            return_code=return_code,
+            stdout=stdout,
+            stderr=stderr,
+            execution_status=status,
+            truncated=truncated,
+        )
+
+    def _collect(
+        self,
+        engine: SysCheckEngine,
+        platform_device_reliability: CmdResult,
+        kernel_stall_reliability: CmdResult | None = None,
+        kernel_oops_panic: CmdResult | None = None,
+        thermal_throttle: CmdResult | None = None,
+        aer: CmdResult | None = None,
+        nvme: CmdResult | None = None,
+        mce_edac: CmdResult | None = None,
+        fs_io: CmdResult | None = None,
+        platform_acpi_firmware_error: CmdResult | None = None,
+        kernel_firmware_load_fail: CmdResult | None = None,
+        usb_enumeration_fail: CmdResult | None = None,
+        iommu_fault: CmdResult | None = None,
+    ) -> None:
+        from unittest.mock import patch
+
+        results = {
+            "dmesg_restrict": self._cmd("0"),
+            "kernel_errors": self._cmd(),
+            "segfaults": self._cmd(),
+            "firmware_msgs": self._cmd(),
+            "oom_events": self._cmd(),
+            "gpu_i915_hang": self._cmd(),
+            "amdgpu_reset_fail": self._cmd(),
+            "gpu_nvidia_xid_79": self._cmd(),
+            "pcie_aer": aer or self._cmd(),
+            "nvme_controller_reliability": nvme or self._cmd(),
+            "hardware_mce_edac": mce_edac or self._cmd(),
+            "filesystem_io_error": fs_io or self._cmd(),
+            "hardware_thermal_throttling": thermal_throttle or self._cmd(),
+            "kernel_oops_panic": kernel_oops_panic or self._cmd(),
+            "kernel_stall_reliability": kernel_stall_reliability or self._cmd(),
+            "platform_device_reliability": platform_device_reliability,
+            "platform_acpi_firmware_error": platform_acpi_firmware_error,
+            "kernel_firmware_load_fail": kernel_firmware_load_fail,
+            "usb_enumeration_fail": usb_enumeration_fail,
+            "iommu_fault": iommu_fault,
+            "lspci": self._cmd(),
+            "lsusb": self._cmd(),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_kernel_hw()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)",
+            "kernel: ACPI BIOS Error (bug): Failure creating named object [_SB.PCI0.GPP0.PEGP], AE_ALREADY_EXISTS (20221020/dswload2-326)",
+            "kernel: ACPI Error: Aborting method \\_SB.PCI0.PEG0.PEGP._ON due to previous error (AE_NOT_FOUND) (20210105/psparse-529)",
+            "kernel: ACPI Exception: AE_NOT_FOUND, Evaluating _PRW (20221020/udev-212)",
+        ],
+    )
+    def test_explicit_platform_acpi_firmware_error_matches(self, line):
+        assert re.search(RE_PLATFORM_ACPI_FIRMWARE_ERROR, line, re.IGNORECASE)
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2",
+            "kernel: firmware: failed to load regulatory.db (-2)",
+            "kernel: radeon 0000:01:00.0: failed to load firmware radeon/R600_rlc.bin",
+            "kernel: i915 0000:00:02.0: [drm] Failed to load firmware 'i915/kbl_dmc_ver1_04.bin'",
+            "kernel: bluetooth hci0: request_firmware failed: -2",
+        ],
+    )
+    def test_explicit_kernel_firmware_load_fail_matches(self, line):
+        assert re.search(RE_KERNEL_FIRMWARE_LOAD_FAIL, line, re.IGNORECASE)
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: usb 1-1: device descriptor read/64, error -71",
+            "kernel: usb 1-1: device descriptor read/8, error -110",
+            "kernel: usb 1-1: device descriptor read/all, error -71",
+            "kernel: hub 1-0:1.0: unable to enumerate USB device on port 1",
+            "kernel: usb 1-2: device not accepting address 4, error -71",
+        ],
+    )
+    def test_explicit_usb_enumeration_fail_matches(self, line):
+        assert re.search(RE_USB_ENUMERATION_FAIL, line, re.IGNORECASE)
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]",
+            "kernel: AMD-Vi: Event logged [ILLEGAL_DEV_TABLE_ENTRY device=01:00.0 domain=0x0010]",
+            "kernel: AMD-Vi: Completion-Wait loop timed out",
+            "kernel: DMAR: [DMA Read NO_PASID] Request device [01:00.0] fault addr 0xdeadbeef [fault reason 0x06] PTE Read access is not set",
+            "kernel: DMAR: DRHD: handling fault status reg 2",
+        ],
+    )
+    def test_explicit_iommu_fault_matches(self, line):
+        assert re.search(RE_IOMMU_FAULT, line, re.IGNORECASE)
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "logger: generic acpi error encountered in config",
+            "systemd: acpi daemon started successfully",
+            "app: firmware version 2.1 validated",
+            "worker: direct firmware load simulation ok",
+            "logger: usb port 2 connected",
+            "systemd: usb guard service active",
+            "daemon: iommu translation enabled in bios",
+            "test: simulated fault in userspace application",
+        ],
+    )
+    def test_generic_and_userspace_messages_rejected(self, line):
+        assert re.search(RE_PLATFORM_ACPI_FIRMWARE_ERROR, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_FIRMWARE_LOAD_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_USB_ENUMERATION_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_IOMMU_FAULT, line, re.IGNORECASE) is None
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: ACPI: Core revision 20230628",
+            "kernel: ACPI: Interpreter enabled",
+            "kernel: firmware: direct-loading firmware intel-ucode/06-8e-09",
+            "kernel: usb 1-1: New USB device found, idVendor=046d, idProduct=c52b",
+            "kernel: DMAR: Host address width 39",
+            "kernel: AMD-Vi: Lazy IO/TLB flushing enabled",
+        ],
+    )
+    def test_normal_boot_and_info_messages_rejected(self, line):
+        assert re.search(RE_PLATFORM_ACPI_FIRMWARE_ERROR, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_FIRMWARE_LOAD_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_USB_ENUMERATION_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_IOMMU_FAULT, line, re.IGNORECASE) is None
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE) is None
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "kernel: Kernel panic - not syncing: Fatal exception",
+            "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s!",
+            "kernel: mce: [Hardware Error]: Machine Check Exception",
+            "kernel: CPU0: Core temperature above threshold, cpu clock throttled",
+            "kernel: Buffer I/O error on dev sda1",
+            "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting",
+        ],
+    )
+    def test_unrelated_diagnostics_rejected(self, line):
+        assert re.search(RE_PLATFORM_ACPI_FIRMWARE_ERROR, line, re.IGNORECASE) is None
+        assert re.search(RE_KERNEL_FIRMWARE_LOAD_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_USB_ENUMERATION_FAIL, line, re.IGNORECASE) is None
+        assert re.search(RE_IOMMU_FAULT, line, re.IGNORECASE) is None
+        assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE) is None
+
+    def test_collector_emits_acpi_firmware_p2(self):
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_acpi_firmware")
+        line = "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f
+            for f in engine.findings
+            if f.finding_id == "PLATFORM-ACPI-FIRMWARE-ERROR-001"
+        )
+        assert finding.severity == "P2"
+        assert finding.kind == FindingKind.PLATFORM_ACPI_FIRMWARE_ERROR
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert "ACPI" in finding.title
+
+    def test_collector_emits_firmware_load_fail_p2(self):
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_firmware_load_fail")
+        line = "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f
+            for f in engine.findings
+            if f.finding_id == "KERNEL-FIRMWARE-LOAD-FAIL-001"
+        )
+        assert finding.severity == "P2"
+        assert finding.kind == FindingKind.KERNEL_FIRMWARE_LOAD_FAIL
+        assert finding.domain == DiagnosticDomain.KERNEL
+        assert "oprogramowania układowego" in finding.title
+
+    def test_collector_emits_usb_enumeration_fail_p2(self):
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_usb_enum_fail")
+        line = "kernel: usb 1-1: device descriptor read/64, error -71"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "USB-ENUMERATION-FAIL-001"
+        )
+        assert finding.severity == "P2"
+        assert finding.kind == FindingKind.USB_ENUMERATION_FAIL
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert "USB" in finding.title
+
+    def test_collector_emits_iommu_fault_p1(self):
+        from syscheck import FindingKind, DiagnosticDomain
+
+        engine = SysCheckEngine(output_dir="/tmp/test_iommu_fault")
+        line = "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]"
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(f for f in engine.findings if f.finding_id == "IOMMU-FAULT-001")
+        assert finding.severity == "P1"
+        assert finding.kind == FindingKind.IOMMU_FAULT
+        assert finding.domain == DiagnosticDomain.HARDWARE
+        assert "IOMMU" in finding.title
+
+    def test_collector_coexistence_all_four_families_in_shared_capture(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_platform_device_coexistence")
+        lines = "\n".join(
+            [
+                "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)",
+                "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2",
+                "kernel: usb 1-1: device descriptor read/64, error -71",
+                "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]",
+            ]
+        )
+        self._collect(engine, self._cmd(lines))
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert "PLATFORM-ACPI-FIRMWARE-ERROR-001" in findings
+        assert "KERNEL-FIRMWARE-LOAD-FAIL-001" in findings
+        assert "USB-ENUMERATION-FAIL-001" in findings
+        assert "IOMMU-FAULT-001" in findings
+        assert findings["PLATFORM-ACPI-FIRMWARE-ERROR-001"].severity == "P2"
+        assert findings["KERNEL-FIRMWARE-LOAD-FAIL-001"].severity == "P2"
+        assert findings["USB-ENUMERATION-FAIL-001"].severity == "P2"
+        assert findings["IOMMU-FAULT-001"].severity == "P1"
+
+    @pytest.mark.parametrize(
+        ("status", "stdout", "ret_code"),
+        [
+            ("error", "", 1),
+            ("ok", "", 0),
+        ],
+    )
+    def test_failed_or_empty_journal_does_not_emit_diagnostics(
+        self, status, stdout, ret_code
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_platform_device_empty_or_fail")
+        self._collect(
+            engine,
+            self._cmd(stdout=stdout, status=status, return_code=ret_code),
+        )
+        assert not any(
+            r.source_id
+            in {
+                "PLATFORM-ACPI-FIRMWARE-ERROR-001",
+                "KERNEL-FIRMWARE-LOAD-FAIL-001",
+                "USB-ENUMERATION-FAIL-001",
+                "IOMMU-FAULT-001",
+            }
+            for r in engine.raw_diagnostics
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "cat",
+            "source_id",
+            "expected_severity",
+            "expected_kind",
+            "expected_domain",
+            "line",
+        ),
+        [
+            (
+                "platform_acpi_firmware_error",
+                "PLATFORM-ACPI-FIRMWARE-ERROR-001",
+                "P2",
+                "platform_acpi_firmware_error",
+                "hardware",
+                "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)",
+            ),
+            (
+                "kernel_firmware_load_fail",
+                "KERNEL-FIRMWARE-LOAD-FAIL-001",
+                "P2",
+                "kernel_firmware_load_fail",
+                "kernel",
+                "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2",
+            ),
+            (
+                "usb_enumeration_fail",
+                "USB-ENUMERATION-FAIL-001",
+                "P2",
+                "usb_enumeration_fail",
+                "hardware",
+                "kernel: usb 1-1: device descriptor read/64, error -71",
+            ),
+            (
+                "iommu_fault",
+                "IOMMU-FAULT-001",
+                "P1",
+                "iommu_fault",
+                "hardware",
+                "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]",
+            ),
+        ],
+    )
+    def test_observation_evidence_and_finding_contracts_all_four_families(
+        self, cat, source_id, expected_severity, expected_kind, expected_domain, line
+    ):
+        from syscheck import DiagnosticDomain, EvidenceType, FindingKind
+
+        engine = SysCheckEngine(output_dir=f"/tmp/test_contract_{cat}")
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        observation = next(o for o in engine.observations if o.obs_id == source_id)
+        finding = next(f for f in engine.findings if f.finding_id == source_id)
+        evidence = next(
+            e
+            for e in engine.evidence_objects
+            if e.evidence_id == f"EVIDENCE-{source_id}-001"
+        )
+        assert observation.category == cat
+        assert observation.direct_measurement is True
+        assert finding.kind == FindingKind(expected_kind)
+        assert finding.severity == expected_severity
+        assert finding.domain == DiagnosticDomain(expected_domain)
+        assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
+        assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert "nie przypisuje przyczyny źródłowej" in finding.interpretation
+
+    def test_rules_are_registered_and_reexported(self):
+        import diagnostic_rules
+        import syscheck
+
+        assert (
+            syscheck.PlatformAcpiFirmwareErrorRule
+            is diagnostic_rules.PlatformAcpiFirmwareErrorRule
+        )
+        assert (
+            syscheck.KernelFirmwareLoadFailRule
+            is diagnostic_rules.KernelFirmwareLoadFailRule
+        )
+        assert (
+            syscheck.UsbEnumerationFailRule is diagnostic_rules.UsbEnumerationFailRule
+        )
+        assert syscheck.IommuFaultRule is diagnostic_rules.IommuFaultRule
+
+        engine_rules = {
+            rule.rule_id: rule
+            for rule in syscheck.build_default_rule_engine()._registry.rules
+        }
+        assert "RULE-PLATFORM-ACPI-FIRMWARE-ERROR" in engine_rules
+        assert "RULE-KERNEL-FIRMWARE-LOAD-FAIL" in engine_rules
+        assert "RULE-USB-ENUMERATION-FAIL" in engine_rules
+        assert "RULE-IOMMU-FAULT" in engine_rules
+
+    def test_platform_device_diagnostics_isolation_from_stall_and_panic_and_hw(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_platform_device_isolation")
+        platform_device_lines = "\n".join(
+            [
+                "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)",
+                "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2",
+                "kernel: usb 1-1: device descriptor read/64, error -71",
+                "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]",
+            ]
+        )
+        stall_lines = (
+            "kernel: watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [kworker:1]"
+        )
+        panic_line = "kernel: Kernel panic - not syncing: Fatal exception"
+        thermal_line = "kernel: CPU0: Core temperature above threshold, cpu clock throttled (total events = 1)"
+        fs_line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        aer_line = "kernel: pcieport 0000:00:01.0: AER: Corrected error received"
+        nvme_line = "kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting"
+        mce_line = "kernel: mce: [Hardware Error]: Machine check events logged"
+        self._collect(
+            engine,
+            platform_device_reliability=self._cmd(platform_device_lines),
+            kernel_stall_reliability=self._cmd(stall_lines),
+            kernel_oops_panic=self._cmd(panic_line),
+            thermal_throttle=self._cmd(thermal_line),
+            fs_io=self._cmd(fs_line),
+            aer=self._cmd(aer_line),
+            nvme=self._cmd(nvme_line),
+            mce_edac=self._cmd(mce_line),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        findings = {f.finding_id: f for f in engine.findings}
+        assert findings["PLATFORM-ACPI-FIRMWARE-ERROR-001"].severity == "P2"
+        assert findings["KERNEL-FIRMWARE-LOAD-FAIL-001"].severity == "P2"
+        assert findings["USB-ENUMERATION-FAIL-001"].severity == "P2"
+        assert findings["IOMMU-FAULT-001"].severity == "P1"
+        assert findings["KERNEL-SOFT-LOCKUP-001"].severity == "P1"
         assert findings["KERNEL-OOPS-PANIC-001"].severity == "P0"
         assert findings["HW-THERMAL-THROTTLE-001"].severity == "P2"
         assert findings["FS-IO-ERROR-001"].severity == "P2"

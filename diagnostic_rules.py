@@ -1233,6 +1233,267 @@ class KernelRcuStallRule(DiagnosticRule):
         )
 
 
+class PlatformAcpiFirmwareErrorRule(DiagnosticRule):
+    rule_id = "RULE-PLATFORM-ACPI-FIRMWARE-ERROR"
+    supported_categories = frozenset({"platform_acpi_firmware_error"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("acpi_firmware_error_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto błędy oprogramowania układowego ACPI (Platform ACPI Firmware Error)"
+        interpretation = (
+            "Dziennik jądra zarejestrował jawne błędy interpretera ACPI lub tablic BIOS ACPI w bieżącym rozruchu. "
+            "Wskazuje to na niepoprawny kod AML, brakujące metody lub niekompatybilności w implementacji firmware płyty głównej. "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego modułu jądra ani oprogramowania."
+        )
+        recommended_diagnostics = (
+            "Przeanalizuj komunikaty o błędach ACPI w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 5 -iE 'ACPI (?:BIOS )?(?:Error|Exception)'`\n"
+            "Sprawdź dostępność aktualizacji oprogramowania układowego UEFI/BIOS u producenta płyty głównej."
+        )
+        remediation = (
+            "Zaktualizuj BIOS/UEFI do najnowszej stabilnej wersji oferowanej przez producenta płyty/laptopa. "
+            "W razie potrzeby zweryfikuj parametry rozruchu jądra związane z ACPI."
+        )
+        verification = (
+            "Sprawdź, czy po restarcie w dzienniku jądra nadal pojawiają się błędy ACPI:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'ACPI (?:BIOS )?(?:Error|Exception)'`."
+        )
+        risk_level = "Średnie (P2). Błędy interpretera ACPI mogą prowadzić do nieprawidłowego zarządzania zasilaniem, braku dostępu do czujników lub niepoprawnego usypiania/wybudzania systemu."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class KernelFirmwareLoadFailRule(DiagnosticRule):
+    rule_id = "RULE-KERNEL-FIRMWARE-LOAD-FAIL"
+    supported_categories = frozenset({"kernel_firmware_load_fail"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("firmware_load_fail_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto niepowodzenie ładowania oprogramowania układowego (Kernel Firmware Load Failure)"
+        interpretation = (
+            "Dziennik jądra zarejestrował niepowodzenie załadowania pliku firmware przez procedurę ładującą jądra (firmware loader) w bieżącym rozruchu. "
+            "Zdarzenie to zazwyczaj oznacza brak wymaganych plików mikrokodu/firmware dla urządzeń peryferyjnych (np. karty sieciowej, GPU, Bluetooth). "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego sprzętu ani sterownika."
+        )
+        recommended_diagnostics = (
+            "Zidentyfikuj brakujący plik oprogramowania układowego w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 5 -iE 'failed to load|Direct firmware load for|request_firmware'`\n"
+            "Sprawdź, czy plik istnieje w katalogu `/lib/firmware/` lub `/usr/lib/firmware/`."
+        )
+        remediation = (
+            "Zainstaluj lub zaktualizuj odpowiedni pakiet firmware (np. `linux-firmware`, `sof-firmware`, pakiety mikrokodu). "
+            "W przypadku urządzeń niestandardowych umieść wymagane pliki w `/lib/firmware/`."
+        )
+        verification = (
+            "Uruchom ponownie system lub przeładuj moduł i sprawdź obecność błędów ładowania firmware w dzienniku:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'failed to load|Direct firmware load for'`."
+        )
+        risk_level = "Średnie (P2). Brak oprogramowania układowego może uniemożliwić inicjalizację urządzenia peryferyjnego lub spowodować ograniczenie jego funkcjonalności."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class UsbEnumerationFailRule(DiagnosticRule):
+    rule_id = "RULE-USB-ENUMERATION-FAIL"
+    supported_categories = frozenset({"usb_enumeration_fail"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("usb_enumeration_fail_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto błąd enumeracji urządzeń USB (USB Enumeration Failure)"
+        interpretation = (
+            "Dziennik jądra zarejestrował niepowodzenie odczytu deskryptora, przydziału adresu lub enumeracji urządzenia USB w bieżącym rozruchu. "
+            "Zdarzenie to wskazuje na problem z komunikacją pomiędzy kontrolerem USB a dołączonym urządzeniem. "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego urządzenia, portu, kabla ani kontrolera."
+        )
+        recommended_diagnostics = (
+            "Przeanalizuj komunikaty podsystemu USB w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 5 -iE 'device descriptor read|unable to enumerate|device not accepting address'`\n"
+            "Zweryfikuj stan kontrolerów i urządzeń USB poleceniami `lsusb -v` oraz `dmesg -T | grep -i usb`."
+        )
+        remediation = (
+            "Sprawdź połączenie fizyczne, podłącz urządzenie do innego portu USB lub sprawdź stan zasilania koncentratora (hub). "
+            "W przypadku problemów z kontrolerem sprawdź aktualizacje oprogramowania układowego płyty głównej."
+        )
+        verification = (
+            "Sprawdź, czy po ponownym podłączeniu lub restarcie błąd enumeracji USB ustąpił:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'unable to enumerate|device not accepting address'`."
+        )
+        risk_level = "Średnie (P2). Błąd enumeracji USB uniemożliwia poprawne rozpoznanie i działanie danego urządzenia peryferyjnego."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P2",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
+class IommuFaultRule(DiagnosticRule):
+    rule_id = "RULE-IOMMU-FAULT"
+    supported_categories = frozenset({"iommu_fault"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("iommu_fault_detected"):
+            return DiagnosticRuleResult()
+
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence_items = (self._evidence_builder.build(observation),)
+        title = "Wykryto błąd translacji IOMMU / DMA (IOMMU Translation Fault)"
+        interpretation = (
+            "Dziennik jądra zarejestrował zdarzenie błędu translacji DMA (IOMMU / AMD-Vi / Intel DMAR / ARM SMMU) w bieżącym rozruchu. "
+            "Błąd ten oznacza, że urządzenie peryferyjne próbowało wykonać dostęp bezpośredni do pamięci (DMA) "
+            "pod adres nieobecny lub niezabezpieczony w tablicach stron jednostki IOMMU. "
+            "Diagnostyka rejestruje zdarzenie na podstawie dziennika jądra i nie przypisuje "
+            "przyczyny źródłowej (root-cause) do konkretnego urządzenia ani sterownika."
+        )
+        recommended_diagnostics = (
+            "Zidentyfikuj identyfikator urządzenia (BDF) i typ naruszenia translacji w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -C 10 -iE 'AMD-Vi.*Event logged|DMAR:.*Request device|Unhandled context fault'`\n"
+            "Sprawdź powiązane urządzenie w `lspci -nnk -s <bdf>`."
+        )
+        remediation = (
+            "Sprawdź stabilność sterownika urządzenia generującego błąd translacji DMA. "
+            "W razie problemów z kompatybilnością sprzętu/BIOS zweryfikuj opcje `iommu=pt` lub aktualizację BIOS/UEFI."
+        )
+        verification = (
+            "Sprawdź obecność nowych błędów IOMMU / DMAR w dzienniku jądra:\n"
+            "`journalctl -b -k --no-pager | grep -iE 'AMD-Vi.*Event logged|DMAR:.*Request device'`."
+        )
+        risk_level = "Wysokie (P1). Błąd ochrony translacji DMA IOMMU chroni pamięć przed korupcją, lecz może skutkować zawieszeniem urządzenia lub niestabilnością podsystemu wejścia/wyjścia."
+
+        return DiagnosticRuleResult(
+            finding=_syscheck().Finding(
+                finding_id=obs_id,
+                title=title,
+                severity="P1",
+                confidence=conf,
+                evidence=str(observation.details.get("matched_lines", [])),
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
+                domain=classification.domain,
+                kind=classification.kind,
+                actionability=classification.actionability,
+                recommendation_intent=classification.recommendation_intent,
+                source_observation_ids=(obs_id,),
+                evidence_ids=(evidence_items[0].evidence_id,),
+            ),
+            evidence=evidence_items,
+        )
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1637,6 +1898,10 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         KernelHardLockupRule(eb),
         KernelHungTaskRule(eb),
         KernelRcuStallRule(eb),
+        PlatformAcpiFirmwareErrorRule(eb),
+        KernelFirmwareLoadFailRule(eb),
+        UsbEnumerationFailRule(eb),
+        IommuFaultRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         KernelCountRule(eb),
