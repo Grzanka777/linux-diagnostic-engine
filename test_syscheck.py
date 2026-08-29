@@ -997,7 +997,7 @@ class TestExclusiveDestinationWrites:
         assert destination.read_text() == "keep"
 
     def test_compare_rejects_existing_output_without_overwrite(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, capsys
     ):
         import syscheck
 
@@ -1024,9 +1024,319 @@ class TestExclusiveDestinationWrites:
                 str(output),
             ],
         )
-        with pytest.raises(FileExistsError):
+        with pytest.raises(SystemExit) as exc_info:
             syscheck.main()
+        assert exc_info.value.code == 1
+        assert "Traceback" not in capsys.readouterr().err
         assert output.read_text() == "keep"
+
+
+class TestIteration46CliUxStabilization:
+    """CLI/output regressions for deterministic comparison and clean failures."""
+
+    @staticmethod
+    def _valid_snapshot():
+        return SystemSnapshot(
+            metadata=SnapshotMetadata(
+                hostname="host", kernel="kernel", syscheck_version="1"
+            )
+        )
+
+    @staticmethod
+    def _assert_clean_cli_failure(exc_info, captured, *, needle):
+        assert exc_info.value.code == 1
+        assert "Traceback" not in captured.err
+        assert needle in captured.err
+
+    def test_compare_rejects_output_symlink_without_touching_target(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        import syscheck
+
+        old_path = tmp_path / "old.json"
+        new_path = tmp_path / "new.json"
+        snapshot = self._valid_snapshot()
+        snapshot.to_json(old_path)
+        snapshot.to_json(new_path)
+        target = tmp_path / "target.md"
+        target.write_text("keep")
+        output = tmp_path / "comparison.md"
+        output.symlink_to(target)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "syscheck.py",
+                "compare",
+                str(old_path),
+                str(new_path),
+                "--output",
+                str(output),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        self._assert_clean_cli_failure(
+            exc_info, capsys.readouterr(), needle="is a symlink"
+        )
+        assert output.is_symlink()
+        assert os.readlink(output) == str(target)
+        assert target.read_text() == "keep"
+
+    @pytest.mark.parametrize("destination_kind", ["file", "symlink", "dangling"])
+    def test_run_report_collision_is_clean_and_non_destructive(
+        self, tmp_path, monkeypatch, capsys, destination_kind
+    ):
+        import syscheck
+
+        destination = tmp_path / "report.md"
+        target = tmp_path / "target.md"
+        if destination_kind == "file":
+            destination.write_text("keep")
+        else:
+            if destination_kind == "symlink":
+                target.write_text("keep")
+            destination.symlink_to(target)
+
+        class FakeEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.destination = os.path.join(output_dir, "report.md")
+
+            def run_all(self):
+                syscheck._write_new_text(self.destination, "replace")
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FakeEngine)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            ["syscheck.py", "run", "--output-dir", str(tmp_path), "--quiet"],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        self._assert_clean_cli_failure(
+            exc_info, capsys.readouterr(), needle="Destination"
+        )
+        if destination_kind == "file":
+            assert destination.read_text() == "keep"
+        else:
+            assert destination.is_symlink()
+            assert os.readlink(destination) == str(target)
+            if destination_kind == "symlink":
+                assert target.read_text() == "keep"
+
+    @pytest.mark.parametrize("destination_kind", ["file", "symlink", "dangling"])
+    def test_run_snapshot_collision_is_clean_and_non_destructive(
+        self, tmp_path, monkeypatch, capsys, destination_kind
+    ):
+        import syscheck
+
+        destination = tmp_path / "snapshot.json"
+        target = tmp_path / "target.json"
+        if destination_kind == "file":
+            destination.write_text("keep")
+        else:
+            if destination_kind == "symlink":
+                target.write_text("keep")
+            destination.symlink_to(target)
+
+        class FakeEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.report_path = os.path.join(output_dir, "report.md")
+
+            def run_all(self):
+                syscheck._write_new_text(self.report_path, "report")
+                return self.report_path
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FakeEngine)
+        monkeypatch.setattr(
+            syscheck,
+            "build_snapshot",
+            lambda _engine: self._valid_snapshot(),
+        )
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "syscheck.py",
+                "run",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "--snapshot",
+                str(destination),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        self._assert_clean_cli_failure(
+            exc_info, capsys.readouterr(), needle="Destination"
+        )
+        if destination_kind == "file":
+            assert destination.read_text() == "keep"
+        else:
+            assert destination.is_symlink()
+            assert os.readlink(destination) == str(target)
+            if destination_kind == "symlink":
+                assert target.read_text() == "keep"
+
+    @pytest.mark.parametrize(
+        ("source_kind", "needle"),
+        [
+            ("missing", "Snapshot input not found"),
+            ("malformed", "Invalid snapshot input"),
+            ("root", "Invalid snapshot input"),
+            ("schema", "Invalid snapshot input"),
+        ],
+    )
+    def test_compare_invalid_snapshot_input_is_clean_cli_error(
+        self, tmp_path, monkeypatch, capsys, source_kind, needle
+    ):
+        import json
+        import syscheck
+
+        invalid_path = tmp_path / "invalid.json"
+        if source_kind == "malformed":
+            invalid_path.write_text("{not-json\n")
+        elif source_kind == "root":
+            invalid_path.write_text("[]\n")
+        elif source_kind == "schema":
+            invalid_path.write_text(json.dumps({"schema_version": 999}))
+        valid_path = tmp_path / "valid.json"
+        self._valid_snapshot().to_json(valid_path)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "syscheck.py",
+                "compare",
+                str(invalid_path),
+                str(valid_path),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        self._assert_clean_cli_failure(exc_info, capsys.readouterr(), needle=needle)
+
+    def test_compare_environment_storage_order_is_stable(self):
+        old = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                storage=tuple(
+                    {"mountpoint": mountpoint, "usage_percent": percent}
+                    for mountpoint, percent in (("/z", 70), ("/a", 71), ("/m", 72))
+                )
+            ),
+        )
+        new = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                storage=tuple(
+                    {"mountpoint": mountpoint, "usage_percent": percent}
+                    for mountpoint, percent in (("/m", 73), ("/z", 74), ("/a", 75))
+                )
+            ),
+        )
+
+        storage = SnapshotComparator.compare(old, new).environment_changes["storage"]
+        assert list(storage) == ["/a", "/m", "/z"]
+
+    def test_compare_environment_failed_units_order_is_stable(self):
+        old = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                failed_units=(
+                    {"scope": "user", "units": ["z.service", "a.service"]},
+                    {"scope": "system", "units": ["m.service"]},
+                )
+            ),
+        )
+        new = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                failed_units=(
+                    {"scope": "system", "units": ["new.service", "m.service"]},
+                    {"scope": "user", "units": ["a.service", "z.service"]},
+                )
+            ),
+        )
+
+        failed_units = SnapshotComparator.compare(old, new).environment_changes[
+            "failed_units"
+        ]
+        assert failed_units["old"] == [["m.service"], ["a.service", "z.service"]]
+        assert failed_units["new"] == [
+            ["m.service", "new.service"],
+            ["a.service", "z.service"],
+        ]
+
+    def test_compare_markdown_is_stable_across_hash_seeds(self, tmp_path):
+        old = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                storage=tuple(
+                    {"mountpoint": mountpoint, "usage_percent": percent}
+                    for mountpoint, percent in (("/z", 70), ("/a", 71), ("/m", 72))
+                ),
+                failed_units=(
+                    {"scope": "user", "units": ["z.service", "a.service"]},
+                    {"scope": "system", "units": ["m.service"]},
+                ),
+            ),
+        )
+        new = SystemSnapshot(
+            metadata=SnapshotMetadata(hostname="h", kernel="k2", syscheck_version="1"),
+            environment=EnvironmentSnapshot(
+                storage=tuple(
+                    {"mountpoint": mountpoint, "usage_percent": percent}
+                    for mountpoint, percent in (("/m", 77), ("/z", 75), ("/a", 76))
+                ),
+                failed_units=(
+                    {"scope": "system", "units": ["new.service", "m.service"]},
+                    {"scope": "user", "units": ["a.service", "z.service"]},
+                ),
+            ),
+        )
+        old_path = tmp_path / "old.json"
+        new_path = tmp_path / "new.json"
+        old.to_json(old_path)
+        new.to_json(new_path)
+        child = (
+            "import sys\n"
+            "from syscheck import SystemSnapshot, SnapshotComparator, "
+            "format_comparison_markdown\n"
+            "old = SystemSnapshot.from_json(sys.argv[1])\n"
+            "new = SystemSnapshot.from_json(sys.argv[2])\n"
+            "print(format_comparison_markdown(SnapshotComparator.compare(old, new)), "
+            "end='')\n"
+        )
+        outputs = []
+        for seed in ("1", "2", "3"):
+            result = subprocess.run(
+                [sys.executable, "-c", child, str(old_path), str(new_path)],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONHASHSEED": seed,
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            outputs.append(result.stdout)
+
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert "{'/a':" in outputs[0]
+        assert "[['m.service'], ['a.service', 'z.service']]" in outputs[0]
 
 
 # ═══════════════════════════════════════════════════════════════════

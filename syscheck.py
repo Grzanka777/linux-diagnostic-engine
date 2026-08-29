@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, NoReturn, Optional, Tuple
 
 # ── Stałe ────────────────────────────────────────────────────────
 from constants import (  # type: ignore[import-untyped]
@@ -536,6 +536,12 @@ def _write_new_text(path: str | Path, text: str) -> None:
         raise
     finally:
         handle.close()
+
+
+def _cli_error(message: str) -> NoReturn:
+    """Render an expected command-line failure without a traceback."""
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def heading(level: int, title: str) -> str:
@@ -5155,6 +5161,9 @@ class SystemSnapshot:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
 
+        if not isinstance(data, dict):
+            raise ValueError("Snapshot root must be a JSON object")
+
         return cls._from_validated(data)
 
     @classmethod
@@ -5697,7 +5706,9 @@ class SnapshotComparator:
             s.get("mountpoint", "/"): s.get("usage_percent") for s in ne.storage
         }
         storage_diffs = {}
-        for mp in set(list(old_storage.keys()) + list(new_storage.keys())):
+        for mp in sorted(
+            set(list(old_storage.keys()) + list(new_storage.keys())), key=str
+        ):
             o_pct = old_storage.get(mp)
             n_pct = new_storage.get(mp)
             if o_pct != n_pct:
@@ -5719,8 +5730,26 @@ class SnapshotComparator:
         }
         if old_units != new_units:
             changes["failed_units"] = {
-                "old": [list(t[1]) for t in old_units],
-                "new": [list(t[1]) for t in new_units],
+                "old": [
+                    list(t[1])
+                    for t in sorted(
+                        old_units,
+                        key=lambda item: (
+                            str(item[0]),
+                            tuple(str(unit) for unit in item[1]),
+                        ),
+                    )
+                ],
+                "new": [
+                    list(t[1])
+                    for t in sorted(
+                        new_units,
+                        key=lambda item: (
+                            str(item[0]),
+                            tuple(str(unit) for unit in item[1]),
+                        ),
+                    )
+                ],
             }
 
         return changes
@@ -5832,12 +5861,23 @@ def main() -> None:
 
     # ── Obsługa compare ──────────────────────────────────────────
     if args.command == "compare":
-        old_snapshot = SystemSnapshot.from_json(args.old)
-        new_snapshot = SystemSnapshot.from_json(args.new)
+        try:
+            old_snapshot = SystemSnapshot.from_json(args.old)
+            new_snapshot = SystemSnapshot.from_json(args.new)
+        except FileNotFoundError as exc:
+            missing_path = exc.filename or "snapshot input"
+            _cli_error(f"Snapshot input not found: {missing_path}")
+        except (IsADirectoryError, PermissionError) as exc:
+            _cli_error(f"Cannot read snapshot input: {exc}")
+        except ValueError as exc:
+            _cli_error(f"Invalid snapshot input: {exc}")
         comp = SnapshotComparator.compare(old_snapshot, new_snapshot)
         md = format_comparison_markdown(comp)
         if args.output:
-            _write_new_text(args.output, md)
+            try:
+                _write_new_text(args.output, md)
+            except FileExistsError as exc:
+                _cli_error(str(exc))
             print(f"Comparison saved to: {args.output}")
         print(md)
         return
@@ -5866,12 +5906,18 @@ def main() -> None:
     snapshot_path = getattr(cmd_args, "snapshot", None)
 
     engine = SysCheckEngine(output_dir=output_dir, quiet=quiet, full=full)
-    report_path = engine.run_all()
+    try:
+        report_path = engine.run_all()
+    except FileExistsError as exc:
+        _cli_error(str(exc))
 
     # Save snapshot if requested
     if snapshot_path:
         snap = build_snapshot(engine)
-        snap.to_json(snapshot_path)
+        try:
+            snap.to_json(snapshot_path)
+        except FileExistsError as exc:
+            _cli_error(str(exc))
         print(f"\nSnapshot saved to: {snapshot_path}")
 
     print(f"\n{'=' * 72}")
