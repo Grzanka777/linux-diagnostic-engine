@@ -3,12 +3,13 @@ Stałe konfiguracyjne dla Linux Diagnostic Engine.
 Wydzielone dla czytelności i łatwej modyfikacji.
 """
 
+import os
 from pathlib import Path
 
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.1.0"
+PRODUCT_VERSION = "0.1.1"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for
@@ -23,8 +24,19 @@ TIMEOUT_SHORT = 10
 TIMEOUT_MEDIUM = 30
 TIMEOUT_LONG = 60
 
+
 # ── Ścieżki domyślne ─────────────────────────────────────────────
-OUTPUT_DIR_DEFAULT = str(Path.home() / "<REDACTED-USER>" / "raport")
+def get_default_reports_dir() -> Path:
+    """Return the XDG data directory used for generated reports."""
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home).expanduser() / "lde" / "reports"
+    return Path.home() / ".local" / "share" / "lde" / "reports"
+
+
+# Compatibility export; callers needing environment-sensitive behavior should
+# use get_default_reports_dir() at runtime.
+OUTPUT_DIR_DEFAULT = str(get_default_reports_dir())
 
 # ── Wzorce regex do analizy logów ───────────────────────────────
 RE_KERNEL_ERROR = r"error|fail|BUG|lockup|hung|oom|taint|Call Trace"

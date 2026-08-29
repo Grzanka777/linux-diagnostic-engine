@@ -6,7 +6,7 @@ systemu Linux.
 Autor:      <REDACTED-ROLE>
 Model:      <REDACTED-PROVIDER>
 Licencja:   MIT
-Wersja produktu:                         0.1.0
+Wersja produktu:                         0.1.1
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -51,7 +51,7 @@ from constants import (  # type: ignore[import-untyped]
     DISTRO_CONFIG,
     MAX_RECOMMENDED_KERNELS,
     MODEL_NAME,
-    OUTPUT_DIR_DEFAULT,
+    get_default_reports_dir,
     PRODUCT_NAME,
     PRODUCT_SHORT_NAME,
     PRODUCT_VERSION,
@@ -104,6 +104,78 @@ from constants import (  # type: ignore[import-untyped]
 # ──────────────────────────────────────────────────────────────────
 
 MAX_WORKERS = 8  # maksymalna liczba równoległych wątków
+
+
+_SYSTEMD_DURATION_COMPONENT_RE = re.compile(
+    r"(?P<value>(?:\d+(?:\.\d*)?|\.\d+))\s*"
+    r"(?P<unit>usec|us|µs|ms|seconds?|sec|s|minutes?|mins?|min|m|"
+    r"hours?|hrs?|hr|h|days?|d|weeks?|w)",
+    re.IGNORECASE,
+)
+_SYSTEMD_DURATION_FACTORS = {
+    "usec": 1e-6,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "ms": 1e-3,
+    "second": 1.0,
+    "seconds": 1.0,
+    "sec": 1.0,
+    "s": 1.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "mins": 60.0,
+    "min": 60.0,
+    "m": 60.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+    "hrs": 3600.0,
+    "hr": 3600.0,
+    "h": 3600.0,
+    "day": 86400.0,
+    "days": 86400.0,
+    "d": 86400.0,
+    "week": 604800.0,
+    "weeks": 604800.0,
+    "w": 604800.0,
+}
+_SYSTEMD_DURATION_EXPRESSION = (
+    r"(?:\d+(?:\.\d*)?|\.\d+)\s*"
+    r"(?:usec|us|µs|ms|seconds?|sec|s|minutes?|mins?|min|m|"
+    r"hours?|hrs?|hr|h|days?|d|weeks?|w)"
+    r"(?:\s+(?:\d+(?:\.\d*)?|\.\d+)\s*"
+    r"(?:usec|us|µs|ms|seconds?|sec|s|minutes?|mins?|min|m|"
+    r"hours?|hrs?|hr|h|days?|d|weeks?|w))*"
+)
+
+
+def _parse_systemd_duration(text: str) -> Optional[float]:
+    """Parse a systemd duration expression into seconds.
+
+    The parser accepts the fixed-length units emitted by systemd-analyze,
+    including compound values such as ``1min 31.345s``.  Invalid or partial
+    expressions return None instead of silently accepting a numeric suffix.
+    """
+    value = text.strip()
+    if value.endswith("."):
+        value = value[:-1].rstrip()
+    if not value:
+        return None
+
+    matches = list(_SYSTEMD_DURATION_COMPONENT_RE.finditer(value))
+    if not matches:
+        return None
+
+    seconds = 0.0
+    cursor = 0
+    for match in matches:
+        if value[cursor : match.start()].strip():
+            return None
+        unit = match.group("unit").lower()
+        seconds += float(match.group("value")) * _SYSTEMD_DURATION_FACTORS[unit]
+        cursor = match.end()
+    if value[cursor:].strip():
+        return None
+    return seconds
 
 
 @dataclass
@@ -1500,29 +1572,39 @@ class EvidenceBuilder:
             if observation.contradictory_evidence:
                 strength = EvidenceStrength.MODERATE
 
-            # Factual summary based on available measurements
+            # Factual summary based on the measurement used for the threshold.
             total = d.get("total_seconds")
             userspace = d.get("userspace_time")
+            target = d.get("target_time")
+            measurement = (
+                target
+                if target is not None
+                else userspace
+                if userspace is not None
+                else total
+            )
             threshold = d.get("threshold", 30)
             fstrim_in_cc = d.get("fstrim_in_critical_chain")
-            if total is not None:
-                summary = f"Total measured boot time was {total} seconds"
-                if threshold is not None and total > threshold:
-                    summary += (
-                        f", exceeding the configured threshold of {threshold} seconds"
-                    )
-                else:
-                    summary += "."
+            if target is not None:
+                summary = f"Boot-to-graphical.target time was {target} seconds"
             elif userspace is not None:
                 summary = f"Userspace initialization took {userspace} seconds"
-                if threshold is not None and userspace > threshold:
-                    summary += (
-                        f", exceeding the configured threshold of {threshold} seconds"
-                    )
-                else:
-                    summary += "."
+            elif total is not None:
+                summary = f"Total measured boot time was {total} seconds"
             else:
                 summary = "Boot time measurement recorded."
+            if (
+                measurement is not None
+                and threshold is not None
+                and measurement > threshold
+            ):
+                summary += (
+                    f", exceeding the configured threshold of {threshold} seconds"
+                )
+            elif not summary.endswith("."):
+                summary += "."
+            if total is not None and target is not None:
+                summary += f" Total measured boot time was {total} seconds."
             if fstrim_in_cc is False:
                 summary += " fstrim.service was not present in the critical chain."
 
@@ -2174,7 +2256,7 @@ class SysCheckEngine:
         full: bool = False,
         classification_policy: FindingClassificationPolicy | None = None,
     ):
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(output_dir).expanduser().resolve()
         self.quiet = quiet
         self.full = full
         self.classification_policy = (
@@ -3599,10 +3681,34 @@ class SysCheckEngine:
         fstrim_in_critical_chain = None
 
         if analyze_out:
-            # Parsowanie czasu userspace i całkowitego czasu bootu
-            # Format: "... X.XXXs (userspace) = Y.YYYs"
-            userspace_match = re.search(r"([\d.]+)s\s*\(userspace\)", analyze_out)
-            total_match = re.search(r"=\s*([\d.]+)s", analyze_out)
+            # Parse userspace, target, and total values using the same parser.
+            # systemd-analyze may emit compound values such as
+            # "1min 31.345s (userspace) = 1min 47.963s".
+            userspace_match = re.search(
+                rf"(?P<duration>{_SYSTEMD_DURATION_EXPRESSION})\s*\(userspace\)",
+                analyze_out,
+                re.IGNORECASE,
+            )
+            userspace_time = (
+                _parse_systemd_duration(userspace_match.group("duration"))
+                if userspace_match
+                else None
+            )
+            target_match = re.search(
+                rf"graphical\.target\s+reached\s+after\s+"
+                rf"(?P<duration>{_SYSTEMD_DURATION_EXPRESSION})\s+in\s+userspace\b",
+                analyze_out,
+                re.IGNORECASE,
+            )
+            target_time = (
+                _parse_systemd_duration(target_match.group("duration"))
+                if target_match
+                else None
+            )
+            total_match = re.search(r"=\s*([^\n]+)", analyze_out)
+            total_seconds = (
+                _parse_systemd_duration(total_match.group(1)) if total_match else None
+            )
             blame_match = re.search(r"(\S+)\.service\s+([\d.]+)s", blame_out)
 
             if blame_match and userspace_match:
@@ -3633,15 +3739,23 @@ class SysCheckEngine:
                         )
 
         # Analiza graficznego czasu bootu
-        if userspace_match:
-            userspace_time = float(userspace_match.group(1))
-            if userspace_time > 30:
+        if userspace_time is not None:
+            measurement_time = (
+                target_time if target_time is not None else userspace_time
+            )
+            measurement_source = (
+                "graphical.target" if target_time is not None else "userspace"
+            )
+            if measurement_time > 30:
                 payload = {
                     "userspace_time": userspace_time,
+                    "measurement_source": measurement_source,
                     "threshold": 30.0,
                 }
-                if total_match:
-                    payload["total_seconds"] = float(total_match.group(1))
+                if target_time is not None:
+                    payload["target_time"] = target_time
+                if total_seconds is not None:
+                    payload["total_seconds"] = total_seconds
                 if fstrim_in_critical_chain is not None:
                     payload["fstrim_in_critical_chain"] = fstrim_in_critical_chain
                 self.raw_diagnostics.append(
@@ -4622,7 +4736,7 @@ class RecommendationPlan:
 
     @property
     def informational(self) -> tuple:
-        return tuple(r for r in self.recommendations if r.priority >= 4)
+        return tuple(r for r in self.recommendations if r.priority >= 5)
 
     def validate(self) -> list[str]:
         errors = []
@@ -4649,8 +4763,15 @@ class RecommendationEngine:
             rec = self._finding_to_recommendation(f, restrictions)
             if rec:
                 recs.append(rec)
-        recs.sort(key=lambda r: r.priority)
-        return RecommendationPlan(recommendations=tuple(recs))
+        recs.sort(key=lambda r: (r.priority, r.recommendation_id))
+        unique_recs = []
+        seen_ids = set()
+        for rec in recs:
+            if rec.recommendation_id in seen_ids:
+                continue
+            seen_ids.add(rec.recommendation_id)
+            unique_recs.append(rec)
+        return RecommendationPlan(recommendations=tuple(unique_recs))
 
     def _finding_to_recommendation(
         self, f: "Finding", restrictions: tuple
@@ -4755,12 +4876,11 @@ class RecommendationEngine:
     @staticmethod
     def _detect_blockers(f: "Finding", restrictions: tuple) -> list:
         blocked = []
-        domain = f.domain
         kind = f.kind
         for r in restrictions:
             r_lower = r.lower()
-            if domain == DiagnosticDomain.FILESYSTEM and (
-                "sudo" in r_lower or "btrfs" in r_lower
+            if kind in (FindingKind.DEVICE_ERROR, FindingKind.SCRUB_STATUS) and (
+                "btrfs" in r_lower
             ):
                 blocked.append(r)
             if kind == FindingKind.KERNEL_TAINT and "dmesg" in r_lower:
@@ -4797,7 +4917,9 @@ def format_recommendation_markdown(plan: RecommendationPlan) -> str:
 
     # Priority groups
     groups = {
-        "Priority 1 — Immediate attention": plan.urgent,
+        "Priority 1 — Immediate attention": [
+            r for r in plan.recommendations if r.priority == 1
+        ],
         "Priority 2 — Important": [r for r in plan.recommendations if r.priority == 2],
         "Priority 3 — Planned maintenance": [
             r for r in plan.recommendations if r.priority == 3
@@ -5847,8 +5969,8 @@ def main() -> None:
     diag_parser.add_argument(
         "--output-dir",
         "-o",
-        default=OUTPUT_DIR_DEFAULT,
-        help=f"Katalog docelowy (domyślnie: {OUTPUT_DIR_DEFAULT})",
+        default=None,
+        help=f"Katalog docelowy (domyślnie: {get_default_reports_dir()})",
     )
     diag_parser.add_argument(
         "--quiet",
@@ -5925,14 +6047,16 @@ def main() -> None:
         )
         print("", file=sys.stderr)
 
-    output_dir = getattr(cmd_args, "output_dir", OUTPUT_DIR_DEFAULT)
+    output_dir = getattr(cmd_args, "output_dir", None)
+    if output_dir is None:
+        output_dir = str(get_default_reports_dir())
     quiet = getattr(cmd_args, "quiet", False)
     full = getattr(cmd_args, "full", False)
     snapshot_path = getattr(cmd_args, "snapshot", None)
 
     engine = SysCheckEngine(output_dir=output_dir, quiet=quiet, full=full)
     try:
-        report_path = engine.run_all()
+        report_path = Path(engine.run_all()).expanduser().resolve()
     except FileExistsError as exc:
         _cli_error(str(exc))
 
@@ -5945,6 +6069,11 @@ def main() -> None:
             _cli_error(str(exc))
         print(f"\nSnapshot saved to: {snapshot_path}")
 
+    try:
+        report_content = report_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        _cli_error(f"Cannot read generated report: {exc}")
+
     print(f"\n{'=' * 72}")
     print(f"Pełna ścieżka raportu: {report_path}")
     print(f"{'=' * 72}")
@@ -5956,7 +6085,6 @@ def main() -> None:
         print("Tryb:                      --full (pełny output)")
     print(f"\n{'─' * 72}")
 
-    report_content = Path(report_path).read_text(encoding="utf-8")
     print(report_content)
 
 

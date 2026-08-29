@@ -1731,15 +1731,27 @@ class BootDelayRule(DiagnosticRule):
             independent_sources=observation.independent_sources,
         )
         obs_id = observation.obs_id
-        t = observation.details.get("userspace_time", "?")
+        details = observation.details
+        target_time = details.get("target_time")
+        userspace_time = details.get("userspace_time")
+        measurement = target_time if target_time is not None else userspace_time
+        measurement_label = (
+            "graphical.target" if target_time is not None else "userspace"
+        )
+        t = measurement if measurement is not None else "?"
+        evidence_text = (
+            f"Czas do graphical.target: {target_time}s."
+            if target_time is not None
+            else f"Czas userspace: {t}s."
+        )
         evidence_items = (self._evidence_builder.build(observation),)
         return DiagnosticRuleResult(
             finding=_syscheck().Finding(
                 finding_id=obs_id,
-                title=f"Wydłużony czas bootu ({t}s userspace)",
+                title=f"Wydłużony czas bootu ({t}s {measurement_label})",
                 severity="P3",
                 confidence=conf,
-                evidence=f"Czas userspace: {t}s.",
+                evidence=evidence_text,
                 interpretation="Czas uruchamiania przekracza 30s.",
                 recommended_diagnostics="`systemd-analyze blame`; `systemd-analyze critical-chain`",
                 remediation="Wyłącz zbędne usługi: `systemctl disable <usługa>`.",

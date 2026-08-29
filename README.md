@@ -5,6 +5,20 @@ collects bounded system evidence, writes a Markdown report and can persist a
 JSON snapshot for later comparison. It does not require third-party Python
 runtime dependencies.
 
+## Supported installation
+
+From a checkout, run the no-sudo installer:
+
+```text
+./install.sh
+```
+
+It uses `uv tool install` for the local package, creates the reports directory
+at `$XDG_DATA_HOME/lde/reports` (or `~/.local/share/lde/reports` when
+`XDG_DATA_HOME` is unset), prints the installed version and reports path, and
+does not modify shell startup files or system services. Add the uv tool bin
+directory to `PATH` manually if your shell does not already include it.
+
 ## Installation from a wheel
 
 Build a wheel in a disposable output directory:
@@ -17,7 +31,7 @@ Install it into an isolated virtual environment:
 
 ```text
 uv venv /tmp/lde-venv
-uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.1.0-py3-none-any.whl
+uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.1.1-py3-none-any.whl
 ```
 
 The installed command is `lde`:
@@ -29,8 +43,11 @@ The installed command is `lde`:
 /tmp/lde-venv/bin/lde compare --help
 ```
 
-The public product version is `0.1.0`; `lde --version` prints
-`Linux Diagnostic Engine 0.1.0`. The legacy flat module remains named
+The public product version is `0.1.1`; `lde --version` prints
+`Linux Diagnostic Engine 0.1.1`. Without `--output-dir`, reports are written
+to `$XDG_DATA_HOME/lde/reports` or `~/.local/share/lde/reports`; an explicit
+`--output-dir` still overrides this default. A successful run prints the exact
+absolute report path. The legacy flat module remains named
 `syscheck.py`, and the package entry point remains `lde = syscheck:main` for
 compatibility. The schema-3 snapshot field `syscheck_version` and the related
 report metadata retain `2.1.0` only as explicitly labelled legacy

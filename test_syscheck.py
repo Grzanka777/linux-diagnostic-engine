@@ -58,7 +58,9 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _journal_filter_command,
     _kernel_oops_panic_severity,
     _oom_collector_command,
+    _parse_systemd_duration,
     build_snapshot,
+    get_default_reports_dir,
     _nvme_controller_reliability_severity,
     _pcie_aer_severity,
     _parse_storage_usage,
@@ -11785,3 +11787,312 @@ class TestIteration44RIntegrityCompletenessRemediation:
         assert loaded.raw_diagnostics[0].provenance["command"] == (
             "btrfs device stats /"
         )
+
+
+class TestIteration011RealWorldCorrectness:
+    """Regression coverage for v0.1.1 correctness and install UX seams."""
+
+    @pytest.mark.parametrize(
+        ("duration", "expected"),
+        [
+            ("250ms", 0.25),
+            ("4.819s", 4.819),
+            ("1min 31.345s", 91.345),
+            ("1h 2min 3.5s", 3723.5),
+        ],
+    )
+    def test_systemd_duration_parser_supports_single_and_compound_values(
+        self, duration, expected
+    ):
+        assert _parse_systemd_duration(duration) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("duration", ["", "31.345", "1min 31.345", "1min garbage"])
+    def test_systemd_duration_parser_rejects_malformed_values(self, duration):
+        assert _parse_systemd_duration(duration) is None
+
+    @staticmethod
+    def _systemd_result(stdout: str) -> CmdResult:
+        return CmdResult(
+            command="systemd-analyze",
+            stdout=stdout,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+
+    def _collect_systemd(self, analyze: str, *, blame: str = "", critical: str = ""):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v011_systemd")
+        results = {
+            "sys_failed": self._systemd_result(""),
+            "usr_failed": self._systemd_result(""),
+            "analyze": self._systemd_result(analyze),
+            "blame": self._systemd_result(blame),
+            "critical": self._systemd_result(critical),
+            "timers": self._systemd_result(""),
+            "usr_timers": self._systemd_result(""),
+            "auto_restart": self._systemd_result(""),
+            "restarting": self._systemd_result(""),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_systemd()
+        return engine
+
+    def test_boot_slow_uses_graphical_target_instead_of_userspace_accounting(self):
+        analyze = (
+            "Startup finished in 14.425s (firmware) + 8.130s (loader) + "
+            "2.906s (kernel) + 5.034s (initrd) + 1min 31.345s (userspace) "
+            "= 1min 47.963s.\n"
+            "graphical.target reached after 4.819s in userspace."
+        )
+        engine = self._collect_systemd(analyze)
+
+        assert not [
+            raw for raw in engine.raw_diagnostics if raw.category == "boot_time"
+        ]
+
+    def test_boot_slow_uses_target_threshold_when_target_is_slow(self):
+        analyze = (
+            "Startup finished in 0s (firmware) + 0s (loader) + 0s (kernel) + "
+            "0s (initrd) + 1min 31.345s (userspace) = 1min 47.963s.\n"
+            "graphical.target reached after 31.2s in userspace."
+        )
+        engine = self._collect_systemd(analyze)
+        raw = next(raw for raw in engine.raw_diagnostics if raw.category == "boot_time")
+
+        assert raw.payload["userspace_time"] == pytest.approx(91.345)
+        assert raw.payload["target_time"] == pytest.approx(31.2)
+        assert raw.payload["measurement_source"] == "graphical.target"
+        assert raw.payload["total_seconds"] == pytest.approx(107.963)
+
+    def test_boot_slow_falls_back_to_userspace_without_target_timing(self):
+        analyze = (
+            "Startup finished in 0s (firmware) + 0s (loader) + 0s (kernel) + "
+            "0s (initrd) + 31.345s (userspace) = 31.345s."
+        )
+        engine = self._collect_systemd(analyze)
+        raw = next(raw for raw in engine.raw_diagnostics if raw.category == "boot_time")
+
+        assert raw.payload["measurement_source"] == "userspace"
+        assert raw.payload["userspace_time"] == pytest.approx(31.345)
+        assert "target_time" not in raw.payload
+
+    @staticmethod
+    def _finding(
+        finding_id: str,
+        *,
+        kind: FindingKind = FindingKind.GENERAL,
+        domain: DiagnosticDomain = DiagnosticDomain.OTHER,
+        severity: str = "P3",
+        intent: RecommendationIntent = RecommendationIntent.VERIFY,
+    ) -> Finding:
+        return Finding(
+            finding_id=finding_id,
+            title=f"Finding {finding_id}",
+            severity=severity,
+            confidence="Certain",
+            interpretation="A measured condition requires review.",
+            domain=domain,
+            kind=kind,
+            actionability=Actionability.CONDITIONAL,
+            recommendation_intent=intent,
+        )
+
+    def test_recommendation_candidates_are_deduplicated_and_ordered(self):
+        findings = [self._finding("F2"), self._finding("F1"), self._finding("F2")]
+        plan = RecommendationEngine().generate(findings=findings)
+
+        assert [rec.recommendation_id for rec in plan.recommendations] == [
+            "REC-F1",
+            "REC-F2",
+        ]
+
+    def test_priority_four_is_not_rendered_again_as_informational(self):
+        recommendation = DiagnosticRecommendation(
+            recommendation_id="REC-BOOT-SLOW-001",
+            priority=4,
+            title="Wydłużony czas bootu",
+            rationale="Target timing exceeds threshold.",
+            source_finding_ids=("BOOT-SLOW-001",),
+        )
+        markdown = format_recommendation_markdown(
+            RecommendationPlan(recommendations=(recommendation,))
+        )
+
+        assert markdown.count("Wydłużony czas bootu") == 1
+        assert "### Priority 4" in markdown
+        assert "### Informational" not in markdown
+
+    def test_priority_one_and_two_groups_do_not_render_same_recommendation_twice(
+        self,
+    ):
+        recommendations = (
+            DiagnosticRecommendation(
+                recommendation_id="REC-P1",
+                priority=1,
+                title="Immediate",
+                rationale="r",
+            ),
+            DiagnosticRecommendation(
+                recommendation_id="REC-P2",
+                priority=2,
+                title="Important",
+                rationale="r",
+            ),
+        )
+        markdown = format_recommendation_markdown(
+            RecommendationPlan(recommendations=recommendations)
+        )
+
+        assert markdown.count("**Immediate**") == 1
+        assert markdown.count("**Important**") == 1
+
+    def test_restrictions_are_scoped_to_relevant_finding_kinds(self):
+        restrictions = (
+            "Btrfs show — wymaga sudo.",
+            "dmesg_restrict=1 — bezpośredni dmesg wymaga sudo.",
+        )
+        systemd = self._finding(
+            "SYSD-SYS-FAIL-001",
+            kind=FindingKind.FAILED_UNIT,
+            domain=DiagnosticDomain.SYSTEMD,
+            severity="P2",
+            intent=RecommendationIntent.INVESTIGATE,
+        )
+        systemd_rec = RecommendationEngine().generate([systemd], restrictions)
+        assert systemd_rec.recommendations[0].blocked_by_restrictions == ()
+
+        btrfs = self._finding(
+            "BTRFS-ERR-001",
+            kind=FindingKind.DEVICE_ERROR,
+            domain=DiagnosticDomain.FILESYSTEM,
+            severity="P2",
+            intent=RecommendationIntent.VERIFY,
+        )
+        btrfs_rec = RecommendationEngine().generate([btrfs], restrictions)
+        assert btrfs_rec.recommendations[0].blocked_by_restrictions == (
+            "Btrfs show — wymaga sudo.",
+        )
+
+        taint = self._finding(
+            "KERNEL-TAINT-001",
+            kind=FindingKind.KERNEL_TAINT,
+            domain=DiagnosticDomain.KERNEL,
+            intent=RecommendationIntent.MONITOR,
+        )
+        taint_rec = RecommendationEngine().generate([taint], restrictions)
+        assert taint_rec.recommendations[0].blocked_by_restrictions == (
+            "dmesg_restrict=1 — bezpośredni dmesg wymaga sudo.",
+        )
+
+    def test_default_reports_dir_is_xdg_or_home_fallback(self, monkeypatch, tmp_path):
+        xdg = tmp_path / "xdg-data"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+        assert get_default_reports_dir() == xdg / "lde" / "reports"
+
+        monkeypatch.delenv("XDG_DATA_HOME")
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        assert get_default_reports_dir() == (
+            tmp_path / "home" / ".local" / "share" / "lde" / "reports"
+        )
+
+    @staticmethod
+    def _patch_successful_cli_engine(monkeypatch, syscheck):
+        class FakeEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.output_dir = output_dir
+                self.findings = []
+                self.restrictions = []
+                self.commands_used = []
+                self.observations = []
+
+            def run_all(self):
+                report = os.path.join(self.output_dir, "lde-test-report.md")
+                os.makedirs(self.output_dir, exist_ok=True)
+                syscheck._write_new_text(report, "# generated report\n")
+                return report
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FakeEngine)
+
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_successful_cli_summary_contains_absolute_generated_report_path(
+        self, monkeypatch, tmp_path, capsys, explicit
+    ):
+        import syscheck
+
+        self._patch_successful_cli_engine(monkeypatch, syscheck)
+        if explicit:
+            output_dir = tmp_path / "explicit-reports"
+            argv = ["lde", "run", "--quiet", "--output-dir", str(output_dir)]
+            expected_dir = output_dir
+        else:
+            expected_dir = tmp_path / "xdg-data" / "lde" / "reports"
+            monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+            argv = ["lde", "run", "--quiet"]
+        monkeypatch.setattr(syscheck.sys, "argv", argv)
+
+        syscheck.main()
+        report = expected_dir / "lde-test-report.md"
+        captured = capsys.readouterr()
+
+        assert report.is_file()
+        assert f"Pełna ścieżka raportu: {report.resolve()}" in captured.out
+
+    def test_failed_cli_run_does_not_print_success_report_path(
+        self, monkeypatch, capsys
+    ):
+        import syscheck
+
+        class FailingEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.findings = []
+                self.restrictions = []
+                self.commands_used = []
+                self.observations = []
+
+            def run_all(self):
+                raise FileExistsError("Destination report already exists")
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FailingEngine)
+        monkeypatch.setattr(
+            syscheck.sys, "argv", ["lde", "run", "--quiet", "--output-dir", "/tmp"]
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code == 1
+        assert "Pełna ścieżka raportu:" not in captured.out
+        assert "Destination report already exists" in captured.err
+
+    def test_unreadable_generated_report_does_not_print_success_path(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import syscheck
+
+        class MissingReportEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.findings = []
+                self.restrictions = []
+                self.commands_used = []
+                self.observations = []
+
+            def run_all(self):
+                return str(tmp_path / "missing-report.md")
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", MissingReportEngine)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            ["lde", "run", "--quiet", "--output-dir", str(tmp_path)],
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            syscheck.main()
+
+        captured = capsys.readouterr()
+        assert exc_info.value.code == 1
+        assert "Pełna ścieżka raportu:" not in captured.out
+        assert "Cannot read generated report" in captured.err

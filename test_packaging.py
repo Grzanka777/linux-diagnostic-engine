@@ -17,7 +17,7 @@ class TestPackagingContract:
         manifest = _manifest_text()
 
         assert 'name = "linux-diagnostic-engine"' in manifest
-        assert 'version = "0.1.0"' in manifest
+        assert 'version = "0.1.1"' in manifest
         assert 'requires-python = ">=3.10"' in manifest
         assert "dependencies = []" in manifest
 
@@ -49,10 +49,12 @@ class TestPackagingContract:
         documentation = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
         assert "uv build --wheel" in documentation
-        assert "/linux_diagnostic_engine-0.1.0-py3-none-any.whl" in documentation
+        assert "/linux_diagnostic_engine-0.1.1-py3-none-any.whl" in documentation
         assert "/tmp/lde-venv/bin/lde --version" in documentation
         assert "/tmp/lde-venv/bin/lde --help" in documentation
         assert "python3 syscheck.py --help" in documentation
+        assert "./install.sh" in documentation
+        assert "$XDG_DATA_HOME/lde/reports" in documentation
 
     def test_public_cli_version_and_help_use_current_identity(self):
         version = subprocess.run(
@@ -71,8 +73,23 @@ class TestPackagingContract:
         )
 
         assert version.returncode == 0
-        assert version.stdout.strip() == "Linux Diagnostic Engine 0.1.0"
+        assert version.stdout.strip() == "Linux Diagnostic Engine 0.1.1"
         assert version.stderr == ""
         assert help_output.returncode == 0
         assert "Linux Diagnostic Engine (LDE)" in help_output.stdout
         assert "syscheck —" not in help_output.stdout
+
+    def test_supported_installer_is_local_no_sudo_and_no_system_mutation(self):
+        installer = PROJECT_ROOT / "install.sh"
+        source = installer.read_text(encoding="utf-8")
+
+        assert installer.is_file()
+        assert installer.stat().st_mode & 0o111
+        assert "uv tool install" in source
+        assert 'mkdir -p "$reports_dir"' in source
+        assert "XDG_DATA_HOME" in source
+        assert "lde --version" in source
+        assert "sudo" not in source
+        assert "systemctl" not in source
+        assert ".codex" not in source
+        assert "git " not in source
