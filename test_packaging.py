@@ -17,7 +17,7 @@ class TestPackagingContract:
         manifest = _manifest_text()
 
         assert 'name = "linux-diagnostic-engine"' in manifest
-        assert 'version = "0.1.1"' in manifest
+        assert 'version = "0.1.2"' in manifest
         assert 'requires-python = ">=3.10"' in manifest
         assert "dependencies = []" in manifest
 
@@ -49,7 +49,7 @@ class TestPackagingContract:
         documentation = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
         assert "uv build --wheel" in documentation
-        assert "/linux_diagnostic_engine-0.1.1-py3-none-any.whl" in documentation
+        assert "/linux_diagnostic_engine-0.1.2-py3-none-any.whl" in documentation
         assert "/tmp/lde-venv/bin/lde --version" in documentation
         assert "/tmp/lde-venv/bin/lde --help" in documentation
         assert "python3 syscheck.py --help" in documentation
@@ -73,11 +73,19 @@ class TestPackagingContract:
         )
 
         assert version.returncode == 0
-        assert version.stdout.strip() == "Linux Diagnostic Engine 0.1.1"
+        assert version.stdout.strip() == "Linux Diagnostic Engine 0.1.2"
         assert version.stderr == ""
         assert help_output.returncode == 0
         assert "Linux Diagnostic Engine (LDE)" in help_output.stdout
         assert "syscheck —" not in help_output.stdout
+
+    def test_public_and_legacy_compatibility_versions_are_explicit(self):
+        import constants
+        import syscheck
+
+        assert constants.PRODUCT_VERSION == "0.1.2"
+        assert constants.REPORT_COMPATIBILITY_VERSION == "2.1.0"
+        assert syscheck.SNAPSHOT_SCHEMA_VERSION == 3
 
     def test_supported_installer_is_local_no_sudo_and_no_system_mutation(self):
         installer = PROJECT_ROOT / "install.sh"

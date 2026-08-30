@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -11996,6 +11997,55 @@ class TestIteration011RealWorldCorrectness:
         assert get_default_reports_dir() == (
             tmp_path / "home" / ".local" / "share" / "lde" / "reports"
         )
+
+    def test_generated_public_report_has_no_ai_identity_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        import syscheck
+
+        engine = SysCheckEngine(output_dir=str(tmp_path), quiet=True)
+        base_output = {
+            "osr": 'PRETTY_NAME="Synthetic Linux"\nID=arch',
+            "kernel": "6.18.0-test",
+            "hostname": "test-host",
+            "uptime": "up 1 minute",
+            "cmdline": "quiet",
+            "boot_ls": "",
+            "mod_ls": "",
+            "niri_ver": "(optional dependency unavailable)",
+        }
+        monkeypatch.setattr(engine, "_parallel", lambda _tasks: base_output)
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_modules", lambda: [])
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", lambda: [])
+        monkeypatch.setattr(engine, "detect_distro", lambda: None)
+        for phase in (
+            "collect_resources",
+            "collect_storage",
+            "collect_kernel_hw",
+            "collect_systemd",
+            "collect_packages",
+            "collect_graphics",
+            "collect_network",
+            "collect_userenv",
+            "_derive_observations",
+            "_interpret",
+        ):
+            monkeypatch.setattr(engine, phase, lambda: None)
+
+        report_path = Path(engine.run_all())
+        report = report_path.read_text(encoding="utf-8")
+
+        assert report_path.is_file()
+        assert "# Linux Diagnostic Engine (LDE)" in report
+        assert "**Wersja produktu:** `0.1.2`" in report
+        assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
+        assert "**Internal metadata:**" not in report
+        assert "**Internal metadata:**" not in report
+        assert "<REDACTED-ROLE>" not in report
+        assert "<REDACTED-PROVIDER>" not in report
+        assert "przez <REDACTED-ROLE>" not in report
+        assert "Linux Diagnostic Engine 0.1.2" in report
+        assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
     def _patch_successful_cli_engine(monkeypatch, syscheck):

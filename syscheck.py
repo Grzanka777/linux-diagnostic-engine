@@ -3,10 +3,8 @@
 Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
-Autor:      <REDACTED-ROLE>
-Model:      <REDACTED-PROVIDER>
 Licencja:   MIT
-Wersja produktu:                         0.1.1
+Wersja produktu:                         0.1.2
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -47,10 +45,8 @@ from typing import Any, ClassVar, Dict, List, NoReturn, Optional, Tuple
 
 # ── Stałe ────────────────────────────────────────────────────────
 from constants import (  # type: ignore[import-untyped]
-    AGENT_NAME,
     DISTRO_CONFIG,
     MAX_RECOMMENDED_KERNELS,
-    MODEL_NAME,
     get_default_reports_dir,
     PRODUCT_NAME,
     PRODUCT_SHORT_NAME,
@@ -2468,8 +2464,6 @@ class SysCheckEngine:
             "**Kompatybilność raportów/snapshotów:** "
             f"`{REPORT_COMPATIBILITY_VERSION}`  \n"
         )
-        self.report_lines.append(f"**Internal metadata:** `{AGENT_NAME}`  \n")
-        self.report_lines.append(f"**Internal metadata:** `{MODEL_NAME}`  \n")
         self.report_lines.append(
             f"**Data rozpoczęcia (UTC):** {self.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}  \n"
         )
@@ -4585,7 +4579,7 @@ class SysCheckEngine:
         self.report_lines.append("\n---\n")
         self.report_lines.append(
             f"*Raport wygenerowany {self.start_time_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-            f"przez {AGENT_NAME}; wersja produktu {PRODUCT_VERSION}; "
+            f"{PRODUCT_NAME} {PRODUCT_VERSION}; "
             f"kompatybilność raportów/snapshotów {REPORT_COMPATIBILITY_VERSION}*\n"
         )
 
