@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.1.2
+Wersja produktu:                         0.1.3
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -19,12 +19,12 @@ Zasady:
   - Wyłącznie operacje tylko do odczytu.
   - Bez sudo (chyba że odczyt jest niemożliwy – wtedy pomijane i oznaczane).
   - Bez modyfikacji konfiguracji, pakietów, usług.
-  - Raport zapisywany do pliku .md i wyświetlany na konsoli.
+  - Raport zapisywany do pliku .md; wyświetlenie na konsoli jest opcjonalne.
   - Wspiera Arch/CachyOS, Debian/Ubuntu, RHEL/Fedora (pakiety).
 
 Użycie:
   lde [--version]
-  python syscheck.py [--output-dir KATALOG] [--quiet] [--full]
+  lde run [--output-dir DIRECTORY] [--quiet] [--full] [--print-report] [--verbose]
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ import subprocess
 import argparse
 import datetime
 import re
+import shutil
 import sys
 import threading
 from urllib.parse import quote
@@ -41,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, NoReturn, Optional, Tuple
+from typing import Any, ClassVar, Dict, Iterable, List, NoReturn, Optional, Tuple
 
 # ── Stałe ────────────────────────────────────────────────────────
 from constants import (  # type: ignore[import-untyped]
@@ -616,6 +617,127 @@ def _cli_error(message: str) -> NoReturn:
     """Render an expected command-line failure without a traceback."""
     print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+CLI_STATUS_HEALTHY = "HEALTHY"
+CLI_STATUS_ATTENTION = "ATTENTION"
+CLI_STATUS_PROBLEMS = "PROBLEMS"
+_CLI_COLLECTION_SECTIONS = (
+    "Environment",
+    "CPU & memory",
+    "Storage / NVMe / Btrfs",
+    "Kernel & hardware",
+    "systemd & boot",
+    "Packages",
+    "Graphics",
+    "Network & security",
+    "User environment",
+)
+_CLI_STATUS_MARKERS = {
+    CLI_STATUS_HEALTHY: "✓",
+    CLI_STATUS_ATTENTION: "!",
+    CLI_STATUS_PROBLEMS: "✗",
+}
+
+
+def determine_cli_status(findings: Iterable[Finding]) -> str:
+    """Return the stable public status derived only from finding severity."""
+    severities = {finding.severity for finding in findings}
+    if severities.intersection({"P0", "P1"}):
+        return CLI_STATUS_PROBLEMS
+    if severities.intersection({"P2", "P3"}):
+        return CLI_STATUS_ATTENTION
+    return CLI_STATUS_HEALTHY
+
+
+def _terminal_width(stream: Any) -> int:
+    """Return a safe width for compact CLI rules on unusual terminals."""
+    try:
+        columns = int(shutil.get_terminal_size(fallback=(80, 24)).columns)
+    except (AttributeError, OSError, TypeError, ValueError):
+        columns = 80
+    return max(1, columns)
+
+
+def _ansi_enabled(stream: Any) -> bool:
+    """Enable presentation color only for an actual TTY and never for NO_COLOR."""
+    if "NO_COLOR" in os.environ:
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _style_cli_status(status: str, stream: Any) -> str:
+    if not _ansi_enabled(stream):
+        return status
+    color = {
+        CLI_STATUS_HEALTHY: "\033[32m",
+        CLI_STATUS_ATTENTION: "\033[33m",
+        CLI_STATUS_PROBLEMS: "\033[31m",
+    }.get(status, "")
+    return f"{color}{status}\033[0m" if color else status
+
+
+def format_cli_summary(
+    engine: "SysCheckEngine", report_path: str | Path, *, stream: Any = None
+) -> str:
+    """Format the compact, English public summary for a completed run."""
+    output_stream = sys.stdout if stream is None else stream
+    status = determine_cli_status(engine.findings)
+    rule = "-" * min(72, _terminal_width(output_stream))
+    recommendation_plan = getattr(engine, "recommendation_plan", None)
+    recommendation_count = (
+        len(recommendation_plan.recommendations) if recommendation_plan else 0
+    )
+    confirmed_problem_count = sum(
+        finding.severity != "Info" for finding in engine.findings
+    )
+    os_name = getattr(engine, "os_name", "") or getattr(engine, "distro_id", "unknown")
+    desktop = getattr(engine, "desktop_environment", "") or "?"
+    session_type = getattr(engine, "session_type", "") or "?"
+    session = f"{desktop} / {session_type}"
+
+    lines = [
+        rule,
+        f"{PRODUCT_NAME} {PRODUCT_VERSION}",
+        "Read-only diagnostics | no sudo | no system changes",
+        rule,
+        "",
+        "System",
+        f"  Host        {getattr(engine, 'hostname', '') or 'unknown'}",
+        f"  OS          {os_name}",
+        f"  Kernel      {getattr(engine, 'active_kernel', '') or 'unknown'}",
+        f"  Session     {session}",
+        "",
+        "Collecting diagnostics",
+    ]
+    lines.extend(f"  ✓ {section}" for section in _CLI_COLLECTION_SECTIONS)
+    lines.extend(
+        [
+            "",
+            "Analyzing evidence",
+            f"  ✓ {len(engine.commands_used)} commands executed",
+            f"  ✓ {len(engine.observations)} actionable observations",
+            "",
+            rule,
+            "",
+            f"HEALTH STATUS    {_CLI_STATUS_MARKERS[status]} "
+            f"{_style_cli_status(status, output_stream)}",
+            "",
+            f"Confirmed problems              {confirmed_problem_count}",
+            f"Actionable recommendations      {recommendation_count}",
+            f"Analysis limitations            {len(engine.restrictions)}",
+            f"Commands executed              {len(engine.commands_used)}",
+            "",
+            "Report",
+            f"  {report_path}",
+            rule,
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def heading(level: int, title: str) -> str:
@@ -2263,6 +2385,9 @@ class SysCheckEngine:
         self.hostname: str = ""
         self.active_kernel: str = ""
         self.distro_id: str = "unknown"
+        self.os_name: str = ""
+        self.desktop_environment: str = ""
+        self.session_type: str = ""
         self.distro_config: dict = DISTRO_CONFIG.get("arch", DISTRO_CONFIG["arch"])
         self.report_lines: List[str] = []
         self.findings: List[Finding] = []
@@ -2281,7 +2406,23 @@ class SysCheckEngine:
 
     def log_section(self, name: str) -> None:
         if not self.quiet:
-            print(f"\n═══ {name} ═══", file=sys.stderr, flush=True)
+            public_names = {
+                "Identyfikacja środowiska": "Environment identification",
+                "Stan zasobów": "Resource status",
+                "Dyski, NVMe, Btrfs": "Storage, NVMe, and Btrfs",
+                "Kernel i sprzęt": "Kernel and hardware",
+                "Systemd i usługi": "Systemd and services",
+                "Pakiety i spójność": "Packages and integrity",
+                "Warstwa graficzna": "Graphics stack",
+                "Sieć i bezpieczeństwo": "Network and security",
+                "Środowisko użytkownika": "User environment",
+                "Budowanie podsumowania": "Building summary",
+            }
+            print(
+                f"\n=== {public_names.get(name, 'Diagnostics')} ===",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # ── Wykonanie komend ─────────────────────────────────────────
     def cmd(
@@ -2452,6 +2593,9 @@ class SysCheckEngine:
         xdg_type = os.environ.get("XDG_SESSION_TYPE", "?")
         wayland_disp = os.environ.get("WAYLAND_DISPLAY", "?")
         xdg_desktop = os.environ.get("XDG_CURRENT_DESKTOP", "?")
+        self.os_name = pretty_name
+        self.desktop_environment = xdg_desktop
+        self.session_type = xdg_type
 
         self.report_lines.append(
             heading(1, f"{PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) — Raport diagnostyczny")
@@ -4551,10 +4695,10 @@ class SysCheckEngine:
 
         Żadna faza nie zależy od następnej. Interpretacja nie czyta RAW.
         """
-        self.log(f"{PRODUCT_NAME} {PRODUCT_VERSION} — rozpoczynanie diagnostyki...\n")
+        self.log(f"{PRODUCT_NAME} {PRODUCT_VERSION} — starting diagnostics...\n")
 
-        # Stage 1: RAW data collection
-        self.log("=== Stage 1: Zbieranie surowych danych (RAW) ===")
+        # Collect existing diagnostic data.
+        self.log("Collecting diagnostics...")
         self.detect_distro()
         self.collect_base_info()
         self.collect_resources()
@@ -4566,12 +4710,12 @@ class SysCheckEngine:
         self.collect_network()
         self.collect_userenv()
 
-        # Stage 2: Derive observations from RAW
-        self.log("\n=== Stage 2: Wyprowadzanie obserwacji (OBS) ===")
+        # Analyze existing observations.
+        self.log("\nAnalyzing evidence...")
         self._derive_observations()
 
-        # Stage 3: Generate interpreted findings from observations
-        self.log("\n=== Stage 3: Generowanie interpretacji (INT) ===")
+        # Generate the existing report from findings.
+        self.log("\nGenerating report...")
         self._interpret()
 
         self.build_summary()
@@ -4592,7 +4736,7 @@ class SysCheckEngine:
         full_report = "".join(self.report_lines)
         _write_new_text(report_path, full_report)
 
-        self.log(f"\nRaport zapisany do: {report_path}")
+        self.log(f"\nReport saved to: {report_path}")
         return str(report_path)
 
 
@@ -5945,7 +6089,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             f"{PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) — "
-            "tylko do odczytu diagnostyka systemu Linux"
+            "read-only Linux system diagnostics"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -5954,53 +6098,63 @@ def main() -> None:
         action="version",
         version=f"{PRODUCT_NAME} {PRODUCT_VERSION}",
     )
-    subparsers = parser.add_subparsers(dest="command", help="Komendy")
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # ── Komenda główna: diagnostyka ──────────────────────────────
+    # ── Main command: diagnostics ─────────────────────────────────
     diag_parser = subparsers.add_parser(
-        "run", help="Uruchom diagnostykę (domyślna)", aliases=["diagnose"]
+        "run", help="Run diagnostics (default)", aliases=["diagnose"]
     )
     diag_parser.add_argument(
         "--output-dir",
         "-o",
         default=None,
-        help=f"Katalog docelowy (domyślnie: {get_default_reports_dir()})",
+        help=f"Output directory (default: {get_default_reports_dir()})",
     )
     diag_parser.add_argument(
         "--quiet",
         "-q",
         action="store_true",
-        help="Wycisz komunikaty diagnostyczne na stderr",
+        help="Suppress progress output on stderr",
     )
     diag_parser.add_argument(
         "--full",
         "-f",
         action="store_true",
-        help="Pełny output — nie obcinaj długich wyników w raporcie",
+        help="Keep full command output in the Markdown report",
     )
     diag_parser.add_argument(
         "--snapshot",
         "-s",
         type=str,
         default=None,
-        help="Zapisz migawkę JSON (np. snapshot.json)",
+        help="Write a JSON snapshot (for example, snapshot.json)",
+    )
+    diag_parser.add_argument(
+        "--print-report",
+        action="store_true",
+        help="Print the full Markdown report after the summary",
+    )
+    diag_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed diagnostic progress",
     )
 
-    # ── Komenda compare ──────────────────────────────────────────
-    cmp_parser = subparsers.add_parser("compare", help="Porównaj dwie migawki JSON")
-    cmp_parser.add_argument("old", help="Ścieżka do starej migawki JSON")
-    cmp_parser.add_argument("new", help="Ścieżka do nowej migawki JSON")
+    # ── Compare command ───────────────────────────────────────────
+    cmp_parser = subparsers.add_parser("compare", help="Compare two JSON snapshots")
+    cmp_parser.add_argument("old", help="Path to the older JSON snapshot")
+    cmp_parser.add_argument("new", help="Path to the newer JSON snapshot")
     cmp_parser.add_argument(
         "--output",
         "-o",
         type=str,
         default=None,
-        help="Zapisz raport porównania do pliku Markdown",
+        help="Write the comparison report to a Markdown file",
     )
 
     args = parser.parse_args()
 
-    # ── Obsługa compare ──────────────────────────────────────────
+    # ── Compare handling ──────────────────────────────────────────
     if args.command == "compare":
         try:
             old_snapshot = SystemSnapshot.from_json(args.old)
@@ -6023,23 +6177,8 @@ def main() -> None:
         print(md)
         return
 
-    # ── Obsługa run (domyślna) ───────────────────────────────────
+    # ── Run handling (default) ────────────────────────────────────
     cmd_args = args if hasattr(args, "output_dir") else parser.parse_args(["run"])
-
-    if not getattr(cmd_args, "quiet", False):
-        print("╔══════════════════════════════════════════════╗", file=sys.stderr)
-        print("║   Linux Diagnostic Engine (LDE)             ║", file=sys.stderr)
-        print("║   Tylko do odczytu | Bez sudo | Bez zmian   ║", file=sys.stderr)
-        print("╚══════════════════════════════════════════════╝", file=sys.stderr)
-        print(
-            f"  Produkt: {PRODUCT_NAME} ({PRODUCT_SHORT_NAME}) {PRODUCT_VERSION}",
-            file=sys.stderr,
-        )
-        print(
-            f"  Start: {datetime.datetime.now().strftime('%H:%M:%S')}",
-            file=sys.stderr,
-        )
-        print("", file=sys.stderr)
 
     output_dir = getattr(cmd_args, "output_dir", None)
     if output_dir is None:
@@ -6047,12 +6186,26 @@ def main() -> None:
     quiet = getattr(cmd_args, "quiet", False)
     full = getattr(cmd_args, "full", False)
     snapshot_path = getattr(cmd_args, "snapshot", None)
+    print_report = getattr(cmd_args, "print_report", False)
+    verbose = getattr(cmd_args, "verbose", False)
 
-    engine = SysCheckEngine(output_dir=output_dir, quiet=quiet, full=full)
+    if not quiet:
+        print("Running diagnostics...", file=sys.stderr, flush=True)
+
+    # The engine's existing diagnostic progress is reserved for --verbose;
+    # default output stays compact without changing collection or rules.
+    engine = SysCheckEngine(
+        output_dir=output_dir,
+        quiet=quiet or not verbose,
+        full=full,
+    )
     try:
         report_path = Path(engine.run_all()).expanduser().resolve()
     except FileExistsError as exc:
         _cli_error(str(exc))
+
+    if not quiet:
+        print("Diagnostics complete.", file=sys.stderr, flush=True)
 
     # Save snapshot if requested
     if snapshot_path:
@@ -6061,25 +6214,21 @@ def main() -> None:
             snap.to_json(snapshot_path)
         except FileExistsError as exc:
             _cli_error(str(exc))
-        print(f"\nSnapshot saved to: {snapshot_path}")
+        snapshot_message = f"Snapshot saved to: {snapshot_path}"
+    else:
+        snapshot_message = None
 
     try:
         report_content = report_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         _cli_error(f"Cannot read generated report: {exc}")
 
-    print(f"\n{'=' * 72}")
-    print(f"Pełna ścieżka raportu: {report_path}")
-    print(f"{'=' * 72}")
-    print(f"\nLiczba wykrytych problemów: {len(engine.findings)}")
-    print(f"Liczba ograniczeń:         {len(engine.restrictions)}")
-    print(f"Liczba wykonanych poleceń: {len(engine.commands_used)}")
-    print(f"Liczba obserwacji:         {len(engine.observations)}")
-    if full:
-        print("Tryb:                      --full (pełny output)")
-    print(f"\n{'─' * 72}")
-
-    print(report_content)
+    sys.stdout.write(format_cli_summary(engine, report_path))
+    if snapshot_message:
+        print(snapshot_message)
+    if print_report:
+        print("\nFull Markdown report:")
+        sys.stdout.write(report_content)
 
 
 if __name__ == "__main__":

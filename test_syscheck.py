@@ -67,6 +67,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _parse_storage_usage,
     _write_new_text,
     confidence_tag,
+    determine_cli_status,
     run_cmd,
     severity_tag,
 )
@@ -12037,14 +12038,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.1.2`" in report
+        assert "**Wersja produktu:** `0.1.3`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.1.2" in report
+        assert "Linux Diagnostic Engine 0.1.3" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -12087,7 +12088,7 @@ class TestIteration011RealWorldCorrectness:
         captured = capsys.readouterr()
 
         assert report.is_file()
-        assert f"Pełna ścieżka raportu: {report.resolve()}" in captured.out
+        assert f"  {report.resolve()}" in captured.out
 
     def test_failed_cli_run_does_not_print_success_report_path(
         self, monkeypatch, capsys
@@ -12114,7 +12115,7 @@ class TestIteration011RealWorldCorrectness:
 
         captured = capsys.readouterr()
         assert exc_info.value.code == 1
-        assert "Pełna ścieżka raportu:" not in captured.out
+        assert "Report:" not in captured.out
         assert "Destination report already exists" in captured.err
 
     def test_unreadable_generated_report_does_not_print_success_path(
@@ -12144,5 +12145,256 @@ class TestIteration011RealWorldCorrectness:
 
         captured = capsys.readouterr()
         assert exc_info.value.code == 1
-        assert "Pełna ścieżka raportu:" not in captured.out
+        assert "Report:" not in captured.out
         assert "Cannot read generated report" in captured.err
+
+
+class TestV013CliPresentationStabilization:
+    """Public CLI presentation contract for the v0.1.3 release."""
+
+    @staticmethod
+    def _finding(severity):
+        return Finding(
+            finding_id=f"F-{severity}",
+            title="Synthetic finding",
+            severity=severity,
+            confidence="Certain",
+        )
+
+    @pytest.mark.parametrize(
+        ("severities", "expected"),
+        [
+            ([], "HEALTHY"),
+            (["Info"], "HEALTHY"),
+            (["P3"], "ATTENTION"),
+            (["P2", "P3"], "ATTENTION"),
+            (["P1"], "PROBLEMS"),
+            (["P0", "P2"], "PROBLEMS"),
+        ],
+    )
+    def test_status_is_deterministic_from_findings_only(self, severities, expected):
+        findings = [self._finding(severity) for severity in severities]
+        assert determine_cli_status(findings) == expected
+
+    @staticmethod
+    def _patch_engine(monkeypatch, tmp_path, syscheck, *, findings=None):
+        class FakeEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                self.output_dir = output_dir
+                self.findings = list(findings or [])
+                self.restrictions = []
+                self.commands_used = []
+                self.observations = []
+
+            def run_all(self):
+                report = os.path.join(self.output_dir, "lde-test-report.md")
+                os.makedirs(self.output_dir, exist_ok=True)
+                syscheck._write_new_text(
+                    report,
+                    "# generated report\n\nStage 1: RAW\nStage 2: OBS\nStage 3: INT\n",
+                )
+                return report
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FakeEngine)
+
+    def test_default_run_is_compact_and_does_not_print_markdown_report(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import syscheck
+
+        self._patch_engine(
+            monkeypatch,
+            tmp_path,
+            syscheck,
+            findings=[self._finding("P2")],
+        )
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            ["lde", "run", "--output-dir", str(tmp_path)],
+        )
+
+        syscheck.main()
+        captured = capsys.readouterr()
+
+        assert "Running diagnostics..." in captured.err
+        assert "Stage 1" not in captured.out + captured.err
+        assert "RAW" not in captured.out + captured.err
+        assert "HEALTH STATUS    ! ATTENTION" in captured.out
+        assert "System" in captured.out
+        assert "Collecting diagnostics" in captured.out
+        assert "Analyzing evidence" in captured.out
+        assert "Confirmed problems" in captured.out
+        assert "Analysis limitations" in captured.out
+        assert "# generated report" not in captured.out
+
+    def test_print_report_explicitly_emits_full_markdown_report(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import syscheck
+
+        self._patch_engine(monkeypatch, tmp_path, syscheck)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "lde",
+                "run",
+                "--quiet",
+                "--output-dir",
+                str(tmp_path),
+                "--print-report",
+            ],
+        )
+
+        syscheck.main()
+        captured = capsys.readouterr()
+
+        assert "Full Markdown report:" in captured.out
+        assert "# generated report" in captured.out
+        assert "Stage 1: RAW" in captured.out
+        assert captured.out.count("# generated report") == 1
+
+    def test_verbose_uses_existing_detailed_progress_without_changing_engine_contract(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import syscheck
+
+        created = {}
+
+        class FakeEngine:
+            def __init__(self, output_dir, quiet=False, full=False):
+                created["quiet"] = quiet
+                self.quiet = quiet
+                self.findings = []
+                self.restrictions = []
+                self.commands_used = []
+                self.observations = []
+
+            def run_all(self):
+                if not self.quiet:
+                    print("Detailed collection progress", file=syscheck.sys.stderr)
+                report = tmp_path / "lde-test-report.md"
+                syscheck._write_new_text(report, "# report\n")
+                return str(report)
+
+        monkeypatch.setattr(syscheck, "SysCheckEngine", FakeEngine)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            ["lde", "run", "--verbose", "--output-dir", str(tmp_path)],
+        )
+
+        syscheck.main()
+        captured = capsys.readouterr()
+
+        assert created["quiet"] is False
+        assert "HEALTH STATUS    ✓ HEALTHY" in captured.out
+        assert "Running diagnostics..." in captured.err
+        assert "Detailed collection progress" in captured.err
+        assert "# report" not in captured.out
+
+    def test_verbose_and_print_report_combine_without_report_duplication(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        import syscheck
+
+        self._patch_engine(monkeypatch, tmp_path, syscheck)
+        monkeypatch.setattr(
+            syscheck.sys,
+            "argv",
+            [
+                "lde",
+                "run",
+                "--verbose",
+                "--print-report",
+                "--output-dir",
+                str(tmp_path),
+            ],
+        )
+
+        syscheck.main()
+        captured = capsys.readouterr()
+
+        assert captured.out.count("# generated report") == 1
+
+    def test_verbose_section_labels_are_english(self, capsys, tmp_path):
+        engine = SysCheckEngine(output_dir=str(tmp_path), quiet=False)
+
+        engine.log_section("Identyfikacja środowiska")
+
+        captured = capsys.readouterr()
+        assert "=== Environment identification ===" in captured.err
+        assert "Identyfikacja" not in captured.err
+
+    def test_status_ansi_is_tty_only_and_no_color_wins(self, monkeypatch, tmp_path):
+        import syscheck
+
+        class TTY:
+            def isatty(self):
+                return True
+
+        class Pipe:
+            def isatty(self):
+                return False
+
+        engine = type(
+            "Engine",
+            (),
+            {
+                "findings": [self._finding("P1")],
+                "restrictions": [],
+                "commands_used": [],
+                "observations": [],
+            },
+        )()
+        report = str(tmp_path / "report.md")
+
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        colored = syscheck.format_cli_summary(engine, report, stream=TTY())
+        assert "\033[31mPROBLEMS\033[0m" in colored
+
+        piped = syscheck.format_cli_summary(engine, report, stream=Pipe())
+        assert "\033[" not in piped
+
+        monkeypatch.setenv("NO_COLOR", "")
+        no_color = syscheck.format_cli_summary(engine, report, stream=TTY())
+        assert "\033[" not in no_color
+
+    def test_summary_width_fallback_is_safe_for_narrow_or_broken_terminals(
+        self, monkeypatch, tmp_path
+    ):
+        import syscheck
+
+        class Pipe:
+            def isatty(self):
+                return False
+
+        engine = type(
+            "Engine",
+            (),
+            {
+                "findings": [],
+                "restrictions": [],
+                "commands_used": [],
+                "observations": [],
+            },
+        )()
+        monkeypatch.setattr(
+            syscheck.shutil,
+            "get_terminal_size",
+            lambda fallback: os.terminal_size((1, 24)),
+        )
+        narrow = syscheck.format_cli_summary(
+            engine, str(tmp_path / "report.md"), stream=Pipe()
+        )
+        assert "HEALTH STATUS    ✓ HEALTHY" in narrow
+        assert "-\n" in narrow
+
+        def broken_terminal(_fallback):
+            raise OSError("no terminal")
+
+        monkeypatch.setattr(syscheck.shutil, "get_terminal_size", broken_terminal)
+        assert "HEALTH STATUS    ✓ HEALTHY" in syscheck.format_cli_summary(
+            engine, str(tmp_path / "report.md"), stream=Pipe()
+        )
