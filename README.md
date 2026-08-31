@@ -31,7 +31,7 @@ Install it into an isolated virtual environment:
 
 ```text
 uv venv /tmp/lde-venv
-uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.1.5-py3-none-any.whl
+uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.2.0-py3-none-any.whl
 ```
 
 The installed command is `lde`:
@@ -43,8 +43,8 @@ The installed command is `lde`:
 /tmp/lde-venv/bin/lde compare --help
 ```
 
-The public product version is `0.1.5`; `lde --version` prints
-`Linux Diagnostic Engine 0.1.5`. Without `--output-dir`, reports are written
+The public product version is `0.2.0`; `lde --version` prints
+`Linux Diagnostic Engine 0.2.0`. Without `--output-dir`, reports are written
 to `$XDG_DATA_HOME/lde/reports` or `~/.local/share/lde/reports`; an explicit
 `--output-dir` still overrides this default. A successful `lde run` prints a
 compact English summary with the exact absolute report path. Use

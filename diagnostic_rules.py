@@ -1680,6 +1680,22 @@ class FailedUserUnitRule(DiagnosticRule):
         )
 
 
+class SystemdUserSourceFailureRule(DiagnosticRule):
+    """Retain user-systemd query failures as evidence without a service Finding."""
+
+    rule_id = "RULE-SYSTEMD-USER-SOURCE-FAILURE"
+    supported_categories = frozenset({"systemd_user_source_failure"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        return DiagnosticRuleResult(
+            finding=None,
+            evidence=(self._evidence_builder.build(observation),),
+        )
+
+
 class KernelCountRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-COUNT"
     supported_categories = frozenset({"kernel_count"})
@@ -1929,6 +1945,7 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         IommuFaultRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
+        SystemdUserSourceFailureRule(eb),
         KernelCountRule(eb),
         BootDelayRule(eb),
         StorageUsageRule(eb),

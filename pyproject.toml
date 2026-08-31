@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linux-diagnostic-engine"
-version = "0.1.5"
+version = "0.2.0"
 description = "Read-only Linux system diagnostics and snapshot comparison CLI"
 readme = "README.md"
 license = "MIT"

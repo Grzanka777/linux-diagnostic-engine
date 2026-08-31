@@ -491,6 +491,173 @@ Legend: LOAD   \u2192 Reflects whether the unit definition was properly loaded.
         assert "niri-session.service" in units
 
 
+class TestUserSystemdSourceContract:
+    """Post-v0.1.5 contract for user-systemd failed-unit query states."""
+
+    @staticmethod
+    def _result(
+        stdout: str = "",
+        *,
+        stderr: str = "",
+        return_code: int = 0,
+        execution_status: str = "ok",
+        truncated: bool = False,
+    ) -> CmdResult:
+        return CmdResult(
+            command="systemctl --user --failed --no-pager",
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            execution_status=execution_status,
+            truncated=truncated,
+        )
+
+    def _collect(self, usr_failed: CmdResult) -> SysCheckEngine:
+        from unittest.mock import patch
+
+        ok = self._result()
+        analyze = self._result("Startup finished in 0s (userspace) = 0s.")
+        results = {
+            "sys_failed": ok,
+            "usr_failed": usr_failed,
+            "analyze": analyze,
+            "blame": ok,
+            "critical": ok,
+            "timers": ok,
+            "usr_timers": ok,
+            "auto_restart": ok,
+            "restarting": ok,
+        }
+        engine = SysCheckEngine(output_dir="/tmp/test_user_systemd_contract")
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=results):
+            engine.collect_systemd()
+        return engine
+
+    def test_authoritative_zero_units_has_no_diagnostic(self):
+        result = self._result(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n\n0 loaded units listed."
+        )
+
+        engine = self._collect(result)
+
+        assert not [
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "systemd_user_source_failure"
+        ]
+        assert not any(
+            "user systemd" in restriction.lower() for restriction in engine.restrictions
+        )
+
+    def test_truncated_zero_units_is_not_authoritative(self):
+        result = self._result(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n\n0 loaded units listed.",
+            truncated=True,
+        )
+
+        engine = self._collect(result)
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "systemd_user_source_failure"
+        )
+        assert raw.payload["capture_truncated"] is True
+        assert raw.payload["failure_kind"] == "malformed_output"
+        assert not any(f.finding_id == "SYSD-USR-FAIL-001" for f in engine.findings)
+
+    def test_failed_user_unit_remains_a_failed_unit_finding(self):
+        result = self._result(
+            "UNIT LOAD ACTIVE SUB DESCRIPTION\n"
+            "\u25cf example.service loaded failed failed Example"
+        )
+
+        engine = self._collect(result)
+        engine._derive_observations()
+        engine._interpret()
+
+        assert any(f.finding_id == "SYSD-USR-FAIL-001" for f in engine.findings)
+        assert not any(
+            raw.category == "systemd_user_source_failure"
+            for raw in engine.raw_diagnostics
+        )
+
+    @pytest.mark.parametrize(
+        ("execution_status", "return_code", "stderr"),
+        [
+            ("error", 1, "Failed to connect to user scope bus"),
+            ("timeout", -2, "Timeout (5s): systemctl --user --failed"),
+            ("not_found", -1, "Polecenie nie znalezione"),
+            ("permission_denied", -3, "Brak uprawnień"),
+        ],
+    )
+    def test_query_failure_is_not_a_failed_user_service(
+        self, execution_status, return_code, stderr
+    ):
+        result = self._result(
+            stderr=stderr,
+            return_code=return_code,
+            execution_status=execution_status,
+        )
+
+        engine = self._collect(result)
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "systemd_user_source_failure"
+        )
+        assert raw.source_id == "SYSD-USR-SOURCE-FAIL-001"
+        assert raw.payload["failure_kind"] == "source_failure"
+        assert raw.payload["stderr"] == stderr
+        assert raw.payload["return_code"] == return_code
+        assert raw.provenance["execution_status"] == execution_status
+        observation = next(
+            obs
+            for obs in engine.observations
+            if obs.category == "systemd_user_source_failure"
+        )
+        assert observation.data_complete is False
+        assert raw.source_id in observation.source_raw_ids
+        assert not any(f.finding_id == "SYSD-USR-FAIL-001" for f in engine.findings)
+        accounting = next(
+            item
+            for item in engine.pipeline_accounting
+            if item["raw_source_id"] == raw.source_id
+        )
+        assert accounting["outcome"] == "rejected"
+        assert accounting["reason"] == "user_systemd_query_unavailable"
+        assert any(
+            "user systemd" in restriction.lower() for restriction in engine.restrictions
+        )
+
+    def test_successful_malformed_output_is_non_authoritative(self):
+        result = self._result("systemctl returned an unexpected response")
+
+        engine = self._collect(result)
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "systemd_user_source_failure"
+        )
+        assert raw.payload["failure_kind"] == "malformed_output"
+        assert raw.payload["authoritative"] is False
+        assert not any(f.finding_id == "SYSD-USR-FAIL-001" for f in engine.findings)
+        accounting = next(
+            item
+            for item in engine.pipeline_accounting
+            if item["raw_source_id"] == raw.source_id
+        )
+        assert accounting["reason"] == "user_systemd_query_non_authoritative"
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Test 7: Missing nvme executable
 # ═══════════════════════════════════════════════════════════════════
@@ -5738,7 +5905,7 @@ class TestBootTimeCollector:
 
         results = {
             "sys_failed": self._cmd_ok(""),
-            "usr_failed": self._cmd_ok(""),
+            "usr_failed": self._cmd_ok("0 loaded units listed."),
             "analyze": self._cmd_ok(""),
             "blame": self._cmd_ok(""),
             "critical": self._cmd_ok(""),
@@ -5974,7 +6141,7 @@ class TestBootTimeEndToEnd:
         )
         results = {
             "sys_failed": self._cmd_ok(""),
-            "usr_failed": self._cmd_ok(""),
+            "usr_failed": self._cmd_ok("0 loaded units listed."),
             "analyze": self._cmd_ok(analyze),
             "blame": self._cmd_ok(blame),
             "critical": self._cmd_ok(critical),
@@ -6031,7 +6198,7 @@ class TestBootTimeEndToEnd:
         )
         results = {
             "sys_failed": self._cmd_ok(""),
-            "usr_failed": self._cmd_ok(""),
+            "usr_failed": self._cmd_ok("0 loaded units listed."),
             "analyze": self._cmd_ok(analyze),
             "blame": self._cmd_ok("5.553s graphical.target"),
             "critical": self._cmd_ok("graphical.target @5.553s"),
@@ -12116,7 +12283,7 @@ class TestIteration011RealWorldCorrectness:
         engine = SysCheckEngine(output_dir="/tmp/test_v011_systemd")
         results = {
             "sys_failed": self._systemd_result(""),
-            "usr_failed": self._systemd_result(""),
+            "usr_failed": self._systemd_result("0 loaded units listed."),
             "analyze": self._systemd_result(analyze),
             "blame": self._systemd_result(blame),
             "critical": self._systemd_result(critical),
@@ -12326,14 +12493,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.1.5`" in report
+        assert "**Wersja produktu:** `0.2.0`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.1.5" in report
+        assert "Linux Diagnostic Engine 0.2.0" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod

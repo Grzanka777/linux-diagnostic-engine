@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.1.5
+Wersja produktu:                         0.2.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -248,6 +248,7 @@ class DiagnosticDomain(str, Enum):
 
 class FindingKind(str, Enum):
     FAILED_UNIT = "failed_unit"
+    SOURCE_FAILURE = "source_failure"
     STORAGE_USAGE = "storage_usage"
     SCRUB_STATUS = "scrub_status"
     DEVICE_ERROR = "device_error"
@@ -1223,6 +1224,12 @@ class FindingClassificationPolicy:
             Actionability.ACTIONABLE,
             RecommendationIntent.REMEDIATE,
         ),
+        "systemd_user_source_failure": FindingClassification(
+            DiagnosticDomain.SYSTEMD,
+            FindingKind.SOURCE_FAILURE,
+            Actionability.CONDITIONAL,
+            RecommendationIntent.VERIFY,
+        ),
         "segfault_minor": FindingClassification(
             DiagnosticDomain.KERNEL,
             FindingKind.SEGFAULT,
@@ -1473,6 +1480,30 @@ class EvidenceBuilder:
         d = observation.details
         oid = observation.obs_id
         eid = f"EVIDENCE-{oid}-001"
+        if cat == "systemd_user_source_failure":
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.COMMAND_RESULT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    "User systemd failed-unit query was not authoritative; "
+                    "failed user services were not inferred"
+                ),
+                data={
+                    "scope": d.get("scope", "user"),
+                    "query": d.get("query", ""),
+                    "failure_kind": d.get("failure_kind", ""),
+                    "authoritative": bool(d.get("authoritative", False)),
+                    "execution_status": d.get("execution_status", ""),
+                    "return_code": d.get("return_code"),
+                    "stdout": d.get("stdout", ""),
+                    "stderr": d.get("stderr", ""),
+                },
+                strength=EvidenceStrength.WEAK,
+                directness=EvidenceDirectness.DIRECT,
+                completeness=EvidenceCompleteness.PARTIAL,
+            )
         if cat == "systemd_failed":
             return Evidence(
                 evidence_id=eid,
@@ -2345,6 +2376,7 @@ DuplicateEvidenceError = _diagnostic_rules.DuplicateEvidenceError
 DuplicateFindingError = _diagnostic_rules.DuplicateFindingError
 FailedSystemUnitRule = _diagnostic_rules.FailedSystemUnitRule
 FailedUserUnitRule = _diagnostic_rules.FailedUserUnitRule
+SystemdUserSourceFailureRule = _diagnostic_rules.SystemdUserSourceFailureRule
 FilesystemIoErrorRule = _diagnostic_rules.FilesystemIoErrorRule
 GeneralSegfaultRule = _diagnostic_rules.GeneralSegfaultRule
 GpuI915HangRule = _diagnostic_rules.GpuI915HangRule
@@ -2494,6 +2526,10 @@ class SysCheckEngine:
             and details.get("scrub_status") == "scrub_inactive"
         ):
             return "btrfs_scrub_inactive"
+        if observation.category == "systemd_user_source_failure":
+            if details.get("failure_kind") == "malformed_output":
+                return "user_systemd_query_non_authoritative"
+            return "user_systemd_query_unavailable"
         return "rule_returned_no_finding"
 
     def _refresh_pipeline_accounting(self) -> None:
@@ -3925,8 +3961,8 @@ class SysCheckEngine:
 
         # Analiza user failed units
         usr_failed = r["usr_failed"]
-        if usr_failed.is_ok() and self._has_failed_units(usr_failed.stdout):
-            _failed_units = self._extract_failed_unit_names(usr_failed.stdout)
+        user_failed_state, _failed_units = self._classify_user_failed_units(usr_failed)
+        if user_failed_state == "failed":
             self.raw_diagnostics.append(
                 _raw_from_result(
                     usr_failed,
@@ -3934,6 +3970,45 @@ class SysCheckEngine:
                     category="systemd_failed",
                     payload={"scope": "user", "units": _failed_units},
                 )
+            )
+        elif user_failed_state in {"source_failure", "malformed_output"}:
+            self.raw_diagnostics.append(
+                _raw_from_result(
+                    usr_failed,
+                    source_id="SYSD-USR-SOURCE-FAIL-001",
+                    category="systemd_user_source_failure",
+                    payload={
+                        "scope": "user",
+                        "query": usr_failed.command,
+                        "failure_kind": user_failed_state,
+                        "authoritative": False,
+                        "execution_status": usr_failed.execution_status,
+                        "return_code": usr_failed.return_code,
+                        "stdout": usr_failed.stdout,
+                        "stderr": usr_failed.stderr,
+                    },
+                )
+            )
+            if user_failed_state == "source_failure":
+                restriction = (
+                    "User systemd failed-unit query unavailable; user service state "
+                    "is unknown "
+                )
+            else:
+                restriction = (
+                    "User systemd failed-unit query returned non-authoritative "
+                    "output; user service state is unknown "
+                )
+            restriction += (
+                f"(status={usr_failed.execution_status}, rc={usr_failed.return_code})."
+            )
+            if usr_failed.stderr:
+                restriction += f" Captured stderr: {usr_failed.stderr}"
+            self.restrictions.append(restriction)
+            self.report_lines.append(
+                "ℹ️ Nie można potwierdzić stanu nieudanych usług użytkownika; "
+                "błąd lub nieautorytatywny wynik źródła nie jest traktowany jako "
+                "nieudana usługa.\n\n"
             )
 
         # Analiza boot time — korelacja blame z critical-chain
@@ -4033,6 +4108,25 @@ class SysCheckEngine:
                 )
 
     # ── Pomocnicze do analizy jednostek systemd ──────────────────
+    @classmethod
+    def _classify_user_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
+        """Classify user-systemd failed-unit query authority before interpretation."""
+        if result.execution_status == "empty_ok":
+            return "malformed_output", []
+        if not result.is_ok():
+            return "source_failure", []
+        if result.truncated:
+            return "malformed_output", []
+
+        output = result.stdout.strip()
+        if re.search(r"(?im)^\s*0 loaded units listed\.?\s*$", output):
+            return "zero", []
+        if cls._has_failed_units(output):
+            units = cls._extract_failed_unit_names(output)
+            if units:
+                return "failed", units
+        return "malformed_output", []
+
     @staticmethod
     def _has_failed_units(output: str) -> bool:
         """Sprawdza czy są jakieś failed jednostki."""
@@ -4531,6 +4625,18 @@ class SysCheckEngine:
                 details={**payload},
                 direct_measurement=True,
                 data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "systemd_user_source_failure":
+            return Observation(
+                obs_id="SYSD-USR-SOURCE-FAIL-001",
+                category="systemd_user_source_failure",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=False,
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,
