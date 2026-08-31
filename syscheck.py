@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.1.4
+Wersja produktu:                         0.1.5
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:

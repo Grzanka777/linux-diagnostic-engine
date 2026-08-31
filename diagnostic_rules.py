@@ -1210,7 +1210,7 @@ class KernelRcuStallRule(DiagnosticRule):
         )
         recommended_diagnostics = (
             "Przeanalizuj szczegóły dotyczące zablokowanego okresu łaski RCU w dzienniku jądra:\n"
-            "`journalctl -b -k --no-pager | grep -C 20 -iE 'rcu.*(?:detected.*stall|starved)'`\n"
+            "`journalctl -b -k --no-pager | grep -C 20 -iP 'rcu.*(?:detected.*stall|starved)'`\n"
             "Zwróć uwagę na maskę zablokowanych CPU i stan procedur obsługi wywołań zwrotnych (callbacks)."
         )
         remediation = (
@@ -1219,7 +1219,7 @@ class KernelRcuStallRule(DiagnosticRule):
         )
         verification = (
             "Sprawdź obecność nowych komunikatów o zablokowaniach RCU w dzienniku jądra:\n"
-            "`journalctl -b -k --no-pager | grep -iE 'rcu.*(?:detected.*stall|starved)'`."
+            "`journalctl -b -k --no-pager | grep -iP 'rcu.*(?:detected.*stall|starved)'`."
         )
         risk_level = "Wysokie (P1). Zablokowanie podsystemu RCU uniemożliwia zwalnianie struktur pamięci jądra i może prowadzić do wyczerpania pamięci lub załamania całego systemu."
 
@@ -1275,7 +1275,7 @@ class PlatformAcpiFirmwareErrorRule(DiagnosticRule):
         )
         recommended_diagnostics = (
             "Przeanalizuj komunikaty o błędach ACPI w dzienniku jądra:\n"
-            "`journalctl -b -k --no-pager | grep -C 5 -iE 'ACPI (?:BIOS )?(?:Error|Exception)'`\n"
+            "`journalctl -b -k --no-pager | grep -C 5 -iP 'ACPI (?:BIOS )?(?:Error|Exception)'`\n"
             "Sprawdź dostępność aktualizacji oprogramowania układowego UEFI/BIOS u producenta płyty głównej."
         )
         remediation = (
@@ -1284,7 +1284,7 @@ class PlatformAcpiFirmwareErrorRule(DiagnosticRule):
         )
         verification = (
             "Sprawdź, czy po restarcie w dzienniku jądra nadal pojawiają się błędy ACPI:\n"
-            "`journalctl -b -k --no-pager | grep -iE 'ACPI (?:BIOS )?(?:Error|Exception)'`."
+            "`journalctl -b -k --no-pager | grep -iP 'ACPI (?:BIOS )?(?:Error|Exception)'`."
         )
         risk_level = "Średnie (P2). Błędy interpretera ACPI mogą prowadzić do nieprawidłowego zarządzania zasilaniem, braku dostępu do czujników lub niepoprawnego usypiania/wybudzania systemu."
 

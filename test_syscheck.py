@@ -89,6 +89,28 @@ REAL_BTRFS_LIMITED_MISSING_LINE = (
 )
 
 
+def _extract_single_backticked_command(text: str) -> str:
+    commands = re.findall(r"`([^`]+)`", text)
+    assert len(commands) == 1, text
+    return commands[0]
+
+
+def _run_exact_recommendation_command(command: str, replay_input: str, tmp_path: Path):
+    journalctl = tmp_path / "journalctl"
+    journalctl.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+    journalctl.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join((str(tmp_path), env.get("PATH", "")))
+    return subprocess.run(
+        ["bash", "-c", command],
+        input=replay_input,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
 class TestDiagnosticRuleImportBoundary:
     """Iteration 33A: keep the extracted runtime import boundary safe."""
 
@@ -10959,7 +10981,7 @@ class TestKernelStallReliabilityPack:
         assert finding.kind == FindingKind.KERNEL_HUNG_TASK
         assert "Kernel Hung Task" in finding.title
 
-    def test_collector_emits_rcu_stall_p1(self):
+    def test_collector_emits_rcu_stall_p1(self, tmp_path):
         from syscheck import FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_rcu_stall")
@@ -10973,6 +10995,22 @@ class TestKernelStallReliabilityPack:
         assert finding.severity == "P1"
         assert finding.kind == FindingKind.KERNEL_RCU_STALL
         assert "Kernel RCU Stall" in finding.title
+        for field_name in ("recommended_diagnostics", "verification"):
+            command = _extract_single_backticked_command(getattr(finding, field_name))
+            result = _run_exact_recommendation_command(command, line, tmp_path)
+            assert result.args == ["bash", "-c", command]
+            assert result.returncode == 0, f"{field_name}: {result.stderr}"
+            assert result.stdout.splitlines() == [line]
+            assert result.stderr == ""
+
+            negative = _run_exact_recommendation_command(
+                command,
+                "kernel: rcu: Hierarchical RCU implementation.\n",
+                tmp_path,
+            )
+            assert negative.returncode == 1, f"{field_name}: {negative.stderr}"
+            assert negative.stdout == ""
+            assert negative.stderr == ""
 
     def test_collector_coexistence_all_four_stall_families_in_shared_capture(self):
         engine = SysCheckEngine(output_dir="/tmp/test_stall_coexistence")
@@ -11337,7 +11375,7 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert finding.domain == DiagnosticDomain.HARDWARE
         assert "ACPI" in finding.title
 
-    def test_real_acpi_replay_reaches_finding_once_with_lineage(self):
+    def test_real_acpi_replay_reaches_finding_once_with_lineage(self, tmp_path):
         from shlex import quote
 
         replay = run_cmd(
@@ -11380,6 +11418,24 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert observations[0].source_raw_ids == (raw[0].source_id,)
         assert findings[0].source_observation_ids == (observations[0].obs_id,)
         assert findings[0].evidence_ids == (evidence[0].evidence_id,)
+        for field_name in ("recommended_diagnostics", "verification"):
+            command = _extract_single_backticked_command(
+                getattr(findings[0], field_name)
+            )
+            result = _run_exact_recommendation_command(
+                command, REAL_ACPI_REPLAY_LINE + "\n", tmp_path
+            )
+            assert result.args == ["bash", "-c", command]
+            assert result.returncode == 0, f"{field_name}: {result.stderr}"
+            assert result.stdout.splitlines() == [REAL_ACPI_REPLAY_LINE]
+            assert result.stderr == ""
+
+            negative = _run_exact_recommendation_command(
+                command, "kernel: ACPI: Interpreter enabled\n", tmp_path
+            )
+            assert negative.returncode == 1, f"{field_name}: {negative.stderr}"
+            assert negative.stdout == ""
+            assert negative.stderr == ""
         assert engine.pipeline_accounting == [
             {
                 "raw_source_id": raw[0].source_id,
@@ -12270,14 +12326,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.1.4`" in report
+        assert "**Wersja produktu:** `0.1.5`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.1.4" in report
+        assert "Linux Diagnostic Engine 0.1.5" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -12382,7 +12438,7 @@ class TestIteration011RealWorldCorrectness:
 
 
 class TestV013CliPresentationStabilization:
-    """Public CLI presentation contract for the v0.1.4 release."""
+    """Public CLI presentation contract for the v0.1.5 release."""
 
     @staticmethod
     def _finding(severity):
