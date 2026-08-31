@@ -1,0 +1,2 @@
+Aug 31 08:13:01 synthetic-host kernel: NETDEV WATCHDOG: eth0: transmit queue 0 timed out
+Aug 31 08:13:02 synthetic-host kernel: e1000e 0000:00:19.0: Detected Tx Unit Hang

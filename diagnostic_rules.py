@@ -1549,6 +1549,160 @@ class IommuFaultRule(DiagnosticRule):
         )
 
 
+class NetworkManagerActivationFailureRule(DiagnosticRule):
+    rule_id = "RULE-NETWORK-NM-ACTIVATION-FAILURE"
+    supported_categories = frozenset({"network_manager_activation_failure"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("activation_failure_detected"):
+            return DiagnosticRuleResult()
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence = (self._evidence_builder.build(observation),)
+        command = (
+            "`journalctl -b -u NetworkManager --no-pager | grep -iP "
+            "'Activation:\\s+failed\\s+for\\s+connection\\b'`"
+        )
+        finding = _syscheck().Finding(
+            finding_id=obs_id,
+            title="NetworkManager zgłosił nieudaną aktywację połączenia",
+            severity="P2",
+            confidence=conf,
+            evidence=str(observation.details.get("matched_lines", [])),
+            interpretation=(
+                "Dziennik jednostki NetworkManager zawiera jawny marker "
+                "nieudanej aktywacji połączenia w bieżącym rozruchu. "
+                "To potwierdza zdarzenie, ale nie rozstrzyga, czy przyczyną "
+                "był DHCP, uwierzytelnienie, nośnik lub konfiguracja."
+            ),
+            recommended_diagnostics=command,
+            remediation=(
+                "Zachowaj dokładne linie zdarzenia i zweryfikuj stan urządzenia, "
+                "profilu oraz DHCP; LDE nie zmienia konfiguracji sieci."
+            ),
+            verification=f"{command} — brak wyników dla kolejnego rozruchu.",
+            risk_level="Średnie; połączenie mogło być niedostępne lub niestabilne.",
+            domain=classification.domain,
+            kind=classification.kind,
+            actionability=classification.actionability,
+            recommendation_intent=classification.recommendation_intent,
+            source_observation_ids=(obs_id,),
+            evidence_ids=(evidence[0].evidence_id,),
+        )
+        return DiagnosticRuleResult(finding=finding, evidence=evidence)
+
+
+class NetworkDeviceWatchdogRule(DiagnosticRule):
+    rule_id = "RULE-NETWORK-DEVICE-WATCHDOG"
+    supported_categories = frozenset({"network_device_watchdog"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("watchdog_detected"):
+            return DiagnosticRuleResult()
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence = (self._evidence_builder.build(observation),)
+        command = (
+            "`journalctl -b -k --no-pager | grep -iP "
+            "'NETDEV WATCHDOG:\\s+\\S+:\\s+transmit queue\\s+\\d+\\s+timed out|"
+            "Detected Tx Unit Hang'`"
+        )
+        finding = _syscheck().Finding(
+            finding_id=obs_id,
+            title="Kernel zgłosił watchdog kolejki transmisji urządzenia sieciowego",
+            severity="P1",
+            confidence=conf,
+            evidence=str(observation.details.get("matched_lines", [])),
+            interpretation=(
+                "Kernel zarejestrował jawny timeout kolejki transmisji albo "
+                "marker Tx Unit Hang. To jest bezpośredni sygnał awarii lub "
+                "zawieszenia ścieżki urządzenie/sterownik; nie przypisuje "
+                "przyczyny do konkretnego komponentu."
+            ),
+            recommended_diagnostics=command,
+            remediation=(
+                "Porównaj sterownik i urządzenie z dokładną linią kernela oraz "
+                "sprawdź powtarzalność w kolejnych rozruchach; LDE nie resetuje "
+                "interfejsu ani nie zmienia konfiguracji."
+            ),
+            verification=f"{command} — brak nowych markerów.",
+            risk_level="Wysokie; interfejs mógł utracić możliwość transmisji.",
+            domain=classification.domain,
+            kind=classification.kind,
+            actionability=classification.actionability,
+            recommendation_intent=classification.recommendation_intent,
+            source_observation_ids=(obs_id,),
+            evidence_ids=(evidence[0].evidence_id,),
+        )
+        return DiagnosticRuleResult(finding=finding, evidence=evidence)
+
+
+class PowerSourceCriticalRule(DiagnosticRule):
+    rule_id = "RULE-POWER-SOURCE-CRITICAL"
+    supported_categories = frozenset({"power_source_critical"})
+
+    def __init__(self, evidence_builder):
+        self._evidence_builder = evidence_builder
+
+    def evaluate(self, observation, classification):
+        if not observation.details.get("critical_state_detected"):
+            return DiagnosticRuleResult()
+        conf = _syscheck().derive_confidence(
+            direct_measurement=observation.direct_measurement,
+            data_complete=observation.data_complete,
+            contradictory_evidence=observation.contradictory_evidence,
+            inference_required=observation.inference_required,
+            independent_sources=observation.independent_sources,
+        )
+        obs_id = observation.obs_id
+        evidence = (self._evidence_builder.build(observation),)
+        command = "`upower -d`"
+        finding = _syscheck().Finding(
+            finding_id=obs_id,
+            title="UPower zgłosił krytyczny stan źródła zasilania",
+            severity="P1",
+            confidence=conf,
+            evidence=str(observation.details.get("critical_states", [])),
+            interpretation=(
+                "UPower bezpośrednio zgłosił stan empty albo warning-level "
+                "critical dla źródła zasilania. Nie wyprowadzono alarmu z "
+                "samego procentu naładowania ani ze zwykłego rozładowywania."
+            ),
+            recommended_diagnostics=command,
+            remediation=(
+                "Zweryfikuj fizyczne zasilanie i urządzenie UPS/baterię zgodnie "
+                "z dokumentacją sprzętu; LDE nie wykonuje działań zasilających."
+            ),
+            verification=f"{command} — brak stanu critical/empty.",
+            risk_level="Wysokie; źródło może nie podtrzymać systemu.",
+            domain=classification.domain,
+            kind=classification.kind,
+            actionability=classification.actionability,
+            recommendation_intent=classification.recommendation_intent,
+            source_observation_ids=(obs_id,),
+            evidence_ids=(evidence[0].evidence_id,),
+        )
+        return DiagnosticRuleResult(finding=finding, evidence=evidence)
+
+
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
@@ -1985,6 +2139,9 @@ def build_default_rule_engine() -> DiagnosticRuleEngine:
         KernelFirmwareLoadFailRule(eb),
         UsbEnumerationFailRule(eb),
         IommuFaultRule(eb),
+        NetworkManagerActivationFailureRule(eb),
+        NetworkDeviceWatchdogRule(eb),
+        PowerSourceCriticalRule(eb),
         FailedSystemUnitRule(eb),
         FailedUserUnitRule(eb),
         SystemdUserSourceFailureRule(eb),

@@ -39,6 +39,8 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_PLATFORM_DEVICE_RELIABILITY,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
+    RE_NETWORK_DEVICE_WATCHDOG,
+    RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
     RE_PCIE_AER,
     CmdResult,
     Finding,
@@ -70,6 +72,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _parse_btrfs_device_stats,
     _pcie_aer_severity,
     _parse_storage_usage,
+    _parse_upower_critical_states,
     _write_new_text,
     confidence_tag,
     determine_cli_status,
@@ -12769,14 +12772,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.3.0`" in report
+        assert "**Wersja produktu:** `0.4.0`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.3.0" in report
+        assert "Linux Diagnostic Engine 0.4.0" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -13757,3 +13760,384 @@ class TestV03StorageMemoryReliabilityReplayCorpus:
             ),
         )
         assert findings == {"NVME-CONTROLLER-RESET-001", "FS-IO-ERROR-001"}
+
+
+class TestV04WorkstationCoverage:
+    """v0.4 source contracts for network and power reliability."""
+
+    ROOT = (
+        Path(__file__).parent / ".agent-work" / "replay" / "v0.4-workstation-coverage"
+    )
+
+    @staticmethod
+    def _result(
+        stdout: str = "",
+        *,
+        status: str = "ok",
+        return_code: int = 0,
+        stderr: str = "",
+        truncated: bool = False,
+    ) -> CmdResult:
+        return CmdResult(
+            command="synthetic-source",
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            execution_status=status,
+            truncated=truncated,
+        )
+
+    @classmethod
+    def _fixture(cls, name: str) -> str:
+        return (cls.ROOT / name).read_text(encoding="utf-8")
+
+    @classmethod
+    def _network_results(cls, **overrides):
+        results = {
+            "ip_addr": cls._result("2: eth0: <UP>"),
+            "ss_tlnp": cls._result(""),
+            "resolvectl": cls._result("DNS Servers: 192.0.2.53"),
+            "nm_status": cls._result("Active: active (running)"),
+            "nm_activation_failures": cls._result(""),
+            "network_device_watchdog": cls._result(""),
+            "auth_fails": cls._result("0"),
+            "firewalld": cls._result("inactive"),
+            "ufw_status": cls._result("Status: inactive"),
+        }
+        results.update(overrides)
+        return results
+
+    def _collect_network(self, **overrides):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v04_network", quiet=True)
+        nft_missing = self._result(
+            status="not_found", return_code=-1, stderr="not found"
+        )
+        with (
+            patch.object(
+                SysCheckEngine,
+                "_parallel_cmd",
+                return_value=self._network_results(**overrides),
+            ),
+            patch.object(engine, "cmd", return_value=nft_missing),
+        ):
+            engine.collect_network()
+        return engine
+
+    def test_replay_parser_positive_healthy_and_near_miss(self):
+        critical, malformed, source_count = _parse_upower_critical_states(
+            self._fixture("upower-critical.txt")
+        )
+        assert len(critical) == 2
+        assert malformed is False
+        assert source_count == 2
+
+        for name in ("upower-healthy.txt", "upower-near-miss.txt"):
+            critical, malformed, source_count = _parse_upower_critical_states(
+                self._fixture(name)
+            )
+            assert critical == []
+            assert malformed is False
+            assert source_count == 1
+
+    def test_upower_malformed_output_is_not_health(self):
+        critical, malformed, source_count = _parse_upower_critical_states(
+            "Device: /synthetic\n  power supply: yes\n"
+        )
+        assert critical == []
+        assert malformed is True
+        assert source_count == 1
+
+    def test_network_replay_aggregates_duplicate_activation_lines(self):
+        engine = self._collect_network(
+            nm_activation_failures=self._result(
+                self._fixture("networkmanager-activation-failure.txt")
+            ),
+            network_device_watchdog=self._result(
+                self._fixture("network-device-healthy.txt")
+            ),
+        )
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "network_manager_activation_failure"
+        )
+        assert raw.payload["match_count"] == 1
+        assert re.search(
+            RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
+            raw.payload["matched_lines"][0],
+            re.IGNORECASE,
+        )
+        engine._derive_observations()
+        engine._interpret()
+        assert [f.finding_id for f in engine.findings] == [
+            "NETWORK-NM-ACTIVATION-FAIL-001"
+        ]
+
+    def test_network_watchdog_replay_keeps_two_explicit_signatures(self):
+        engine = self._collect_network(
+            nm_activation_failures=self._result(
+                self._fixture("networkmanager-healthy.txt")
+            ),
+            network_device_watchdog=self._result(
+                self._fixture("network-device-watchdog.txt")
+            ),
+        )
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "network_device_watchdog"
+        )
+        assert raw.payload["match_count"] == 2
+        engine._derive_observations()
+        engine._interpret()
+        assert [f.finding_id for f in engine.findings] == [
+            "NETWORK-DEVICE-WATCHDOG-001"
+        ]
+
+    def test_network_healthy_and_near_miss_sources_do_not_create_findings(self):
+        engine = self._collect_network(
+            nm_activation_failures=self._result(
+                "Activation: successful for connection 'synthetic-office'"
+            ),
+            network_device_watchdog=self._result(
+                "eth0: transmit queue 0 completed successfully"
+            ),
+        )
+        assert engine.raw_diagnostics == []
+        engine._derive_observations()
+        engine._interpret()
+        assert engine.findings == []
+
+    def test_network_source_failures_are_restrictions_not_findings(self):
+        failed = self._result(
+            status="permission_denied", return_code=-3, stderr="permission denied"
+        )
+        engine = self._collect_network(
+            nm_activation_failures=failed,
+            network_device_watchdog=failed,
+        )
+        assert engine.raw_diagnostics == []
+        assert len(engine.restrictions) == 2
+        assert all(
+            "no healthy or failure state was inferred" in item
+            for item in engine.restrictions
+        )
+
+    def test_truncated_network_positive_is_incomplete_and_not_healthy(self):
+        engine = self._collect_network(
+            nm_activation_failures=self._result(
+                "Activation: failed for connection 'synthetic-office'",
+                truncated=True,
+            )
+        )
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f
+            for f in engine.findings
+            if f.finding_id == "NETWORK-NM-ACTIVATION-FAIL-001"
+        )
+        assert finding.confidence == "Guessing"
+        assert any("TRUNCATED_OUTPUT" in item for item in engine.restrictions)
+
+    def test_upower_critical_aggregate_reaches_finding(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v04_power", quiet=True)
+        with patch.object(
+            engine,
+            "cmd",
+            return_value=self._result(self._fixture("upower-critical.txt")),
+        ):
+            engine.collect_power()
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.category == "power_source_critical"
+        )
+        assert raw.payload["match_count"] == 2
+        engine._derive_observations()
+        engine._interpret()
+        assert [f.finding_id for f in engine.findings] == ["POWER-SOURCE-CRITICAL-001"]
+
+    def test_truncated_upower_positive_is_incomplete_and_not_healthy(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v04_power", quiet=True)
+        with patch.object(
+            engine,
+            "cmd",
+            return_value=self._result(
+                self._fixture("upower-critical.txt"), truncated=True
+            ),
+        ):
+            engine.collect_power()
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            f for f in engine.findings if f.finding_id == "POWER-SOURCE-CRITICAL-001"
+        )
+        assert finding.confidence == "Guessing"
+        assert any("TRUNCATED_OUTPUT" in item for item in engine.restrictions)
+
+    def test_upower_healthy_near_miss_failure_and_malformed_are_closed(self):
+        from unittest.mock import patch
+
+        for fixture in ("upower-healthy.txt", "upower-near-miss.txt"):
+            engine = SysCheckEngine(output_dir="/tmp/test_v04_power", quiet=True)
+            with patch.object(
+                engine, "cmd", return_value=self._result(self._fixture(fixture))
+            ):
+                engine.collect_power()
+            assert engine.raw_diagnostics == []
+            assert engine.restrictions == []
+
+        failed = self._result(
+            status="not_found", return_code=-1, stderr="command not found"
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_v04_power", quiet=True)
+        with patch.object(engine, "cmd", return_value=failed):
+            engine.collect_power()
+        assert engine.raw_diagnostics == []
+        assert "COMMAND_NOT_FOUND" in engine.restrictions[0]
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v04_power", quiet=True)
+        with patch.object(
+            engine,
+            "cmd",
+            return_value=self._result("Device: /synthetic\n  power supply: yes\n"),
+        ):
+            engine.collect_power()
+        assert engine.raw_diagnostics == []
+        assert "MALFORMED_OUTPUT" in engine.restrictions[0]
+
+    @pytest.mark.parametrize(
+        ("category", "obs_id", "flag", "rule_regex"),
+        [
+            (
+                "network_manager_activation_failure",
+                "NETWORK-NM-ACTIVATION-FAIL-001",
+                "activation_failure_detected",
+                RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
+            ),
+            (
+                "network_device_watchdog",
+                "NETWORK-DEVICE-WATCHDOG-001",
+                "watchdog_detected",
+                RE_NETWORK_DEVICE_WATCHDOG,
+            ),
+        ],
+    )
+    def test_network_rule_negated_observation_is_stable_rejection(
+        self, category, obs_id, flag, rule_regex
+    ):
+        positive = (
+            "Activation: failed for connection 'synthetic'"
+            if category == "network_manager_activation_failure"
+            else "NETDEV WATCHDOG: eth0: transmit queue 0 timed out"
+        )
+        assert re.search(rule_regex, positive, re.IGNORECASE)
+        assert not re.search(
+            rule_regex, "connection activation successful", re.IGNORECASE
+        )
+        obs = Observation(
+            obs_id=obs_id,
+            category=category,
+            details={flag: False, "matched_lines": []},
+        )
+        evaluation = __import__("syscheck").build_default_rule_engine().evaluate([obs])
+        assert evaluation.findings == ()
+        assert evaluation.evidence == ()
+
+    def test_power_rule_negated_observation_is_stable_rejection(self):
+        obs = Observation(
+            obs_id="POWER-SOURCE-CRITICAL-001",
+            category="power_source_critical",
+            details={"critical_state_detected": False, "critical_states": []},
+        )
+        evaluation = __import__("syscheck").build_default_rule_engine().evaluate([obs])
+        assert evaluation.findings == ()
+        assert evaluation.evidence == ()
+
+    def test_new_observations_have_complete_pipeline_accounting(self):
+        engine = self._collect_network(
+            nm_activation_failures=self._result(
+                self._fixture("networkmanager-activation-failure.txt")
+            ),
+            network_device_watchdog=self._result(
+                self._fixture("network-device-watchdog.txt")
+            ),
+        )
+        engine._derive_observations()
+        engine._interpret()
+        assert len(engine.pipeline_accounting) == len(engine.observations) == 2
+        assert all(item["outcome"] == "finding" for item in engine.pipeline_accounting)
+        assert {item["finding_id"] for item in engine.pipeline_accounting} == {
+            "NETWORK-NM-ACTIVATION-FAIL-001",
+            "NETWORK-DEVICE-WATCHDOG-001",
+        }
+
+    def test_exact_read_only_recommendation_commands_execute(self, tmp_path):
+        import syscheck
+
+        observations = [
+            Observation(
+                obs_id="NETWORK-NM-ACTIVATION-FAIL-001",
+                category="network_manager_activation_failure",
+                details={
+                    "activation_failure_detected": True,
+                    "matched_lines": ["Activation: failed for connection 'synthetic'"],
+                    "match_count": 1,
+                },
+            ),
+            Observation(
+                obs_id="NETWORK-DEVICE-WATCHDOG-001",
+                category="network_device_watchdog",
+                details={
+                    "watchdog_detected": True,
+                    "matched_lines": [
+                        "NETDEV WATCHDOG: eth0: transmit queue 0 timed out"
+                    ],
+                    "match_count": 1,
+                },
+            ),
+            Observation(
+                obs_id="POWER-SOURCE-CRITICAL-001",
+                category="power_source_critical",
+                details={
+                    "critical_state_detected": True,
+                    "critical_states": [
+                        {"state": "empty", "warning_level": "critical"}
+                    ],
+                    "match_count": 1,
+                },
+            ),
+        ]
+        evaluation = syscheck.build_default_rule_engine().evaluate(observations)
+        for finding in evaluation.findings:
+            command = _extract_single_backticked_command(
+                finding.recommended_diagnostics
+            )
+            tool = command.split()[0]
+            script = tmp_path / tool
+            script.write_text("#!/bin/sh\ncat\n", encoding="utf-8")
+            script.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = os.pathsep.join((str(tmp_path), env.get("PATH", "")))
+            result = subprocess.run(
+                ["bash", "-c", command],
+                input=(
+                    "Activation: failed for connection 'synthetic'"
+                    if finding.finding_id == "NETWORK-NM-ACTIVATION-FAIL-001"
+                    else "NETDEV WATCHDOG: eth0: transmit queue 0 timed out"
+                    if finding.finding_id == "NETWORK-DEVICE-WATCHDOG-001"
+                    else ""
+                ),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            assert result.returncode == 0, (finding.finding_id, result.stderr)

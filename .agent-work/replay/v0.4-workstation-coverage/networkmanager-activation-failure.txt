@@ -1,0 +1,2 @@
+Aug 31 08:12:01 synthetic-host NetworkManager[123]: <warn> device (eth0): Activation: failed for connection 'synthetic-office'
+Aug 31 08:12:01 synthetic-host NetworkManager[123]: <warn> device (eth0): Activation: failed for connection 'synthetic-office'

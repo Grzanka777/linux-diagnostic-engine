@@ -1,0 +1,14 @@
+Device: /org/freedesktop/UPower/devices/ups_synthetic
+  power supply: yes
+    state: discharging
+    warning-level: critical
+    percentage: 12%
+
+Device: /org/freedesktop/UPower/devices/DisplayDevice
+  power supply: yes
+    state: empty
+    warning-level: critical
+    percentage: 0%
+
+Daemon:
+  on-battery: yes

@@ -1,0 +1,8 @@
+Device: /org/freedesktop/UPower/devices/battery_synthetic
+  power supply: yes
+    state: fully-charged
+    warning-level: none
+    percentage: 100%
+
+Daemon:
+  on-battery: no

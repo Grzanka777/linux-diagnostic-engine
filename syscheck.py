@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.3.0
+Wersja produktu:                         0.4.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -81,6 +81,8 @@ from constants import (  # type: ignore[import-untyped]
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
     RE_PCIE_AER,
+    RE_NETWORK_DEVICE_WATCHDOG,
+    RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
     RE_SEGFAULT,
     SEGFAULT_ALERT_THRESHOLD,
     TIMEOUT_LONG,
@@ -238,6 +240,7 @@ class DiagnosticDomain(str, Enum):
     AUDIO = "audio"
     HARDWARE = "hardware"
     NETWORK = "network"
+    POWER = "power"
     SECURITY = "security"
     PACKAGES = "packages"
     ENVIRONMENT = "environment"
@@ -273,6 +276,8 @@ class FindingKind(str, Enum):
     KERNEL_FIRMWARE_LOAD_FAIL = "kernel_firmware_load_fail"
     USB_ENUMERATION_FAIL = "usb_enumeration_fail"
     IOMMU_FAULT = "iommu_fault"
+    NETWORK_RELIABILITY = "network_reliability"
+    POWER_BATTERY_RELIABILITY = "power_battery_reliability"
     BOOT_DELAY = "boot_delay"
     GENERAL = "general"
     __hash__ = str.__hash__  # type: ignore[assignment]
@@ -636,6 +641,7 @@ _CLI_COLLECTION_SECTIONS = (
     "Packages",
     "Graphics",
     "Network & security",
+    "Power & battery",
     "User environment",
 )
 _CLI_STATUS_MARKERS = {
@@ -1115,6 +1121,42 @@ def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
     return results
 
 
+def _parse_upower_critical_states(
+    output: str,
+) -> Tuple[List[Dict[str, str]], bool, int]:
+    """Parse only explicit critical states from a UPower diagnostic dump.
+
+    The parser intentionally does not infer a critical condition from a
+    percentage or from ordinary discharging.  A source is positive only when
+    UPower reports ``state: empty`` or ``warning-level: critical`` for a
+    power-supply device.  The returned malformed flag prevents a successful
+    but structurally unusable dump from being treated as healthy.
+    """
+    blocks = re.split(r"(?m)^Device:\s+", output)
+    if len(blocks) == 1:
+        # ``upower -d`` may legitimately contain only the daemon section when
+        # no device is exposed.
+        return [], False, 0
+
+    critical: List[Dict[str, str]] = []
+    malformed = False
+    source_count = 0
+    for block in blocks[1:]:
+        if not re.search(r"(?im)^\s*power supply:\s+yes\s*$", block):
+            continue
+        source_count += 1
+        state_match = re.search(r"(?im)^\s*state:\s*(\S+)\s*$", block)
+        warning_match = re.search(r"(?im)^\s*warning-level:\s*(\S+)\s*$", block)
+        if state_match is None and warning_match is None:
+            malformed = True
+            continue
+        state = state_match.group(1).lower() if state_match else "unknown"
+        warning_level = warning_match.group(1).lower() if warning_match else "unknown"
+        if state == "empty" or warning_level == "critical":
+            critical.append({"state": state, "warning_level": warning_level})
+    return critical, malformed, source_count
+
+
 def _journal_filter_command(
     upstream_cmd: str, regexes: List[str], tail_lines: Optional[int] = None
 ) -> List[str]:
@@ -1463,6 +1505,24 @@ class FindingClassificationPolicy:
         "iommu_fault": FindingClassification(
             DiagnosticDomain.HARDWARE,
             FindingKind.IOMMU_FAULT,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "network_manager_activation_failure": FindingClassification(
+            DiagnosticDomain.NETWORK,
+            FindingKind.NETWORK_RELIABILITY,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "network_device_watchdog": FindingClassification(
+            DiagnosticDomain.NETWORK,
+            FindingKind.NETWORK_RELIABILITY,
+            Actionability.ACTIONABLE,
+            RecommendationIntent.INVESTIGATE,
+        ),
+        "power_source_critical": FindingClassification(
+            DiagnosticDomain.POWER,
+            FindingKind.POWER_BATTERY_RELIABILITY,
             Actionability.ACTIONABLE,
             RecommendationIntent.INVESTIGATE,
         ),
@@ -2459,6 +2519,55 @@ class EvidenceBuilder:
                 directness=directness,
                 completeness=completeness,
             )
+        if cat in {
+            "network_manager_activation_failure",
+            "network_device_watchdog",
+        }:
+            completeness = (
+                EvidenceCompleteness.COMPLETE
+                if observation.data_complete
+                else EvidenceCompleteness.PARTIAL
+            )
+            if cat == "network_manager_activation_failure":
+                summary = (
+                    "NetworkManager activation failure events detected during "
+                    f"the current boot ({d.get('match_count', 0)} matching line(s))"
+                )
+            else:
+                summary = (
+                    "Network device transmit watchdog events detected during "
+                    f"the current boot ({d.get('match_count', 0)} matching line(s))"
+                )
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.JOURNAL_EVENT,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=summary,
+                data=dict(d),
+                strength=EvidenceStrength.STRONG,
+                directness=EvidenceDirectness.DIRECT,
+                completeness=completeness,
+            )
+        if cat == "power_source_critical":
+            return Evidence(
+                evidence_id=eid,
+                evidence_type=EvidenceType.SYSTEM_STATE,
+                source_observation_ids=(oid,),
+                source_raw_ids=observation.source_raw_ids,
+                summary=(
+                    "UPower reported critical state for "
+                    f"{d.get('match_count', 0)} power-supply source(s)"
+                ),
+                data=dict(d),
+                strength=EvidenceStrength.STRONG,
+                directness=EvidenceDirectness.DIRECT,
+                completeness=(
+                    EvidenceCompleteness.COMPLETE
+                    if observation.data_complete
+                    else EvidenceCompleteness.PARTIAL
+                ),
+            )
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
@@ -2497,6 +2606,11 @@ PlatformAcpiFirmwareErrorRule = _diagnostic_rules.PlatformAcpiFirmwareErrorRule
 KernelFirmwareLoadFailRule = _diagnostic_rules.KernelFirmwareLoadFailRule
 UsbEnumerationFailRule = _diagnostic_rules.UsbEnumerationFailRule
 IommuFaultRule = _diagnostic_rules.IommuFaultRule
+NetworkDeviceWatchdogRule = _diagnostic_rules.NetworkDeviceWatchdogRule
+NetworkManagerActivationFailureRule = (
+    _diagnostic_rules.NetworkManagerActivationFailureRule
+)
+PowerSourceCriticalRule = _diagnostic_rules.PowerSourceCriticalRule
 KernelCountRule = _diagnostic_rules.KernelCountRule
 KernelOomRule = _diagnostic_rules.KernelOomRule
 KernelTaintRule = _diagnostic_rules.KernelTaintRule
@@ -2561,6 +2675,7 @@ class SysCheckEngine:
                 "Pakiety i spójność": "Packages and integrity",
                 "Warstwa graficzna": "Graphics stack",
                 "Sieć i bezpieczeństwo": "Network and security",
+                "Zasilanie i bateria": "Power and battery",
                 "Środowisko użytkownika": "User environment",
                 "Budowanie podsumowania": "Building summary",
             }
@@ -4556,6 +4671,22 @@ class SysCheckEngine:
                 TIMEOUT_SHORT,
                 False,
             ),
+            "nm_activation_failures": (
+                _journal_filter_command(
+                    "journalctl -b -u NetworkManager --no-pager 2>/dev/null",
+                    [RE_NETWORK_MANAGER_ACTIVATION_FAILURE],
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
+            "network_device_watchdog": (
+                _journal_filter_command(
+                    "journalctl -b -k --no-pager 2>/dev/null",
+                    [RE_NETWORK_DEVICE_WATCHDOG],
+                ),
+                TIMEOUT_LONG,
+                False,
+            ),
             "auth_fails": (
                 _journal_count_command(
                     "journalctl -b --no-pager 2>/dev/null", RE_AUTH_FAIL
@@ -4597,10 +4728,79 @@ class SysCheckEngine:
         self.report_lines.append(
             codeblock("\n".join(r["nm_status"].to_fallback_text().split("\n")[:15]))
         )
+        self.report_lines.append(heading(3, "Network reliability events"))
+        self.report_lines.append(
+            codeblock(r["nm_activation_failures"].to_fallback_text())
+        )
+        self.report_lines.append(heading(3, "Network device watchdog"))
+        self.report_lines.append(
+            codeblock(r["network_device_watchdog"].to_fallback_text())
+        )
         self.report_lines.append(heading(3, "Nieudane logowania"))
         self.report_lines.append(
             f"Liczba nieudanych logowań: **{r['auth_fails'].to_fallback_text()}**\n\n"
         )
+
+        for key, source_name in (
+            (
+                "nm_activation_failures",
+                "current-boot NetworkManager activation query",
+            ),
+            ("network_device_watchdog", "current-boot network watchdog query"),
+        ):
+            self._record_source_status(r[key], source_name)
+
+        nm_activation_result = r["nm_activation_failures"]
+        if nm_activation_result.is_ok() and nm_activation_result.stdout.strip():
+            activation_matching = list(
+                dict.fromkeys(
+                    line
+                    for line in nm_activation_result.stdout.splitlines()
+                    if re.search(
+                        RE_NETWORK_MANAGER_ACTIVATION_FAILURE, line, re.IGNORECASE
+                    )
+                )
+            )
+            if activation_matching:
+                self.raw_diagnostics.append(
+                    _raw_from_result(
+                        nm_activation_result,
+                        source_id="NETWORK-NM-ACTIVATION-FAIL-001",
+                        category="network_manager_activation_failure",
+                        payload={
+                            "activation_failure_detected": True,
+                            "matched_lines": activation_matching[:20],
+                            "match_count": len(activation_matching),
+                            "journal_scope": "current_boot_networkmanager",
+                            "source_query": "nm_activation_failures",
+                        },
+                    )
+                )
+
+        watchdog_result = r["network_device_watchdog"]
+        if watchdog_result.is_ok() and watchdog_result.stdout.strip():
+            watchdog_matching = list(
+                dict.fromkeys(
+                    line
+                    for line in watchdog_result.stdout.splitlines()
+                    if re.search(RE_NETWORK_DEVICE_WATCHDOG, line, re.IGNORECASE)
+                )
+            )
+            if watchdog_matching:
+                self.raw_diagnostics.append(
+                    _raw_from_result(
+                        watchdog_result,
+                        source_id="NETWORK-DEVICE-WATCHDOG-001",
+                        category="network_device_watchdog",
+                        payload={
+                            "watchdog_detected": True,
+                            "matched_lines": watchdog_matching[:20],
+                            "match_count": len(watchdog_matching),
+                            "journal_scope": "current_boot_kernel",
+                            "source_query": "network_device_watchdog",
+                        },
+                    )
+                )
 
         # Analiza nasłuchujących usług — lokalne vs zewnętrzne
         ss_output = r["ss_tlnp"].stdout
@@ -4680,6 +4880,61 @@ class SysCheckEngine:
                 f"Możliwe że firewall jest skonfigurowany inaczej lub wymaga sudo do weryfikacji.\n\n"
             )
 
+    # ── Raport: Zasilanie ────────────────────────────────────────
+    def collect_power(self) -> None:
+        """Collect explicit critical power-source state from UPower."""
+        self.log_section("Zasilanie i bateria")
+        result = self.cmd(["upower", "-d"], TIMEOUT_LONG, optional_dependency=True)
+
+        self.report_lines.append(heading(2, "9. Zasilanie i bateria"))
+        self.report_lines.append(heading(3, "UPower"))
+        if result.is_ok() and result.stdout.strip():
+            summary_lines = []
+            for line in result.stdout.splitlines():
+                if re.match(
+                    r"^\s*(power supply|state|warning-level|percentage|on-battery):",
+                    line,
+                    re.IGNORECASE,
+                ):
+                    summary_lines.append(line)
+            self.report_lines.append(
+                codeblock(
+                    "\n".join(summary_lines) if summary_lines else "(brak pól stanu)"
+                )
+            )
+        else:
+            self.report_lines.append(codeblock(result.to_fallback_text()))
+
+        if not result.is_ok():
+            self._record_source_status(result, "UPower power-source query")
+            return
+
+        self._record_truncated_capture(result, "UPower power-source query")
+        critical_states, malformed, source_count = _parse_upower_critical_states(
+            result.stdout
+        )
+        if malformed:
+            self._record_source_status(
+                result,
+                "UPower power-source query",
+                authority_state="MALFORMED_OUTPUT",
+            )
+        if critical_states:
+            self.raw_diagnostics.append(
+                _raw_from_result(
+                    result,
+                    source_id="POWER-SOURCE-CRITICAL-001",
+                    category="power_source_critical",
+                    payload={
+                        "critical_state_detected": True,
+                        "match_count": len(critical_states),
+                        "critical_states": critical_states,
+                        "power_source_count": source_count,
+                        "source_query": "upower_power_sources",
+                    },
+                )
+            )
+
     # ── Raport: Środowisko użytkownika ───────────────────────────
     def collect_userenv(self) -> None:
         self.log_section("Środowisko użytkownika")
@@ -4691,7 +4946,7 @@ class SysCheckEngine:
         editor = os.environ.get("EDITOR", "(nie ustawiony)")
         browser = os.environ.get("BROWSER", "(nie ustawiony)")
 
-        self.report_lines.append(heading(2, "9. Środowisko użytkownika"))
+        self.report_lines.append(heading(2, "10. Środowisko użytkownika"))
         self.report_lines.append(heading(3, "Zmienne środowiskowe"))
         self.report_lines.append(f"- **SHELL:** `{shell}`\n")
         self.report_lines.append(f"- **TERM:** `{term}`\n")
@@ -4707,7 +4962,7 @@ class SysCheckEngine:
         # Sortuj findings: P0 < P1 < P2 < P3 < Info
         self.findings.sort(key=lambda f: Finding._severity_order.get(f.severity, 99))
 
-        self.report_lines.append(heading(2, "10. Problemy potwierdzone"))
+        self.report_lines.append(heading(2, "11. Problemy potwierdzone"))
         if self.findings:
             for f in self.findings:
                 self.report_lines.append(
@@ -4736,7 +4991,7 @@ class SysCheckEngine:
         else:
             self.report_lines.append("Nie wykryto potwierdzonych problemów.\n\n")
 
-        self.report_lines.append(heading(2, "11. Rekomendacje"))
+        self.report_lines.append(heading(2, "12. Rekomendacje"))
         if hasattr(self, "recommendation_plan") and self.recommendation_plan:
             self.report_lines.append(
                 format_recommendation_markdown(self.recommendation_plan)
@@ -4744,7 +4999,7 @@ class SysCheckEngine:
         else:
             self.report_lines.append("Brak rekomendacji.\n\n")
 
-        self.report_lines.append(heading(2, "12. Ograniczenia analizy"))
+        self.report_lines.append(heading(2, "13. Ograniczenia analizy"))
         if self.restrictions:
             for i, r in enumerate(self.restrictions, 1):
                 self.report_lines.append(f"{i}. {r}\n")
@@ -4752,7 +5007,7 @@ class SysCheckEngine:
             self.report_lines.append("Brak ograniczeń.\n")
         self.report_lines.append("\n")
 
-        self.report_lines.append(heading(2, "13. Lista wykonanych poleceń"))
+        self.report_lines.append(heading(2, "14. Lista wykonanych poleceń"))
         self.report_lines.append(codeblock("\n".join(self.commands_used), lang="bash"))
 
     # ── Stage 2: Derive observations ───────────────────────────
@@ -5130,6 +5385,42 @@ class SysCheckEngine:
                 independent_sources=1,
                 source_raw_ids=(src_id,),
             )
+        elif cat == "network_manager_activation_failure":
+            return Observation(
+                obs_id="NETWORK-NM-ACTIVATION-FAIL-001",
+                category="network_manager_activation_failure",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "network_device_watchdog":
+            return Observation(
+                obs_id="NETWORK-DEVICE-WATCHDOG-001",
+                category="network_device_watchdog",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
+        elif cat == "power_source_critical":
+            return Observation(
+                obs_id="POWER-SOURCE-CRITICAL-001",
+                category="power_source_critical",
+                details={**payload},
+                direct_measurement=True,
+                data_complete=capture_complete,
+                contradictory_evidence=False,
+                inference_required=False,
+                independent_sources=1,
+                source_raw_ids=(src_id,),
+            )
         return None
 
     # ── Stage 3: Interpret observations → findings ─────────────
@@ -5172,6 +5463,7 @@ class SysCheckEngine:
         self.collect_packages()
         self.collect_graphics()
         self.collect_network()
+        self.collect_power()
         self.collect_userenv()
 
         # Analyze existing observations.

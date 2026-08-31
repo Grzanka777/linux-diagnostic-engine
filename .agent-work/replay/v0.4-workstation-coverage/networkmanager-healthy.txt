@@ -1,0 +1,2 @@
+Aug 31 08:11:02 synthetic-host NetworkManager[123]: <info> device (eth0): state change: activated -> activated
+Aug 31 08:11:03 synthetic-host NetworkManager[123]: <info> dhcp4 (eth0): state changed new lease

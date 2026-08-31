@@ -9,7 +9,7 @@ from pathlib import Path
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.3.0"
+PRODUCT_VERSION = "0.4.0"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for
@@ -165,6 +165,13 @@ RE_IOMMU_FAULT = (
     r"\bDMAR:\s+\[INTR-REMAP\]\s+Request device\b|"
     r"\b(?:arm-smmu[0-9a-z.-]*:\s+)?Unhandled context fault\b|"
     r"\bIOMMU:\s+(?:DMA\s+)?translation fault\b"
+    r")"
+)
+RE_NETWORK_MANAGER_ACTIVATION_FAILURE = r"\bActivation:\s+failed\s+for\s+connection\b"
+RE_NETWORK_DEVICE_WATCHDOG = (
+    r"(?:"
+    r"\bNETDEV WATCHDOG:\s+\S+:\s+transmit queue\s+\d+\s+timed out\b|"
+    r"\bDetected Tx Unit Hang\b"
     r")"
 )
 RE_PLATFORM_DEVICE_RELIABILITY = (

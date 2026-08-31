@@ -1,0 +1,8 @@
+Device: /org/freedesktop/UPower/devices/battery_synthetic
+  power supply: yes
+    state: discharging
+    warning-level: low
+    percentage: 20%
+
+Daemon:
+  on-battery: yes
