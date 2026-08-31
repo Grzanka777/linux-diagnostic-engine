@@ -9,7 +9,7 @@ from pathlib import Path
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.1.3"
+PRODUCT_VERSION = "0.1.4"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for
@@ -37,6 +37,7 @@ OUTPUT_DIR_DEFAULT = str(get_default_reports_dir())
 
 # ── Wzorce regex do analizy logów ───────────────────────────────
 RE_KERNEL_ERROR = r"error|fail|BUG|lockup|hung|oom|taint|Call Trace"
+RE_KERNEL_TAINT = r"(?:\bTainted:\s|\b(?:tainting|taints)\s+kernel\b)"
 RE_SEGFAULT = r"segfault"
 RE_FIRMWARE = r"firmware|microcode|ucode"
 RE_AUTH_FAIL = r"authentication failure|Failed password"

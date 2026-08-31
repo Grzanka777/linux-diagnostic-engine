@@ -25,6 +25,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     RE_KERNEL_HARD_LOCKUP,
     RE_KERNEL_HUNG_TASK,
     RE_KERNEL_ERROR,
+    RE_KERNEL_TAINT,
     RE_KERNEL_OOPS_BUG,
     RE_KERNEL_OOPS_PANIC,
     RE_KERNEL_PANIC,
@@ -70,6 +71,21 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     determine_cli_status,
     run_cmd,
     severity_tag,
+)
+
+
+REAL_ACPI_REPLAY_LINE = (
+    "kernel: ACPI BIOS Error (bug): Could not resolve symbol "
+    "[_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)"
+)
+REAL_KERNEL_TAINT_REPLAY_LINES = (
+    "kernel: i915 0000:00:02.0: [drm] *ERROR* force_probe required for device",
+    "kernel: i915: module verification failed: signature and/or required key "
+    "missing - tainting kernel",
+    "kernel: razermouse: loading out-of-tree module taints kernel.",
+)
+REAL_BTRFS_LIMITED_MISSING_LINE = (
+    "devid 1 size 931.51GiB used 512.00GiB path /dev/nvme0n1p5 MISSING"
 )
 
 
@@ -930,6 +946,22 @@ class TestStatusAwareJournalCommands:
             check=False,
         )
         assert result.returncode == 2
+
+    def test_filter_replays_real_acpi_with_python_regex_and_shell_quote(self):
+        from shlex import quote
+
+        result = subprocess.run(
+            _journal_filter_command(
+                f"printf %s {quote(REAL_ACPI_REPLAY_LINE)}",
+                [RE_PLATFORM_DEVICE_RELIABILITY],
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert result.stdout.splitlines() == [REAL_ACPI_REPLAY_LINE]
+        assert result.stderr == ""
 
 
 class TestCaptureCompleteness:
@@ -6213,6 +6245,53 @@ class TestBtrfsCollectorPath:
         err_raws = [r for r in engine.raw_diagnostics if r.category == "btrfs_error"]
         assert len(err_raws) == 0
 
+    def test_privilege_limited_missing_preserves_raw_and_rejects_finding(self):
+        """Unprivileged MISSING is observable but not a device-error Finding."""
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_limited_missing")
+        show = CmdResult(
+            command="btrfs filesystem show /",
+            stdout=REAL_BTRFS_LIMITED_MISSING_LINE,
+            stderr="ERROR: cannot inspect all devices: Operation not permitted",
+            return_code=1,
+            execution_status="error",
+            privilege_required=True,
+        )
+        self._collect_with_mock(engine, btrfs_show=show)
+        assert _classify_btrfs_status(show) == "permission_denied"
+
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.source_id == "BTRFS-MISSING-INCOMPLETE-001"
+        )
+        assert raw.payload["matched_lines"] == [REAL_BTRFS_LIMITED_MISSING_LINE]
+        engine._derive_observations()
+        engine._interpret()
+
+        observation = next(
+            obs for obs in engine.observations if obs.obs_id == "BTRFS-ERR-001"
+        )
+        assert observation.details["privilege_limited"] is True
+        assert not any(
+            finding.finding_id == "BTRFS-ERR-001" for finding in engine.findings
+        )
+        assert engine.pipeline_accounting == [
+            {
+                "raw_source_id": raw.source_id,
+                "observation_id": observation.obs_id,
+                "finding_id": "",
+                "outcome": "rejected",
+                "reason": "privilege_limited_btrfs_missing",
+            }
+        ]
+        report = "".join(engine.report_lines)
+        assert REAL_BTRFS_LIMITED_MISSING_LINE in report
+        assert "incomplete and non-authoritative" in report
+        assert any(
+            "MISSING" in restriction and "non-authoritative" in restriction
+            for restriction in engine.restrictions
+        )
+
     # ── BTRFS-SCRUB-001 tests ────────────────────────────────────
 
     def test_btrfs_scrub_no_scrub_triggers(self):
@@ -6646,6 +6725,83 @@ class TestSegfaultAndTaintCollectorPath:
         ]
         assert len(taint_raws) == 1
         assert taint_raws[0].payload.get("tainted") is True
+
+    def test_real_kernel_taint_replay_reaches_finding_once_with_lineage(self):
+        from shlex import quote
+
+        replay_text = "\n".join(REAL_KERNEL_TAINT_REPLAY_LINES)
+        replay = run_cmd(
+            _oom_collector_command(
+                f"printf %s {quote(replay_text)}",
+                RE_KERNEL_ERROR,
+            )
+        )
+        assert replay.is_ok()
+        assert replay.stdout.splitlines() == list(REAL_KERNEL_TAINT_REPLAY_LINES)
+
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_taint_real_replay")
+        self._collect_with_mock(engine, kernel_errors=replay)
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = [
+            item
+            for item in engine.raw_diagnostics
+            if item.source_id == "KERNEL-TAINT-001"
+        ]
+        observations = [
+            item for item in engine.observations if item.obs_id == "KERNEL-TAINT-001"
+        ]
+        findings = [
+            item for item in engine.findings if item.finding_id == "KERNEL-TAINT-001"
+        ]
+        evidence = [
+            item
+            for item in engine.evidence_objects
+            if item.evidence_id == "EVIDENCE-KERNEL-TAINT-001-001"
+        ]
+        assert len(raw) == len(observations) == len(findings) == len(evidence) == 1
+        assert raw[0].payload["matched_lines"] == list(
+            REAL_KERNEL_TAINT_REPLAY_LINES[1:]
+        )
+        assert raw[0].payload["match_count"] == 2
+        assert observations[0].source_raw_ids == (raw[0].source_id,)
+        assert findings[0].source_observation_ids == (observations[0].obs_id,)
+        assert findings[0].evidence_ids == (evidence[0].evidence_id,)
+        assert engine.pipeline_accounting == [
+            {
+                "raw_source_id": raw[0].source_id,
+                "observation_id": observations[0].obs_id,
+                "finding_id": findings[0].finding_id,
+                "outcome": "finding",
+                "reason": "",
+            }
+        ]
+
+    def test_real_kernel_taint_negative_controls_remain_rejected(self):
+        from shlex import quote
+
+        negative_lines = (
+            "kernel: CPU: 0 PID: 1 Comm: swapper Not tainted",
+            "kernel: Kernel is not tainted",
+            "kernel: filesystem was untainted after reboot",
+            "kernel: force_probe configured without taint",
+            "kernel: module is not tainting kernel",
+        )
+        replay = run_cmd(
+            _oom_collector_command(
+                f"printf %s {quote(chr(10).join(negative_lines))}",
+                RE_KERNEL_ERROR,
+            )
+        )
+        assert replay.is_ok()
+        assert replay.stdout.splitlines() == list(negative_lines)
+
+        engine = SysCheckEngine(output_dir="/tmp/test_kernel_taint_negative_replay")
+        self._collect_with_mock(engine, kernel_errors=replay)
+        assert not any(
+            raw.source_id == "KERNEL-TAINT-001" for raw in engine.raw_diagnostics
+        )
 
     def test_kernel_no_taint(self):
         """No taint signal in kernel log produces no KERNEL-TAINT-001."""
@@ -11181,6 +11337,82 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert finding.domain == DiagnosticDomain.HARDWARE
         assert "ACPI" in finding.title
 
+    def test_real_acpi_replay_reaches_finding_once_with_lineage(self):
+        from shlex import quote
+
+        replay = run_cmd(
+            _journal_filter_command(
+                f"printf %s {quote(REAL_ACPI_REPLAY_LINE)}",
+                [RE_PLATFORM_DEVICE_RELIABILITY],
+            )
+        )
+        assert replay.is_ok()
+        assert replay.stdout.splitlines() == [REAL_ACPI_REPLAY_LINE]
+
+        engine = SysCheckEngine(output_dir="/tmp/test_acpi_real_replay")
+        self._collect(engine, replay)
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = [
+            item
+            for item in engine.raw_diagnostics
+            if item.source_id == "PLATFORM-ACPI-FIRMWARE-ERROR-001"
+        ]
+        observations = [
+            item
+            for item in engine.observations
+            if item.obs_id == "PLATFORM-ACPI-FIRMWARE-ERROR-001"
+        ]
+        findings = [
+            item
+            for item in engine.findings
+            if item.finding_id == "PLATFORM-ACPI-FIRMWARE-ERROR-001"
+        ]
+        evidence = [
+            item
+            for item in engine.evidence_objects
+            if item.evidence_id == "EVIDENCE-PLATFORM-ACPI-FIRMWARE-ERROR-001-001"
+        ]
+        assert len(raw) == len(observations) == len(findings) == len(evidence) == 1
+        assert raw[0].payload["matched_lines"] == [REAL_ACPI_REPLAY_LINE]
+        assert "grep -iP" in raw[0].provenance["command"]
+        assert observations[0].source_raw_ids == (raw[0].source_id,)
+        assert findings[0].source_observation_ids == (observations[0].obs_id,)
+        assert findings[0].evidence_ids == (evidence[0].evidence_id,)
+        assert engine.pipeline_accounting == [
+            {
+                "raw_source_id": raw[0].source_id,
+                "observation_id": observations[0].obs_id,
+                "finding_id": findings[0].finding_id,
+                "outcome": "finding",
+                "reason": "",
+            }
+        ]
+
+    def test_acpi_negative_control_is_rejected_before_raw_stage(self):
+        from shlex import quote
+
+        negative = "kernel: ACPI: Interpreter enabled"
+        replay = run_cmd(
+            _journal_filter_command(
+                f"printf %s {quote(negative)}",
+                [RE_PLATFORM_DEVICE_RELIABILITY],
+            )
+        )
+        assert replay.is_ok()
+        assert replay.stdout == ""
+
+        engine = SysCheckEngine(output_dir="/tmp/test_acpi_negative_replay")
+        self._collect(engine, replay)
+        engine._derive_observations()
+        engine._interpret()
+        assert not any(
+            raw.source_id == "PLATFORM-ACPI-FIRMWARE-ERROR-001"
+            for raw in engine.raw_diagnostics
+        )
+        assert engine.pipeline_accounting == []
+
     def test_collector_emits_firmware_load_fail_p2(self):
         from syscheck import FindingKind, DiagnosticDomain
 
@@ -12038,14 +12270,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.1.3`" in report
+        assert "**Wersja produktu:** `0.1.4`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.1.3" in report
+        assert "Linux Diagnostic Engine 0.1.4" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -12150,7 +12382,7 @@ class TestIteration011RealWorldCorrectness:
 
 
 class TestV013CliPresentationStabilization:
-    """Public CLI presentation contract for the v0.1.3 release."""
+    """Public CLI presentation contract for the v0.1.4 release."""
 
     @staticmethod
     def _finding(severity):

@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.1.3
+Wersja produktu:                         0.1.4
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -34,6 +34,7 @@ import subprocess
 import argparse
 import datetime
 import re
+import shlex
 import shutil
 import sys
 import threading
@@ -57,6 +58,7 @@ from constants import (  # type: ignore[import-untyped]
     RE_FIRMWARE,
     RE_GFX_ERROR,
     RE_KERNEL_ERROR,
+    RE_KERNEL_TAINT,
     RE_AMDGPU_RESET_FAIL,
     RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
@@ -215,10 +217,12 @@ class CmdResult:
             )
             return with_capture_marker(self.stdout or partial_stderr or "(timeout)")
         if self.execution_status == "permission_denied":
+            if self.stdout:
+                return with_capture_marker(self.stdout) + "\n(wymaga sudo — pominięto)"
             return "(wymaga sudo — pominięto)"
         if self.execution_status == "empty_ok":
             return with_capture_marker(self.stdout if self.stdout else "(brak wyników)")
-        if self.truncated and (self.stdout or self.stderr):
+        if self.stdout or self.stderr:
             captured = "\n".join(part for part in (self.stdout, self.stderr) if part)
             return with_capture_marker(captured) + f"\n(błąd rc={self.return_code})"
         return f"(błąd rc={self.return_code})"
@@ -1044,7 +1048,11 @@ def _journal_filter_command(
     upstream_cmd: str, regexes: List[str], tail_lines: Optional[int] = None
 ) -> List[str]:
     """Build a status-aware journal filter with bounded pipeline semantics."""
-    stages = [f"grep -iE '{regex}'" for regex in regexes]
+    # The diagnostic regexes use Python/PCRE constructs such as ``(?:...)``
+    # and ``\b``.  Keep the shell stage aligned with those existing patterns,
+    # and quote the pattern so messages such as ``can't set address`` cannot
+    # terminate the shell string.
+    stages = [f"grep -iP -- {shlex.quote(regex)}" for regex in regexes]
     if tail_lines is not None:
         stages.append(f"tail -{tail_lines}")
     pipeline = f"{upstream_cmd} | " + " | ".join(stages)
@@ -1072,7 +1080,7 @@ def _journal_count_command(upstream_cmd: str, regex: str) -> List[str]:
     return [
         "bash",
         "-c",
-        f"{upstream_cmd} | grep -iE '{regex}' | wc -l; "
+        f"{upstream_cmd} | grep -iP -- {shlex.quote(regex)} | wc -l; "
         'statuses=("${PIPESTATUS[@]}"); '
         'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; '
         'elif [ "${statuses[1]}" -ne 0 ] && [ "${statuses[1]}" -ne 1 ]; then '
@@ -2395,6 +2403,7 @@ class SysCheckEngine:
         self.recommendation_plan: Optional[RecommendationPlan] = None  # Stage 4: REC
         self.raw_diagnostics: List[RawDiagnostic] = []
         self.evidence_objects: List[Evidence] = []
+        self.pipeline_accounting: List[Dict[str, str]] = []
         self.restrictions: List[str] = []
         self.commands_used: List[str] = []
         self._script_pids: List[str] = []
@@ -2464,6 +2473,54 @@ class SysCheckEngine:
         )
         if restriction not in self.restrictions:
             self.restrictions.append(restriction)
+
+    @staticmethod
+    def _pipeline_rejection_reason(observation: Observation) -> str:
+        """Return a stable reason when an Observation has no Finding."""
+        details = observation.details
+        if (
+            observation.category == "btrfs_error"
+            and details.get("status") == "device_missing"
+            and details.get("privilege_limited", False)
+        ):
+            return "privilege_limited_btrfs_missing"
+        if observation.category == "btrfs_error" and details.get("status") in (
+            "permission_denied",
+            "command_not_found",
+        ):
+            return "btrfs_state_requires_privilege_or_tool"
+        if (
+            observation.category == "btrfs_scrub"
+            and details.get("scrub_status") == "scrub_inactive"
+        ):
+            return "btrfs_scrub_inactive"
+        return "rule_returned_no_finding"
+
+    def _refresh_pipeline_accounting(self) -> None:
+        """Expose deterministic RAW -> OBS -> Finding/rejection accounting."""
+        findings_by_observation = {
+            observation_id: finding
+            for finding in self.findings
+            for observation_id in finding.source_observation_ids
+        }
+        self.pipeline_accounting = []
+        for observation in self.observations:
+            finding = findings_by_observation.get(observation.obs_id)
+            self.pipeline_accounting.append(
+                {
+                    "raw_source_id": (
+                        observation.source_raw_ids[0]
+                        if observation.source_raw_ids
+                        else ""
+                    ),
+                    "observation_id": observation.obs_id,
+                    "finding_id": finding.finding_id if finding else "",
+                    "outcome": "finding" if finding else "rejected",
+                    "reason": ""
+                    if finding
+                    else self._pipeline_rejection_reason(observation),
+                }
+            )
 
     # ── Równoległe wykonanie grupy komend ────────────────────────
     def _parallel(self, tasks: Dict[str, Tuple[List[str], int]]) -> Dict[str, str]:
@@ -2733,6 +2790,29 @@ class SysCheckEngine:
             "nvme_list": (["nvme", "list"], TIMEOUT_SHORT, True),
         }
         r = self._parallel_cmd(tasks_cmd)
+        btrfs_show = r["btrfs_show"]
+        btrfs_stats = r["btrfs_stats"]
+        btrfs_scrub = r["btrfs_scrub"]
+        btrfs_statuses = {
+            name: _classify_btrfs_status(result)
+            for name, result in (
+                ("show", btrfs_show),
+                ("stats", btrfs_stats),
+                ("scrub", btrfs_scrub),
+            )
+        }
+        btrfs_missing_lines = {
+            name: [
+                line
+                for line in result.stdout.splitlines()
+                if re.search(r"\bMISSING\b", line, re.IGNORECASE)
+            ]
+            for name, result in (
+                ("show", btrfs_show),
+                ("stats", btrfs_stats),
+                ("scrub", btrfs_scrub),
+            )
+        }
 
         self.report_lines.append(heading(2, "3. Dyski, NVMe i Btrfs"))
         self.report_lines.append(heading(3, "Urządzenia blokowe"))
@@ -2743,10 +2823,22 @@ class SysCheckEngine:
         self.report_lines.append(codeblock(r["df_i"].to_fallback_text()))
         self.report_lines.append(heading(3, "Btrfs — filesystem show"))
         self.report_lines.append(codeblock(r["btrfs_show"].to_fallback_text()))
+        if btrfs_missing_lines["show"]:
+            self.report_lines.append(
+                "⚠️ Btrfs show reports `MISSING`; this unprivileged capture is "
+                "incomplete and non-authoritative. Raw output is preserved; "
+                "no finding is emitted from `MISSING` alone.\n\n"
+            )
         self.report_lines.append(heading(3, "Btrfs — filesystem df"))
         self.report_lines.append(codeblock(r["btrfs_df"].to_fallback_text()))
         self.report_lines.append(heading(3, "Btrfs — device stats"))
         self.report_lines.append(codeblock(r["btrfs_stats"].to_fallback_text()))
+        if btrfs_missing_lines["stats"]:
+            self.report_lines.append(
+                "⚠️ Btrfs device stats reports `MISSING`; this unprivileged "
+                "capture is incomplete and non-authoritative. Raw output is "
+                "preserved; no finding is emitted from `MISSING` alone.\n\n"
+            )
         self.report_lines.append(heading(3, "Btrfs — scrub status"))
         self.report_lines.append(codeblock(r["btrfs_scrub"].to_fallback_text()))
         self.report_lines.append(heading(3, "NVMe list"))
@@ -2760,27 +2852,35 @@ class SysCheckEngine:
             self.report_lines.append(codeblock(nvme_result.to_fallback_text()))
 
         # Analiza Btrfs
-        btrfs_show = r["btrfs_show"]
-        btrfs_stats = r["btrfs_stats"]
-        btrfs_scrub = r["btrfs_scrub"]
-
         for name, result in r.items():
             self._record_truncated_capture(result, f"storage command {name}")
 
         # Sprawdź czy Btrfs wymaga roota
-        for name, result in [
-            ("show", btrfs_show),
-            ("stats", btrfs_stats),
-            ("scrub", btrfs_scrub),
-        ]:
-            status = _classify_btrfs_status(result)
+        for name in ("show", "stats", "scrub"):
+            status = btrfs_statuses[name]
             if status == "permission_denied":
-                self.restrictions.append(
+                restriction = (
                     f"Btrfs {name} — wymaga sudo. "
                     f"Nie można zweryfikować stanu filesystemu Btrfs bez podwyższonych uprawnień."
                 )
+                if btrfs_missing_lines[name]:
+                    restriction += (
+                        " Captured MISSING is incomplete and non-authoritative; "
+                        "raw output is preserved."
+                    )
+            elif status == "device_missing":
+                restriction = (
+                    f"Btrfs {name} reports MISSING under an unprivileged collection; "
+                    "device state is incomplete and non-authoritative. Raw output "
+                    "is preserved; no finding is emitted from MISSING alone."
+                )
+            else:
+                continue
+            if restriction not in self.restrictions:
+                self.restrictions.append(restriction)
 
         # Analiza Btrfs device stats (tylko jeśli mamy dane)
+        btrfs_stats_error_recorded = False
         if btrfs_stats.execution_status == "ok" and btrfs_stats.stdout:
             has_errors = False
             error_counters: Dict[str, int] = {}
@@ -2796,6 +2896,7 @@ class SysCheckEngine:
                         except (ValueError, IndexError):
                             pass
             if has_errors:
+                btrfs_stats_error_recorded = True
                 self.raw_diagnostics.append(
                     _raw_from_result(
                         btrfs_stats,
@@ -2816,8 +2917,25 @@ class SysCheckEngine:
                     "brak błędów nie jest rozstrzygający.\n\n"
                 )
 
+        if btrfs_missing_lines["show"] and not btrfs_stats_error_recorded:
+            self.raw_diagnostics.append(
+                _raw_from_result(
+                    btrfs_show,
+                    source_id="BTRFS-MISSING-INCOMPLETE-001",
+                    category="btrfs_error",
+                    payload={
+                        "status": "device_missing",
+                        "privilege_limited": True,
+                        "missing_detected": True,
+                        "matched_lines": btrfs_missing_lines["show"][:20],
+                        "match_count": len(btrfs_missing_lines["show"]),
+                        "source_query": "btrfs_show",
+                    },
+                )
+            )
+
         # Analiza Btrfs scrub status
-        scrub_status = _classify_btrfs_status(btrfs_scrub)
+        scrub_status = btrfs_statuses["scrub"]
         if scrub_status == "no_scrub":
             self.raw_diagnostics.append(
                 _raw_from_result(
@@ -3145,11 +3263,21 @@ class SysCheckEngine:
                 )
             )
 
-        # Sprawdź taint — używamy precyzyjnego wzorca 'Tainted:' zamiast
-        # substring match by uniknąć false positives na 'Not tainted' itp.
-        if kernel_errors_result.is_ok() and re.search(
-            r"\bTainted:\s", kernel_errors_result.stdout, re.IGNORECASE
-        ):
+        # Sprawdź taint — akceptuj wyłącznie jawne markery kernela, a nie
+        # przypadkowe wystąpienia słowa "tainted" w komunikatach.
+        taint_matching = []
+        if kernel_errors_result.is_ok() and kernel_errors_result.stdout.strip():
+            taint_matching = [
+                line
+                for line in kernel_errors_result.stdout.splitlines()
+                if re.search(RE_KERNEL_TAINT, line, re.IGNORECASE)
+                and not re.search(
+                    r"\bnot\s+(?:tainted|tainting|taints)\b",
+                    line,
+                    re.IGNORECASE,
+                )
+            ]
+        if taint_matching:
             self.raw_diagnostics.append(
                 _raw_from_result(
                     kernel_errors_result,
@@ -3157,11 +3285,10 @@ class SysCheckEngine:
                     category="tainted",
                     payload={
                         "tainted": True,
-                        "matched_lines": [
-                            line
-                            for line in kernel_errors_result.stdout.splitlines()
-                            if re.search(r"\bTainted:\s", line, re.IGNORECASE)
-                        ][:20],
+                        "matched_lines": taint_matching[:20],
+                        "match_count": len(taint_matching),
+                        "journal_scope": "current_boot_kernel",
+                        "source_query": "kernel_errors",
                     },
                 )
             )
@@ -4677,6 +4804,7 @@ class SysCheckEngine:
         self.findings = list(evaluation.findings)
         self.evidence_objects = list(evaluation.evidence)
         self.findings.sort(key=lambda f: Finding._severity_order.get(f.severity, 99))
+        self._refresh_pipeline_accounting()
 
         # Generate recommendations from findings
         engine_rec = RecommendationEngine()

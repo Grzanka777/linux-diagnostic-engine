@@ -90,6 +90,10 @@ class BtrfsDeviceErrorRule(DiagnosticRule):
         status = observation.details.get("status")
         if status in ("ok", "permission_denied", "command_not_found"):
             return DiagnosticRuleResult()
+        if status == "device_missing" and observation.details.get(
+            "privilege_limited", False
+        ):
+            return DiagnosticRuleResult()
 
         evidence_items = (self._evidence_builder.build(observation),)
         return DiagnosticRuleResult(
