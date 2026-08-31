@@ -1,0 +1,18 @@
+{
+  "profile": "home-like-capability-profile",
+  "private_machine_identifiers": [],
+  "capabilities": {
+    "btrfs": "AVAILABLE",
+    "dmesg": "AVAILABLE",
+    "kernel_journal": "AVAILABLE",
+    "nvme": "AVAILABLE",
+    "optional_source": "UNAVAILABLE",
+    "systemd_user": "AVAILABLE",
+    "upower": "AVAILABLE"
+  },
+  "diagnostic_semantics": {
+    "unavailable_source_creates_finding": false,
+    "limited_source_is_health": false,
+    "limited_source_is_failure": false
+  }
+}

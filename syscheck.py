@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.4.0
+Wersja produktu:                         0.5.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -33,6 +33,8 @@ import os
 import subprocess
 import argparse
 import datetime
+import ipaddress
+import json
 import re
 import shlex
 import shutil
@@ -627,6 +629,442 @@ def _cli_error(message: str) -> NoReturn:
     """Render an expected command-line failure without a traceback."""
     print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+# ── Public source capability surface ──────────────────────────────
+
+CAPABILITY_AVAILABLE = "AVAILABLE"
+CAPABILITY_LIMITED = "LIMITED"
+CAPABILITY_NOT_APPLICABLE = "NOT_APPLICABLE"
+CAPABILITY_UNAVAILABLE = "UNAVAILABLE"
+CAPABILITY_FAILED = "FAILED"
+CAPABILITY_STATES = frozenset(
+    {
+        CAPABILITY_AVAILABLE,
+        CAPABILITY_LIMITED,
+        CAPABILITY_NOT_APPLICABLE,
+        CAPABILITY_UNAVAILABLE,
+        CAPABILITY_FAILED,
+    }
+)
+
+
+@dataclass(frozen=True)
+class SourceCapability:
+    """Stable, non-diagnostic description of one source family."""
+
+    family: str
+    status: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        if self.status not in CAPABILITY_STATES:
+            raise ValueError(f"Unsupported capability status: {self.status}")
+
+    def to_dict(self) -> dict:
+        return {
+            "family": self.family,
+            "status": self.status,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityProbeSpec:
+    """One existing read-only source query exposed by ``lde capabilities``."""
+
+    family: str
+    command: Tuple[str, ...]
+    timeout: int = TIMEOUT_SHORT
+    optional_dependency: bool = False
+    empty_means_not_applicable: bool = False
+    mode: str = "generic"
+
+
+CAPABILITY_PROBES = (
+    CapabilityProbeSpec("system_journal", ("journalctl", "-b", "--no-pager")),
+    CapabilityProbeSpec("kernel_journal", ("journalctl", "-b", "-k", "--no-pager")),
+    CapabilityProbeSpec(
+        "kernel_dmesg",
+        ("cat", "/proc/sys/kernel/dmesg_restrict"),
+        mode="dmesg_restrict",
+    ),
+    CapabilityProbeSpec(
+        "systemd_system",
+        ("systemctl", "--failed", "--no-pager"),
+        mode="systemd_system",
+    ),
+    CapabilityProbeSpec(
+        "systemd_user",
+        ("systemctl", "--user", "--failed", "--no-pager"),
+        mode="systemd_user",
+    ),
+    CapabilityProbeSpec(
+        "network_manager",
+        ("systemctl", "status", "NetworkManager", "--no-pager"),
+    ),
+    CapabilityProbeSpec("upower", ("upower", "-d"), optional_dependency=True),
+    CapabilityProbeSpec(
+        "btrfs",
+        ("btrfs", "filesystem", "show", "/"),
+        optional_dependency=True,
+    ),
+    CapabilityProbeSpec(
+        "nvme",
+        ("nvme", "list"),
+        optional_dependency=True,
+        empty_means_not_applicable=True,
+    ),
+    CapabilityProbeSpec(
+        "pci",
+        ("lspci", "-k"),
+        optional_dependency=True,
+        empty_means_not_applicable=True,
+    ),
+    CapabilityProbeSpec(
+        "usb", ("lsusb",), optional_dependency=True, empty_means_not_applicable=True
+    ),
+    CapabilityProbeSpec(
+        "sensors",
+        ("sensors",),
+        optional_dependency=True,
+        empty_means_not_applicable=True,
+    ),
+)
+
+
+def _capability_detail(status: str) -> str:
+    return {
+        CAPABILITY_AVAILABLE: "authoritative source query succeeded",
+        CAPABILITY_LIMITED: "source is available but collection is limited",
+        CAPABILITY_NOT_APPLICABLE: "source does not apply on this workstation",
+        CAPABILITY_UNAVAILABLE: "command or source is unavailable",
+        CAPABILITY_FAILED: "source query failed; state is unknown",
+    }[status]
+
+
+def _stderr_contains(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def _capability_from_result(
+    spec: CapabilityProbeSpec, result: CmdResult
+) -> SourceCapability:
+    """Map an existing source query to a capability state only.
+
+    Capability states never become Findings and no state is described as
+    healthy.  The classifier deliberately uses fixed public wording instead
+    of exposing command output that may contain workstation identifiers.
+    """
+    if result.execution_status == "not_found":
+        status = CAPABILITY_UNAVAILABLE
+    elif result.execution_status == "permission_denied":
+        status = CAPABILITY_LIMITED
+    elif result.execution_status == "timeout" or result.truncated:
+        status = CAPABILITY_LIMITED
+    elif result.execution_status != "ok":
+        captured = f"{result.stdout}\n{result.stderr}"
+        if _stderr_contains(
+            captured,
+            (
+                "permission denied",
+                "operation not permitted",
+                "access denied",
+                "not permitted",
+            ),
+        ):
+            status = CAPABILITY_LIMITED
+        elif spec.mode == "systemd_user" and _stderr_contains(
+            captured,
+            (
+                "failed to connect to bus",
+                "no medium found",
+                "no data available",
+                "user scope bus",
+                "local transport",
+                "no such file or directory",
+                "not running systemd",
+            ),
+        ):
+            status = CAPABILITY_LIMITED
+        elif _stderr_contains(
+            captured,
+            (
+                "not a btrfs filesystem",
+                "unit networkmanager.service could not be found",
+                "unit networkmanager.service not found",
+                "no sensors found",
+                "no nvme controllers",
+            ),
+        ):
+            status = CAPABILITY_NOT_APPLICABLE
+        elif spec.mode == "systemd_system" and _stderr_contains(
+            captured,
+            ("not booted with systemd",),
+        ):
+            status = CAPABILITY_NOT_APPLICABLE
+        elif spec.family in {
+            "systemd_system",
+            "systemd_user",
+            "network_manager",
+        } and _stderr_contains(
+            captured,
+            ("failed to connect to bus", "no data available", "local transport"),
+        ):
+            status = CAPABILITY_LIMITED
+        else:
+            status = CAPABILITY_FAILED
+    elif spec.mode == "dmesg_restrict":
+        value = result.stdout.strip()
+        if value == "1":
+            status = CAPABILITY_LIMITED
+        elif value == "0":
+            status = CAPABILITY_AVAILABLE
+        else:
+            status = CAPABILITY_FAILED
+    elif spec.empty_means_not_applicable and not result.stdout.strip():
+        status = CAPABILITY_NOT_APPLICABLE
+    else:
+        status = CAPABILITY_AVAILABLE
+    return SourceCapability(spec.family, status, _capability_detail(status))
+
+
+def _session_display_capability() -> SourceCapability:
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+        status = CAPABILITY_AVAILABLE
+    else:
+        status = CAPABILITY_NOT_APPLICABLE
+    detail = (
+        "session environment is available"
+        if status == CAPABILITY_AVAILABLE
+        else _capability_detail(status)
+    )
+    return SourceCapability("session_display", status, detail)
+
+
+def probe_source_capabilities() -> tuple[SourceCapability, ...]:
+    """Probe only source availability already used by the diagnostic run."""
+    capabilities = [
+        _capability_from_result(
+            spec,
+            run_cmd(
+                list(spec.command),
+                timeout=spec.timeout,
+                optional_dependency=spec.optional_dependency,
+            ),
+        )
+        for spec in CAPABILITY_PROBES
+    ]
+    capabilities.append(_session_display_capability())
+    return tuple(capabilities)
+
+
+def format_capabilities(
+    capabilities: Iterable[SourceCapability], *, json_output: bool = False
+) -> str:
+    """Format source capabilities with stable ordering and no terminal state."""
+    ordered = tuple(capabilities)
+    if json_output:
+        return (
+            json.dumps(
+                {
+                    "product": PRODUCT_NAME,
+                    "version": PRODUCT_VERSION,
+                    "capabilities": [capability.to_dict() for capability in ordered],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    lines = [
+        f"{PRODUCT_NAME} {PRODUCT_VERSION}",
+        "Source capabilities",
+        "FAMILY                 STATUS          DETAIL",
+    ]
+    lines.extend(
+        f"{capability.family:<22} {capability.status:<15} {capability.detail}"
+        for capability in ordered
+    )
+    return "\n".join(lines) + "\n"
+
+
+# ── Deterministic report/snapshot sanitization ─────────────────────
+
+SANITIZATION_NOTICE = (
+    "Known host, user, network, and explicitly owned hardware identifiers "
+    "were replaced. This artifact is not guaranteed anonymous; inspect it "
+    "before sharing."
+)
+
+_UUID_RE = re.compile(
+    r"(?<![0-9A-Fa-f])"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"(?![0-9A-Fa-f])"
+)
+_MAC_RE = re.compile(
+    r"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])"
+)
+_IPV4_RE = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])")
+_IPV6_CANDIDATE_RE = re.compile(
+    r"(?<![0-9A-Fa-f:])[0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?(?![0-9A-Fa-f:])"
+)
+_HOME_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/home/[A-Za-z0-9._-]+")
+_ROOT_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/root(?=$|[/\s:])")
+_RUNTIME_USER_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/run/user/[0-9]+")
+
+
+def _replace_ip_literals(text: str) -> str:
+    def replace_ipv6(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        if ":" not in candidate:
+            return candidate
+        address = candidate.split("%", 1)[0]
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return candidate
+        return "<IP>"
+
+    text = _IPV6_CANDIDATE_RE.sub(replace_ipv6, text)
+
+    def replace_ipv4(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            ipaddress.IPv4Address(candidate)
+        except ipaddress.AddressValueError:
+            return candidate
+        return "<IP>"
+
+    return _IPV4_RE.sub(replace_ipv4, text)
+
+
+def _sanitize_text(text: str, *, hostname: str = "") -> str:
+    if hostname and hostname not in {"unknown", "?"}:
+        hostname_pattern = re.compile(
+            rf"(?<![A-Za-z0-9._-]){re.escape(hostname)}(?![A-Za-z0-9._-])"
+        )
+        text = hostname_pattern.sub("<HOST>", text)
+    text = _UUID_RE.sub("<UUID>", text)
+    text = _MAC_RE.sub("<MAC>", text)
+    text = _replace_ip_literals(text)
+    text = _HOME_PATH_RE.sub("<HOME>", text)
+    text = _ROOT_PATH_RE.sub("<HOME>", text)
+    return _RUNTIME_USER_PATH_RE.sub("/run/user/<USER>", text)
+
+
+_SANITIZE_ID_KEYS = frozenset(
+    {
+        "source_id",
+        "obs_id",
+        "observation_id",
+        "finding_id",
+        "evidence_id",
+        "raw_id",
+        "source_observation_ids",
+        "source_raw_ids",
+        "evidence_ids",
+        "rule_id",
+    }
+)
+_SANITIZE_HOST_KEYS = frozenset({"hostname", "host_name"})
+_SANITIZE_USER_KEYS = frozenset({"username", "user_name"})
+_SANITIZE_HOME_KEYS = frozenset({"home", "home_path"})
+_SANITIZE_SERIAL_KEYS = frozenset({"serial", "serial_number", "device_serial"})
+_SANITIZE_LABEL_KEYS = frozenset({"filesystem_label", "volume_label"})
+
+
+def _sanitize_json_value(value: Any, *, key: str = "", hostname: str = "") -> Any:
+    lowered_key = key.lower()
+    if isinstance(value, dict):
+        return {
+            child_key: _sanitize_json_value(
+                child_value, key=child_key, hostname=hostname
+            )
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _sanitize_json_value(item, key=key, hostname=hostname) for item in value
+        ]
+    if not isinstance(value, str):
+        return value
+    if lowered_key in _SANITIZE_ID_KEYS or lowered_key.endswith("_ids"):
+        return value
+    if lowered_key in _SANITIZE_HOST_KEYS:
+        return "<HOST>"
+    if lowered_key in _SANITIZE_USER_KEYS:
+        return "<USER>"
+    if lowered_key in _SANITIZE_HOME_KEYS:
+        return "<HOME>"
+    if lowered_key in _SANITIZE_SERIAL_KEYS:
+        return "<SERIAL>"
+    if lowered_key in _SANITIZE_LABEL_KEYS:
+        return "<LABEL>"
+    return _sanitize_text(value, hostname=hostname)
+
+
+def _markdown_hostname(text: str) -> str:
+    match = re.search(r"(?im)^\s*\*\*Hostname:\*\*\s*`([^`\n]*)`", text)
+    return match.group(1).strip() if match else ""
+
+
+def _sanitize_markdown(text: str) -> str:
+    hostname = _markdown_hostname(text)
+    text = _sanitize_text(text, hostname=hostname)
+    field_patterns = (
+        (r"(?im)(^\s*\*\*Hostname:\*\*\s*`)[^`\n]+(`)", "<HOST>"),
+        (r"(?im)(^\s*\*\*(?:Username|User):\*\*\s*`)[^`\n]+(`)", "<USER>"),
+        (
+            r"(?im)(^\s*\*\*Serial(?: number)?:\*\*\s*`)[^`\n]+(`)",
+            "<SERIAL>",
+        ),
+        (
+            r"(?im)(^\s*\*\*Filesystem label:\*\*\s*`)[^`\n]+(`)",
+            "<LABEL>",
+        ),
+    )
+    for pattern, replacement in field_patterns:
+        text = re.sub(pattern, rf"\g<1>{replacement}\g<2>", text)
+    if not text.endswith("\n"):
+        text += "\n"
+    notice_line = f"> Sanitization note: {SANITIZATION_NOTICE}"
+    if notice_line in text:
+        return text
+    return f"{text}\n{notice_line}\n"
+
+
+def sanitize_artifact(input_path: str | Path) -> str:
+    """Return a sanitized Markdown report or validated schema-3 snapshot."""
+    path = Path(input_path).expanduser()
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise
+    suffix = path.suffix.lower()
+    if suffix == ".md":
+        return _sanitize_markdown(raw_text)
+    if suffix != ".json":
+        raise ValueError(
+            "Unsupported input type; expected a .md report or .json snapshot"
+        )
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON input: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Snapshot root must be a JSON object")
+    try:
+        SystemSnapshot._from_validated(payload)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid snapshot input: {exc}") from exc
+    metadata = payload.get("metadata")
+    hostname = metadata.get("hostname", "") if isinstance(metadata, dict) else ""
+    sanitized = _sanitize_json_value(payload, hostname=str(hostname))
+    return json.dumps(sanitized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 CLI_STATUS_HEALTHY = "HEALTHY"
@@ -6908,7 +7346,87 @@ def main() -> None:
         help="Write the comparison report to a Markdown file",
     )
 
+    # ── Source capability command ─────────────────────────────────
+    capabilities_parser = subparsers.add_parser(
+        "capabilities", help="Show diagnostic source capabilities"
+    )
+    capabilities_parser.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+
+    # ── Sanitization command ──────────────────────────────────────
+    sanitize_parser = subparsers.add_parser(
+        "sanitize", help="Create a sanitized copy of a report or snapshot"
+    )
+    sanitize_parser.add_argument(
+        "input", help="Input .md report or schema-3 .json snapshot"
+    )
+    sanitize_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="Explicit new output path; the input is never overwritten",
+    )
+
+    # ── Snapshot utility commands ─────────────────────────────────
+    snapshot_parser = subparsers.add_parser(
+        "snapshot", help="Validate or inspect a JSON snapshot"
+    )
+    snapshot_subparsers = snapshot_parser.add_subparsers(
+        dest="snapshot_command", required=True, help="Snapshot commands"
+    )
+    validate_parser = snapshot_subparsers.add_parser(
+        "validate", help="Validate a schema-3 JSON snapshot"
+    )
+    validate_parser.add_argument("input", help="Path to the JSON snapshot")
+
     args = parser.parse_args()
+
+    # ── Capabilities handling ─────────────────────────────────────
+    if args.command == "capabilities":
+        sys.stdout.write(
+            format_capabilities(probe_source_capabilities(), json_output=args.json)
+        )
+        return
+
+    # ── Sanitization handling ─────────────────────────────────────
+    if args.command == "sanitize":
+        input_path = Path(args.input).expanduser()
+        output_path = Path(args.output).expanduser()
+        try:
+            if input_path.resolve() == output_path.resolve():
+                _cli_error("Sanitization output must be different from the input")
+            sanitized = sanitize_artifact(input_path)
+            _write_new_text(output_path, sanitized)
+        except FileNotFoundError as exc:
+            _cli_error(f"Sanitization input or destination not found: {exc}")
+        except IsADirectoryError as exc:
+            _cli_error(f"Sanitization path is a directory: {exc}")
+        except PermissionError as exc:
+            _cli_error(f"Cannot read or write sanitization path: {exc}")
+        except UnicodeError as exc:
+            _cli_error(f"Sanitization input is not valid UTF-8: {exc}")
+        except ValueError as exc:
+            _cli_error(str(exc))
+        except FileExistsError as exc:
+            _cli_error(str(exc))
+        print(f"Sanitized artifact saved to: {output_path.resolve()}")
+        print(f"Notice: {SANITIZATION_NOTICE}")
+        return
+
+    # ── Snapshot validation handling ──────────────────────────────
+    if args.command == "snapshot":
+        try:
+            snapshot = SystemSnapshot.from_json(args.input)
+        except FileNotFoundError as exc:
+            _cli_error(f"Snapshot input not found: {exc.filename or args.input}")
+        except (IsADirectoryError, PermissionError) as exc:
+            _cli_error(f"Cannot read snapshot input: {exc}")
+        except (AttributeError, ValueError, UnicodeError) as exc:
+            _cli_error(f"Invalid snapshot input: {exc}")
+        print(f"Snapshot valid: {Path(args.input).expanduser().resolve()}")
+        print(f"Schema: {snapshot.schema_version}")
+        return
 
     # ── Compare handling ──────────────────────────────────────────
     if args.command == "compare":
