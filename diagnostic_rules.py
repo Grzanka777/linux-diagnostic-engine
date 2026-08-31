@@ -96,18 +96,51 @@ class BtrfsDeviceErrorRule(DiagnosticRule):
             return DiagnosticRuleResult()
 
         evidence_items = (self._evidence_builder.build(observation),)
+        if status == "device_missing":
+            title = "Btrfs zgłasza brak urządzenia w filesystemie"
+            evidence = str(observation.details.get("matched_lines", []))
+            interpretation = (
+                "Udane, kompletne zapytanie `btrfs filesystem show` zgłosiło "
+                "urządzenie oznaczone jako MISSING. Jest to bezpośrednia "
+                "obserwacja stanu Btrfs, ale sama nie dowodzi utraty danych "
+                "ani zakresu uszkodzenia filesystemu."
+            )
+            recommended_diagnostics = "`btrfs filesystem show /`"
+            remediation = (
+                "Nie uruchamiaj scrub, replace ani repair przed zabezpieczeniem "
+                "danych i potwierdzeniem kompletnego stanu urządzeń."
+            )
+            verification = (
+                "`btrfs filesystem show /` — brak urządzeń oznaczonych MISSING"
+            )
+            risk_level = (
+                "Wysokie ryzyko niedostępności danych; zakres szkody wymaga "
+                "dalszej weryfikacji."
+            )
+        else:
+            title = "Btrfs device stats wykazują błędy we/wy"
+            evidence = str(observation.details.get("line", ""))
+            interpretation = (
+                "Liczniki błędów Btrfs są niezerowe — możliwy problem sprzętowy."
+            )
+            recommended_diagnostics = (
+                "`sudo btrfs scrub start /`; `sudo btrfs device stats /`"
+            )
+            remediation = "Jeśli błędy utrzymują się po scrubie, rozważ wymianę dysku."
+            verification = "`sudo btrfs device stats /` — wszystkie liczniki zerowe"
+            risk_level = "Wysokie ryzyko utraty danych."
         return DiagnosticRuleResult(
             finding=_syscheck().Finding(
                 finding_id=obs_id,
-                title="Btrfs device stats wykazują błędy we/wy",
+                title=title,
                 severity="P1",
                 confidence=conf,
-                evidence=str(observation.details.get("line", "")),
-                interpretation="Liczniki błędów Btrfs są niezerowe — możliwy problem sprzętowy.",
-                recommended_diagnostics="`sudo btrfs scrub start /`; `sudo btrfs device stats /`",
-                remediation="Jeśli błędy utrzymują się po scrubie, rozważ wymianę dysku.",
-                verification="`sudo btrfs device stats /` — wszystkie liczniki zerowe",
-                risk_level="Wysokie ryzyko utraty danych.",
+                evidence=evidence,
+                interpretation=interpretation,
+                recommended_diagnostics=recommended_diagnostics,
+                remediation=remediation,
+                verification=verification,
+                risk_level=risk_level,
                 domain=classification.domain,
                 kind=classification.kind,
                 actionability=classification.actionability,
@@ -776,6 +809,15 @@ class HardwareMceEdacRule(DiagnosticRule):
 class FilesystemIoErrorRule(DiagnosticRule):
     rule_id = "RULE-FILESYSTEM-IO-ERROR"
     supported_categories = frozenset({"filesystem_io_error"})
+    _RECOMMENDATION_PATTERN = (
+        r"\b(?:Buffer I/O error\b|blk_update_request:\s*I/O error\b|"
+        r"I/O error,\s*dev\b|EXT4-fs\s+error\b|EXT4-fs\s*(?:\([^)]+\))?"
+        r"\s*:\s*(?:error\b|.*?error count\b|initial error\b|last error\b)|"
+        r"XFS.*?metadata I/O error\b|"
+        r"BTRFS(?::\s*|\s+)(?:error|critical)\b|critical medium error\b|"
+        r"(?:remount(?:ing)?|remounted)\s+(?:the\s+)?(?:file)?system\s+"
+        r"(?:as\s+)?read[- ]only\b)"
+    )
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -815,7 +857,7 @@ class FilesystemIoErrorRule(DiagnosticRule):
                 ),
                 recommended_diagnostics=(
                     "Zachowaj dokładne linie błędu i sprawdź, czy problem się powtarza:\n"
-                    "`journalctl -b -k --no-pager | grep -iE 'Buffer I/O|blk_update_request|EXT4-fs|XFS|BTRFS|critical medium error'`\n"
+                    f"`journalctl -b -k --no-pager | grep -iP '{self._RECOMMENDATION_PATTERN}'`\n"
                     "Sprawdź stan systemu plików odpowiednim narzędziem diagnostycznym w trybie tylko do odczytu."
                 ),
                 remediation=(
@@ -824,7 +866,7 @@ class FilesystemIoErrorRule(DiagnosticRule):
                 ),
                 verification=(
                     "W kolejnym bocie sprawdź dziennik pod kątem nowych zdarzeń błędów I/O:\n"
-                    "`journalctl -b -k --no-pager | grep -iE 'Buffer I/O|blk_update_request|EXT4-fs|XFS|BTRFS|critical medium error'`."
+                    f"`journalctl -b -k --no-pager | grep -iP '{self._RECOMMENDATION_PATTERN}'`."
                 ),
                 risk_level=(
                     "Umiarkowane dla standardowych błędów I/O (P2), wysokie dla błędów krytycznych/fatalnych (P1). "

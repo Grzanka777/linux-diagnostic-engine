@@ -9,7 +9,7 @@ from pathlib import Path
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.2.0"
+PRODUCT_VERSION = "0.3.0"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for
@@ -77,7 +77,9 @@ RE_FILESYSTEM_IO_ERROR = (
     r"\bEXT4-fs\s*(?:\([^)]+\))?:\s*(?:error\b|.*?error count\b|initial error\b|last error\b)|"
     r"\bXFS.*?\bmetadata I/O error\b|"
     r"\bBTRFS(?::\s*|\s+)(?:error|critical)\b|"
-    r"\bcritical medium error\b"
+    r"\bcritical medium error\b|"
+    r"\b(?:remount(?:ing)?|remounted)\s+(?:the\s+)?(?:file)?system\s+"
+    r"(?:as\s+)?read[- ]only\b"
     r")"
 )
 RE_HARDWARE_THERMAL_THROTTLE = (

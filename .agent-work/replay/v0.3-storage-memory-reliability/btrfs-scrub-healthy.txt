@@ -1,0 +1,2 @@
+Scrub status for sanitized
+scrub started at 2026-08-31 00:00:00, running 0 seconds

@@ -1,0 +1,3 @@
+  UNIT                 LOAD   ACTIVE SUB    DESCRIPTION
+● REDACTED.service     loaded failed failed Sanitized service failure
+1 loaded units listed.

@@ -1,0 +1,2 @@
+kernel: service invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0
+systemd-oomd: memory pressure relief observed; no oomd kill action recorded

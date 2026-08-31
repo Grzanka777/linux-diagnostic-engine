@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.2.0
+Wersja produktu:                         0.3.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -890,7 +890,28 @@ def _filter_invalid_temperatures(text: str) -> str:
     return "\n".join(filtered)
 
 
-def _classify_btrfs_status(cmd_result: CmdResult) -> str:
+_BTRFS_DEVICE_RECORD_RE = re.compile(
+    r"^\s*devid\s+\d+\b.*\bpath\s+\S+(?:\s+MISSING)?\s*$",
+    re.IGNORECASE,
+)
+_BTRFS_MISSING_DEVICE_RE = re.compile(
+    r"^\s*devid\s+\d+\b.*\bpath\s+\S+\s+MISSING\s*$",
+    re.IGNORECASE,
+)
+_BTRFS_DEVICE_STAT_RECORD_RE = re.compile(
+    r"^\s*(?P<device>\[[^\]\r\n]+\])\.(?P<counter>[A-Za-z0-9_]+)\s+"
+    r"(?P<value>\d+)\s*$"
+)
+
+
+def _btrfs_missing_device_lines(text: str) -> List[str]:
+    """Return only structured Btrfs device records marked ``MISSING``."""
+    return [line for line in text.splitlines() if _BTRFS_MISSING_DEVICE_RE.search(line)]
+
+
+def _classify_btrfs_status(
+    cmd_result: CmdResult, *, command_kind: Optional[str] = None
+) -> str:
     """
     Klasyfikuje wynik polecenia btrfs.
     Zwraca: "ok", "no_scrub", "scrub_inactive", "permission_denied",
@@ -935,15 +956,64 @@ def _classify_btrfs_status(cmd_result: CmdResult) -> str:
     ):
         return "scrub_inactive"
 
-    # Sprawdź missing device
-    if "missing" in stdout_lower:
+    # Only a structured device record is evidence of a missing device.  Text
+    # such as "No missing devices" is a healthy/negative control, not a
+    # device error.  The optional kind allows filesystem-show to reject a
+    # successful but unrecognizable capture as non-authoritative.
+    if _btrfs_missing_device_lines(cmd_result.stdout):
         return "device_missing"
+
+    if command_kind == "show" and (
+        not cmd_result.stdout.strip()
+        or not any(
+            _BTRFS_DEVICE_RECORD_RE.search(line)
+            for line in cmd_result.stdout.splitlines()
+        )
+    ):
+        return "error"
 
     # Jeśli wszystko OK
     if cmd_result.return_code == 0:
         return "ok"
 
     return "error"
+
+
+def _btrfs_missing_capture_is_authoritative(result: CmdResult, status: str) -> bool:
+    """Whether a structured Btrfs ``MISSING`` line is usable as evidence."""
+    return (
+        status == "device_missing"
+        and result.execution_status == "ok"
+        and result.return_code == 0
+        and not result.privilege_required
+        and not result.truncated
+    )
+
+
+def _parse_btrfs_device_stats(text: str) -> Tuple[Dict[str, int], int, bool]:
+    """Parse Btrfs device-stat records and retain malformed-output evidence.
+
+    Returns ``(non_zero_error_counters, valid_record_count, malformed)``.  A
+    valid record may be a non-error counter such as ``cleaner_ios``; only
+    counters ending in ``_errs`` can become a device-error observation.
+    """
+    counters: Dict[str, int] = {}
+    valid_records = 0
+    malformed = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _BTRFS_DEVICE_STAT_RECORD_RE.match(line)
+        if match is None:
+            malformed = True
+            continue
+        valid_records += 1
+        counter = match.group("counter")
+        if counter.endswith("_errs"):
+            value = int(match.group("value"))
+            if value != 0:
+                counters[f"{match.group('device')}.{counter}"] = value
+    return counters, valid_records, malformed
 
 
 def _get_bootable_kernels_from_modules() -> List[str]:
@@ -1161,9 +1231,43 @@ def _filesystem_io_error_severity(line: str) -> Optional[str]:
         or "forced shutdown" in normalized
         or "shut down due to" in normalized
         or "remount-ro" in normalized
+        or "read-only" in normalized
+        or "read only" in normalized
     ):
         return "critical_or_fatal"
     return "io_error"
+
+
+def _filesystem_io_error_family(line: str) -> Optional[str]:
+    """Classify a matched I/O event without inferring its root cause."""
+    if not re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE):
+        return None
+    normalized = line.lower()
+    if any(
+        marker in normalized
+        for marker in (
+            "corrupt",
+            "checksum",
+            "parent transid",
+            "generation",
+        )
+    ):
+        return "filesystem_corruption"
+    if "read-only" in normalized or "read only" in normalized:
+        return "filesystem_read_only"
+    if any(
+        marker in normalized
+        for marker in (
+            "buffer i/o error",
+            "blk_update_request",
+            "i/o error, dev",
+            "critical medium error",
+        )
+    ):
+        return "block_io"
+    if any(marker in normalized for marker in ("ext4-fs", "xfs", "btrfs")):
+        return "filesystem"
+    return "unknown"
 
 
 def _kernel_oops_panic_severity(line: str) -> Optional[str]:
@@ -2045,6 +2149,7 @@ class EvidenceBuilder:
                     "match_count": count,
                     "matched_lines": d.get("matched_lines", []),
                     "event_classes": d.get("event_classes", []),
+                    "event_families": d.get("event_families", []),
                     "journal_scope": d.get("journal_scope", "current_boot_kernel"),
                     "source_query": d.get("source_query", "filesystem_io_error"),
                 },
@@ -2500,8 +2605,46 @@ class SysCheckEngine:
         if result is None or not result.truncated:
             return
         restriction = (
-            f"Capture truncated for {source_name}; absence of matching data "
-            "is not authoritative."
+            f"Capture truncated for {source_name} (status=TRUNCATED_OUTPUT); "
+            "absence of matching data is not authoritative."
+        )
+        if restriction not in self.restrictions:
+            self.restrictions.append(restriction)
+
+    def _record_source_status(
+        self,
+        result: Optional[CmdResult],
+        source_name: str,
+        *,
+        authority_state: Optional[str] = None,
+    ) -> None:
+        """Record a source state that cannot prove health or failure.
+
+        Collection failures are deliberately kept out of diagnostic Findings.
+        The status token remains explicit so command failure is not confused
+        with a successful zero-result query.
+        """
+        if result is None:
+            return
+        if authority_state is None:
+            if result.execution_status == "ok" and not result.truncated:
+                return
+            if result.execution_status == "ok" and result.truncated:
+                self._record_truncated_capture(result, source_name)
+                return
+            authority_state = {
+                "error": "FAILED_EXECUTION",
+                "timeout": "TIMEOUT",
+                "not_found": "COMMAND_NOT_FOUND",
+                "permission_denied": "PERMISSION_DENIED",
+                "empty_ok": "MALFORMED_OUTPUT",
+            }.get(result.execution_status, "FAILED_EXECUTION")
+        if authority_state == "SUCCESS_AUTHORITATIVE":
+            return
+        restriction = (
+            f"Source {source_name} cannot establish an authoritative state "
+            f"(status={authority_state}, rc={result.return_code}); "
+            "no healthy or failure state was inferred."
         )
         if restriction not in self.restrictions:
             self.restrictions.append(restriction)
@@ -2830,7 +2973,7 @@ class SysCheckEngine:
         btrfs_stats = r["btrfs_stats"]
         btrfs_scrub = r["btrfs_scrub"]
         btrfs_statuses = {
-            name: _classify_btrfs_status(result)
+            name: _classify_btrfs_status(result, command_kind=name)
             for name, result in (
                 ("show", btrfs_show),
                 ("stats", btrfs_stats),
@@ -2838,11 +2981,7 @@ class SysCheckEngine:
             )
         }
         btrfs_missing_lines = {
-            name: [
-                line
-                for line in result.stdout.splitlines()
-                if re.search(r"\bMISSING\b", line, re.IGNORECASE)
-            ]
+            name: _btrfs_missing_device_lines(result.stdout)
             for name, result in (
                 ("show", btrfs_show),
                 ("stats", btrfs_stats),
@@ -2886,6 +3025,7 @@ class SysCheckEngine:
             )
         else:
             self.report_lines.append(codeblock(nvme_result.to_fallback_text()))
+        self._record_source_status(nvme_result, "NVMe tool output")
 
         # Analiza Btrfs
         for name, result in r.items():
@@ -2904,33 +3044,62 @@ class SysCheckEngine:
                         " Captured MISSING is incomplete and non-authoritative; "
                         "raw output is preserved."
                     )
-            elif status == "device_missing":
+            elif (
+                status == "device_missing"
+                and not _btrfs_missing_capture_is_authoritative(
+                    {"show": btrfs_show, "stats": btrfs_stats, "scrub": btrfs_scrub}[
+                        name
+                    ],
+                    status,
+                )
+            ):
                 restriction = (
                     f"Btrfs {name} reports MISSING under an unprivileged collection; "
                     "device state is incomplete and non-authoritative. Raw output "
                     "is preserved; no finding is emitted from MISSING alone."
+                )
+            elif name == "show" and status in {"error", "command_not_found"}:
+                restriction = (
+                    "Btrfs show returned no authoritative device inventory; "
+                    "Btrfs device state is unknown."
                 )
             else:
                 continue
             if restriction not in self.restrictions:
                 self.restrictions.append(restriction)
 
+        if btrfs_stats.execution_status != "ok" and btrfs_statuses["stats"] != (
+            "permission_denied"
+        ):
+            self._record_source_status(btrfs_stats, "Btrfs device stats")
+        if btrfs_show.execution_status != "ok" and btrfs_statuses["show"] != (
+            "permission_denied"
+        ):
+            self._record_source_status(btrfs_show, "Btrfs filesystem show")
+        if btrfs_scrub.execution_status != "ok" and btrfs_statuses["scrub"] != (
+            "permission_denied"
+        ):
+            self._record_source_status(btrfs_scrub, "Btrfs scrub status")
+
         # Analiza Btrfs device stats (tylko jeśli mamy dane)
         btrfs_stats_error_recorded = False
+        if btrfs_stats.execution_status == "ok" and not btrfs_stats.stdout.strip():
+            self._record_source_status(
+                btrfs_stats,
+                "Btrfs device stats",
+                authority_state="MALFORMED_OUTPUT",
+            )
         if btrfs_stats.execution_status == "ok" and btrfs_stats.stdout:
-            has_errors = False
-            error_counters: Dict[str, int] = {}
-            for line in btrfs_stats.stdout.split("\n"):
-                if "_errs" in line:
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        try:
-                            value = int(parts[-1])
-                            if value != 0:
-                                has_errors = True
-                                error_counters[parts[0]] = value
-                        except (ValueError, IndexError):
-                            pass
+            error_counters, valid_records, stats_malformed = _parse_btrfs_device_stats(
+                btrfs_stats.stdout
+            )
+            has_errors = bool(error_counters)
+            if stats_malformed:
+                self._record_source_status(
+                    btrfs_stats,
+                    "Btrfs device stats",
+                    authority_state="MALFORMED_OUTPUT",
+                )
             if has_errors:
                 btrfs_stats_error_recorded = True
                 self.raw_diagnostics.append(
@@ -2940,10 +3109,22 @@ class SysCheckEngine:
                         category="btrfs_error",
                         payload={
                             "device_error_counters": dict(error_counters),
+                            "stats_malformed": stats_malformed,
                         },
                     )
                 )
-            if not has_errors and not btrfs_stats.truncated:
+            if not has_errors and valid_records == 0 and not stats_malformed:
+                self._record_source_status(
+                    btrfs_stats,
+                    "Btrfs device stats",
+                    authority_state="MALFORMED_OUTPUT",
+                )
+            elif not has_errors and stats_malformed:
+                self.report_lines.append(
+                    "⚠️ Wynik Btrfs device stats jest niepełny lub nierozpoznawalny; "
+                    "brak błędów nie jest rozstrzygający.\n\n"
+                )
+            elif not has_errors and not btrfs_stats.truncated:
                 self.report_lines.append(
                     "✅ Liczniki błędów Btrfs: wszystkie zerowe.\n\n"
                 )
@@ -2954,14 +3135,22 @@ class SysCheckEngine:
                 )
 
         if btrfs_missing_lines["show"] and not btrfs_stats_error_recorded:
+            authoritative_missing = _btrfs_missing_capture_is_authoritative(
+                btrfs_show, btrfs_statuses["show"]
+            )
             self.raw_diagnostics.append(
                 _raw_from_result(
                     btrfs_show,
-                    source_id="BTRFS-MISSING-INCOMPLETE-001",
+                    source_id=(
+                        "BTRFS-DEVICE-MISSING-001"
+                        if authoritative_missing
+                        else "BTRFS-MISSING-INCOMPLETE-001"
+                    ),
                     category="btrfs_error",
                     payload={
                         "status": "device_missing",
-                        "privilege_limited": True,
+                        "privilege_limited": not authoritative_missing,
+                        "authoritative": authoritative_missing,
                         "missing_detected": True,
                         "matched_lines": btrfs_missing_lines["show"][:20],
                         "match_count": len(btrfs_missing_lines["show"]),
@@ -3167,6 +3356,22 @@ class SysCheckEngine:
         for name, result in r.items():
             if name not in {"lspci", "lsusb"}:
                 self._record_truncated_capture(result, f"current-boot query {name}")
+
+        reliability_query_names = (
+            "kernel_errors",
+            "segfaults",
+            "oom_events",
+            "pcie_aer",
+            "nvme_controller_reliability",
+            "filesystem_io_error",
+            "kernel_oops_panic",
+            "kernel_stall_reliability",
+            "platform_device_reliability",
+        )
+        for name in reliability_query_names:
+            result = r.get(name)
+            if result is not None and result.execution_status != "ok":
+                self._record_source_status(result, f"current-boot journal query {name}")
 
         dmesg_restrict_result = r["dmesg_restrict"]
         kernel_errors_result = r["kernel_errors"]
@@ -3582,6 +3787,11 @@ class SysCheckEngine:
                 if (severity := _filesystem_io_error_severity(line)) is not None
             ]
             if severities:
+                event_families = [
+                    event_family
+                    for line in fs_io_matching
+                    if (event_family := _filesystem_io_error_family(line)) is not None
+                ]
                 event_severity = max(
                     severities,
                     key={"io_error": 1, "critical_or_fatal": 2}.get,
@@ -3597,6 +3807,7 @@ class SysCheckEngine:
                             "matched_lines": fs_io_matching[:20],
                             "match_count": len(fs_io_matching),
                             "event_classes": list(dict.fromkeys(severities)),
+                            "event_families": list(dict.fromkeys(event_families)),
                             "journal_scope": "current_boot_kernel",
                             "source_query": "filesystem_io_error",
                         },
@@ -3948,8 +4159,8 @@ class SysCheckEngine:
 
         # Analiza system failed units (system)
         sys_failed = r["sys_failed"]
-        if sys_failed.is_ok() and self._has_failed_units(sys_failed.stdout):
-            _sys_units = self._extract_failed_unit_names(sys_failed.stdout)
+        system_failed_state, _sys_units = self._classify_failed_units(sys_failed)
+        if system_failed_state == "failed":
             self.raw_diagnostics.append(
                 _raw_from_result(
                     sys_failed,
@@ -3957,6 +4168,16 @@ class SysCheckEngine:
                     category="systemd_failed",
                     payload={"scope": "system", "units": _sys_units},
                 )
+            )
+        elif system_failed_state in {"source_failure", "malformed_output"}:
+            self._record_source_status(
+                sys_failed,
+                "system systemd failed-unit query",
+                authority_state=(
+                    "MALFORMED_OUTPUT"
+                    if system_failed_state == "malformed_output"
+                    else None
+                ),
             )
 
         # Analiza user failed units
@@ -4019,6 +4240,9 @@ class SysCheckEngine:
         # Track fstrim critical-chain membership when available
         # None = unknown, True = in critical chain, False = outside critical chain
         fstrim_in_critical_chain = None
+        userspace_time = None
+        target_time = None
+        total_seconds = None
 
         if analyze_out:
             # Parse userspace, target, and total values using the same parser.
@@ -4109,8 +4333,8 @@ class SysCheckEngine:
 
     # ── Pomocnicze do analizy jednostek systemd ──────────────────
     @classmethod
-    def _classify_user_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
-        """Classify user-systemd failed-unit query authority before interpretation."""
+    def _classify_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
+        """Classify a systemd failed-unit query before interpretation."""
         if result.execution_status == "empty_ok":
             return "malformed_output", []
         if not result.is_ok():
@@ -4126,6 +4350,11 @@ class SysCheckEngine:
             if units:
                 return "failed", units
         return "malformed_output", []
+
+    @classmethod
+    def _classify_user_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
+        """Backward-compatible name for the user-systemd classifier."""
+        return cls._classify_failed_units(result)
 
     @staticmethod
     def _has_failed_units(output: str) -> bool:
@@ -4551,7 +4780,8 @@ class SysCheckEngine:
                 category="btrfs_error",
                 details={**payload, "error_type": "device_stats"},
                 direct_measurement=True,
-                data_complete=capture_complete,
+                data_complete=capture_complete
+                and not bool(payload.get("stats_malformed")),
                 contradictory_evidence=False,
                 inference_required=False,
                 independent_sources=1,

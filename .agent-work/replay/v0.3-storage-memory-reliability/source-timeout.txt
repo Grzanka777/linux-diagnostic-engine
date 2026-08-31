@@ -1,0 +1,1 @@
+Timeout (10s): journalctl -b -k --no-pager

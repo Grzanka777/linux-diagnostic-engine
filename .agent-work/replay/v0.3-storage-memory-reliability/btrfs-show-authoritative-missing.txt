@@ -1,0 +1,4 @@
+Label: sanitized uuid: REDACTED
+Total devices 2 FS bytes used 1GiB
+devid 1 size 10GiB used 1GiB path /dev/REDACTED
+devid 2 size 10GiB used 1GiB path /dev/REDACTED MISSING

@@ -1,0 +1,2 @@
+kernel: nvme nvme0: I/O 16 QID 4 timeout, aborting
+[... wynik polecenia obcięty ...]

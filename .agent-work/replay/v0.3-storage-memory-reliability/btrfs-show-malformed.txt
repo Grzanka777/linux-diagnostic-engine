@@ -1,0 +1,1 @@
+successful command output with no Btrfs device record

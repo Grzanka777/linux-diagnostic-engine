@@ -1,0 +1,4 @@
+kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0
+Critical Warning:                   0x04
+Media and Data Integrity Errors:    1
+kernel: Buffer I/O error on dev nvme0n1, logical block 1234

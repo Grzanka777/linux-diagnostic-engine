@@ -1,0 +1,9 @@
+=== START OF INFORMATION SECTION ===
+Device Model:     REDACTED NVMe SSD
+Critical Warning:                   0x04
+Available Spare:                    5%
+Available Spare Threshold:          10%
+Percentage Used:                    99%
+Media and Data Integrity Errors:    1
+Error Information Log Entries:      2
+SMART overall-health self-assessment test result: FAILED

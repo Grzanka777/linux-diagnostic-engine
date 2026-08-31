@@ -47,10 +47,13 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     SysCheckEngine,
     derive_confidence,
     _classify_btrfs_status,
+    _btrfs_missing_device_lines,
+    _btrfs_missing_capture_is_authoritative,
     _count_kernel_packages,
     _count_unique_segfaults,
     _deduplicate_journal_lines,
     _filesystem_io_error_severity,
+    _filesystem_io_error_family,
     _filter_invalid_temperatures,
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
@@ -64,6 +67,7 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     build_snapshot,
     get_default_reports_dir,
     _nvme_controller_reliability_severity,
+    _parse_btrfs_device_stats,
     _pcie_aer_severity,
     _parse_storage_usage,
     _write_new_text,
@@ -86,6 +90,9 @@ REAL_KERNEL_TAINT_REPLAY_LINES = (
 )
 REAL_BTRFS_LIMITED_MISSING_LINE = (
     "devid 1 size 931.51GiB used 512.00GiB path /dev/nvme0n1p5 MISSING"
+)
+REAL_BTRFS_AUTHORITATIVE_MISSING_LINE = (
+    "devid 2 size 931.51GiB used 512.00GiB path /dev/nvme1n1 MISSING"
 )
 
 
@@ -512,13 +519,15 @@ class TestUserSystemdSourceContract:
             truncated=truncated,
         )
 
-    def _collect(self, usr_failed: CmdResult) -> SysCheckEngine:
+    def _collect(
+        self, usr_failed: CmdResult, *, sys_failed: CmdResult | None = None
+    ) -> SysCheckEngine:
         from unittest.mock import patch
 
         ok = self._result()
         analyze = self._result("Startup finished in 0s (userspace) = 0s.")
         results = {
-            "sys_failed": ok,
+            "sys_failed": sys_failed if sys_failed is not None else ok,
             "usr_failed": usr_failed,
             "analyze": analyze,
             "blame": ok,
@@ -547,6 +556,52 @@ class TestUserSystemdSourceContract:
         ]
         assert not any(
             "user systemd" in restriction.lower() for restriction in engine.restrictions
+        )
+
+    def test_system_failed_empty_output_is_not_authoritative_zero(self):
+        result = self._result("")
+        engine = self._collect(
+            self._result("0 loaded units listed."), sys_failed=result
+        )
+
+        assert not any(
+            raw.source_id == "SYSD-SYS-FAIL-001" for raw in engine.raw_diagnostics
+        )
+        assert any(
+            "system systemd failed-unit query" in restriction
+            and "MALFORMED_OUTPUT" in restriction
+            for restriction in engine.restrictions
+        )
+
+    @pytest.mark.parametrize(
+        ("execution_status", "return_code"),
+        [("error", 1), ("timeout", -2), ("not_found", -1), ("permission_denied", -3)],
+    )
+    def test_system_failed_source_status_is_explicit(
+        self, execution_status, return_code
+    ):
+        result = self._result(
+            return_code=return_code,
+            execution_status=execution_status,
+            stderr="source unavailable",
+        )
+        engine = self._collect(
+            self._result("0 loaded units listed."), sys_failed=result
+        )
+
+        assert not any(
+            raw.source_id == "SYSD-SYS-FAIL-001" for raw in engine.raw_diagnostics
+        )
+        expected = {
+            "error": "FAILED_EXECUTION",
+            "timeout": "TIMEOUT",
+            "not_found": "COMMAND_NOT_FOUND",
+            "permission_denied": "PERMISSION_DENIED",
+        }[execution_status]
+        assert any(
+            "system systemd failed-unit query" in restriction
+            and f"status={expected}" in restriction
+            for restriction in engine.restrictions
         )
 
     def test_truncated_zero_units_is_not_authoritative(self):
@@ -769,6 +824,32 @@ class TestBtrfsClassification:
         )
         status = _classify_btrfs_status(result)
         assert status == "device_missing", f"Expected 'device_missing', got '{status}'"
+
+    def test_healthy_no_missing_devices_is_not_device_missing(self):
+        result = CmdResult(
+            command="btrfs filesystem show /",
+            stdout=(
+                "Label: test uuid: abc\n"
+                "Total devices 1 FS bytes used 1GiB\n"
+                "devid 1 size 10GiB used 1GiB path /dev/nvme0n1p1\n"
+                "No missing devices found\n"
+            ),
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+        assert _btrfs_missing_device_lines(result.stdout) == []
+        assert _classify_btrfs_status(result, command_kind="show") == "ok"
+
+    def test_malformed_filesystem_show_is_not_authoritative(self):
+        result = CmdResult(
+            command="btrfs filesystem show /",
+            stdout="unexpected diagnostic text\n",
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+        )
+        assert _classify_btrfs_status(result, command_kind="show") == "error"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6434,6 +6515,45 @@ class TestBtrfsCollectorPath:
         err_raws = [r for r in engine.raw_diagnostics if r.category == "btrfs_error"]
         assert len(err_raws) == 0
 
+    def test_btrfs_stats_malformed_zero_is_not_authoritative(self):
+        """Unrecognizable stats output must not be reported as all-zero."""
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_malformed_stats")
+        self._collect_with_mock(
+            engine, btrfs_stats=self._cmd_ok("unexpected btrfs response")
+        )
+        assert not any(raw.category == "btrfs_error" for raw in engine.raw_diagnostics)
+        assert any(
+            "Btrfs device stats" in restriction and "MALFORMED_OUTPUT" in restriction
+            for restriction in engine.restrictions
+        )
+        assert "wszystkie zerowe" not in "".join(engine.report_lines)
+
+    def test_btrfs_stats_positive_with_malformed_record_is_partial(self):
+        """A valid positive counter remains visible but loses completeness."""
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_partial_stats")
+        stats = "[/dev/REDACTED].read_io_errs 2\nnot a btrfs record"
+        self._collect_with_mock(engine, btrfs_stats=self._cmd_ok(stats))
+        engine._derive_observations()
+        engine._interpret()
+
+        raw = next(
+            raw for raw in engine.raw_diagnostics if raw.category == "btrfs_error"
+        )
+        observation = next(
+            observation
+            for observation in engine.observations
+            if observation.obs_id == "BTRFS-ERR-001"
+        )
+        finding = next(
+            finding
+            for finding in engine.findings
+            if finding.finding_id == "BTRFS-ERR-001"
+        )
+        assert raw.payload["stats_malformed"] is True
+        assert observation.data_complete is False
+        assert finding.confidence == "Guessing"
+        assert engine.pipeline_accounting[-1]["outcome"] == "finding"
+
     def test_privilege_limited_missing_preserves_raw_and_rejects_finding(self):
         """Unprivileged MISSING is observable but not a device-error Finding."""
         engine = SysCheckEngine(output_dir="/tmp/test_btrfs_limited_missing")
@@ -6480,6 +6600,99 @@ class TestBtrfsCollectorPath:
             "MISSING" in restriction and "non-authoritative" in restriction
             for restriction in engine.restrictions
         )
+
+    def test_authoritative_missing_reaches_finding_without_false_restriction(
+        self, tmp_path
+    ):
+        """A complete successful MISSING device record is actionable evidence."""
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_authoritative_missing")
+        show = self._cmd_ok(REAL_BTRFS_AUTHORITATIVE_MISSING_LINE)
+        self._collect_with_mock(engine, btrfs_show=show)
+
+        raw = next(
+            raw for raw in engine.raw_diagnostics if raw.category == "btrfs_error"
+        )
+        assert raw.source_id == "BTRFS-DEVICE-MISSING-001"
+        assert raw.payload["authoritative"] is True
+        assert raw.payload["privilege_limited"] is False
+        assert not any("non-authoritative" in item for item in engine.restrictions)
+
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            finding
+            for finding in engine.findings
+            if finding.finding_id == "BTRFS-ERR-001"
+        )
+        assert "brak urządzenia" in finding.title
+        assert engine.pipeline_accounting == [
+            {
+                "raw_source_id": "BTRFS-DEVICE-MISSING-001",
+                "observation_id": "BTRFS-ERR-001",
+                "finding_id": "BTRFS-ERR-001",
+                "outcome": "finding",
+                "reason": "",
+            }
+        ]
+
+        fake_btrfs = tmp_path / "btrfs"
+        fake_btrfs.write_text(
+            "#!/bin/sh\nprintf '%s\\n' '"
+            + REAL_BTRFS_AUTHORITATIVE_MISSING_LINE
+            + "'\n",
+            encoding="utf-8",
+        )
+        fake_btrfs.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join((str(tmp_path), env.get("PATH", "")))
+        for field_name in ("recommended_diagnostics", "verification"):
+            command = _extract_single_backticked_command(getattr(finding, field_name))
+            result = subprocess.run(
+                ["bash", "-c", command],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            assert result.returncode == 0, f"{field_name}: {result.stderr}"
+            assert result.stdout.splitlines() == [REAL_BTRFS_AUTHORITATIVE_MISSING_LINE]
+
+    def test_truncated_missing_is_preserved_but_rejected(self):
+        """A truncated positive prefix cannot establish authoritative absence/state."""
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_truncated_missing")
+        show = CmdResult(
+            command="btrfs filesystem show /",
+            stdout=REAL_BTRFS_LIMITED_MISSING_LINE,
+            stderr="",
+            return_code=0,
+            execution_status="ok",
+            truncated=True,
+        )
+        self._collect_with_mock(engine, btrfs_show=show)
+        raw = next(
+            raw
+            for raw in engine.raw_diagnostics
+            if raw.source_id == "BTRFS-MISSING-INCOMPLETE-001"
+        )
+        assert raw.payload["authoritative"] is False
+        engine._derive_observations()
+        engine._interpret()
+        assert not any(
+            finding.finding_id == "BTRFS-ERR-001" for finding in engine.findings
+        )
+        assert any("capture" in item.lower() for item in engine.restrictions)
+
+    def test_healthy_show_does_not_create_btrfs_restriction(self):
+        engine = SysCheckEngine(output_dir="/tmp/test_btrfs_healthy_show")
+        healthy = (
+            "Label: test uuid: abc\n"
+            "Total devices 1 FS bytes used 1GiB\n"
+            "devid 1 size 10GiB used 1GiB path /dev/nvme0n1p1\n"
+            "No missing devices found\n"
+        )
+        self._collect_with_mock(engine, btrfs_show=self._cmd_ok(healthy))
+        assert not any(raw.category == "btrfs_error" for raw in engine.raw_diagnostics)
+        assert not any("MISSING" in item for item in engine.restrictions)
 
     # ── BTRFS-SCRUB-001 tests ────────────────────────────────────
 
@@ -10379,6 +10592,12 @@ class TestFilesystemIoErrorDiagnostic:
     def test_explicit_filesystem_and_medium_errors_match(self, line):
         assert re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE)
 
+    def test_read_only_remount_matches_as_filesystem_error(self):
+        line = "kernel: EXT4-fs (sda1): Remounting filesystem read-only"
+        assert re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE)
+        assert _filesystem_io_error_severity(line) == "critical_or_fatal"
+        assert _filesystem_io_error_family(line) == "filesystem_read_only"
+
     @pytest.mark.parametrize(
         "line",
         [
@@ -10406,6 +10625,30 @@ class TestFilesystemIoErrorDiagnostic:
     )
     def test_severity_mapping_is_deterministic(self, line, expected):
         assert _filesystem_io_error_severity(line) == expected
+
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            (
+                "kernel: Buffer I/O error on dev sda1, logical block 1234",
+                "block_io",
+            ),
+            (
+                "kernel: critical medium error, dev nvme0n1, sector 1024",
+                "block_io",
+            ),
+            (
+                "kernel: BTRFS error (device sda): parent transid verify failed",
+                "filesystem_corruption",
+            ),
+            (
+                "kernel: XFS (dm-0): metadata I/O error in xfs_trans_read_buf_map",
+                "filesystem",
+            ),
+        ],
+    )
+    def test_event_family_preserves_actionable_layer(self, line, expected):
+        assert _filesystem_io_error_family(line) == expected
 
     def test_collector_emits_p2_for_direct_io_error(self):
         engine = SysCheckEngine(output_dir="/tmp/test_fs_io_p2")
@@ -10490,7 +10733,40 @@ class TestFilesystemIoErrorDiagnostic:
         assert finding.domain == DiagnosticDomain.FILESYSTEM
         assert evidence.evidence_type == EvidenceType.JOURNAL_EVENT
         assert evidence.data["journal_scope"] == "current_boot_kernel"
+        assert evidence.data["event_families"] == ["block_io"]
         assert "nie wnioskuje o trwałej awarii dysku" in finding.interpretation
+
+    def test_exact_recommendation_commands_execute_against_replay(self, tmp_path):
+        line = "kernel: Buffer I/O error on dev sda1, logical block 1234"
+        positive_lines = [
+            line,
+            "kernel: EXT4-fs (sda1): error count: 1",
+            "kernel: BTRFS error (device sda): parent transid verify failed",
+        ]
+        engine = SysCheckEngine(output_dir="/tmp/test_fs_io_recommendations")
+        self._collect(engine, self._cmd(line))
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            finding
+            for finding in engine.findings
+            if finding.finding_id == "FS-IO-ERROR-001"
+        )
+        for field_name in ("recommended_diagnostics", "verification"):
+            command = _extract_single_backticked_command(getattr(finding, field_name))
+            for positive_line in positive_lines:
+                result = _run_exact_recommendation_command(
+                    command, positive_line + "\n", tmp_path
+                )
+                assert result.returncode == 0, f"{field_name}: {result.stderr}"
+                assert result.stdout.splitlines() == [positive_line]
+            negative = _run_exact_recommendation_command(
+                command,
+                "kernel: Buffer I/O completed successfully\n",
+                tmp_path,
+            )
+            assert negative.returncode == 1, f"{field_name}: {negative.stderr}"
+            assert negative.stdout == ""
 
     def test_rule_is_registered_and_reexported(self):
         import diagnostic_rules
@@ -12493,14 +12769,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.2.0`" in report
+        assert "**Wersja produktu:** `0.3.0`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.2.0" in report
+        assert "Linux Diagnostic Engine 0.3.0" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -12853,3 +13129,631 @@ class TestV013CliPresentationStabilization:
         assert "HEALTH STATUS    ✓ HEALTHY" in syscheck.format_cli_summary(
             engine, str(tmp_path / "report.md"), stream=Pipe()
         )
+
+
+class TestV03StorageMemoryReliabilityReplayCorpus:
+    """Sanitized replay coverage for the v0.3 storage/memory reliability pack."""
+
+    corpus_dir = (
+        Path(__file__).parent
+        / ".agent-work"
+        / "replay"
+        / ("v0.3-storage-memory-reliability")
+    )
+
+    @classmethod
+    def _fixture(cls, name: str) -> str:
+        return (cls.corpus_dir / name).read_text(encoding="utf-8").strip()
+
+    @staticmethod
+    def _cmd(
+        stdout: str = "",
+        *,
+        command: str = "test",
+        status: str = "ok",
+        return_code: int = 0,
+        stderr: str = "",
+        truncated: bool = False,
+    ) -> CmdResult:
+        return CmdResult(
+            command=command,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            execution_status=status,
+            truncated=truncated,
+        )
+
+    def _storage_results(self, **overrides):
+        results = {
+            "lsblk": self._cmd(command="lsblk"),
+            "df_h": self._cmd(command="df -h"),
+            "df_i": self._cmd(command="df -i"),
+            "btrfs_show": self._cmd(command="btrfs filesystem show /"),
+            "btrfs_df": self._cmd(command="btrfs filesystem df /"),
+            "btrfs_stats": self._cmd(command="btrfs device stats /"),
+            "btrfs_scrub": self._cmd(command="btrfs scrub status /"),
+            "nvme_list": self._cmd(command="nvme list"),
+        }
+        results.update(overrides)
+        return results
+
+    def _kernel_results(self, **overrides):
+        keys = (
+            "dmesg_restrict",
+            "kernel_errors",
+            "segfaults",
+            "firmware_msgs",
+            "oom_events",
+            "gpu_i915_hang",
+            "amdgpu_reset_fail",
+            "gpu_nvidia_xid_79",
+            "pcie_aer",
+            "nvme_controller_reliability",
+            "hardware_mce_edac",
+            "filesystem_io_error",
+            "hardware_thermal_throttling",
+            "kernel_oops_panic",
+            "kernel_stall_reliability",
+            "platform_device_reliability",
+            "lspci",
+            "lsusb",
+        )
+        results = {key: self._cmd(command=key) for key in keys}
+        results["dmesg_restrict"] = self._cmd("0", command="dmesg_restrict")
+        results.update(overrides)
+        return results
+
+    def test_manifest_is_sanitized_and_complete(self):
+        expected = {
+            "btrfs-show-healthy.txt",
+            "btrfs-show-authoritative-missing.txt",
+            "btrfs-show-limited-missing.txt",
+            "btrfs-stats-healthy.txt",
+            "btrfs-stats-errors.txt",
+            "btrfs-scrub-healthy.txt",
+            "btrfs-scrub-no-history.txt",
+            "btrfs-show-malformed.txt",
+            "btrfs-show-truncated.txt",
+            "nvme-kernel-failure.txt",
+            "nvme-kernel-near-miss.txt",
+            "filesystem-block-error.txt",
+            "filesystem-near-miss.txt",
+            "filesystem-read-only.txt",
+            "oom-kernel-failure.txt",
+            "oom-kernel-near-miss.txt",
+            "overlap-kernel-events.txt",
+            "nvme-smart-healthy.txt",
+            "nvme-smart-positive.txt",
+            "nvme-smart-deferred-source.txt",
+            "psi-normal.txt",
+            "psi-nonzero-candidate.txt",
+            "system-service-failure.txt",
+            "user-service-source-failure.txt",
+            "segfault-wireplumber-only.txt",
+            "segfault-wireplumber-mixed.txt",
+            "source-timeout.txt",
+            "source-command-not-found.txt",
+            "source-permission-denied.txt",
+            "source-malformed.txt",
+            "source-truncated.txt",
+            "overlap-oom-oomd.txt",
+            "overlap-service-segfault.txt",
+            "overlap-nvme-smart-healthy.txt",
+            "overlap-nvme-smart-issue-filesystem.txt",
+            "overlap-memory-pressure-no-kill.txt",
+        }
+        actual = {path.name for path in self.corpus_dir.glob("*.txt")}
+        assert actual == expected
+        for path in self.corpus_dir.glob("*.txt"):
+            text = path.read_text(encoding="utf-8")
+            assert "grzanka" not in text.lower()
+            assert "localhost" not in text.lower()
+            assert (
+                re.search(
+                    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                    text,
+                    re.IGNORECASE,
+                )
+                is None
+            )
+
+    def test_btrfs_corpus_covers_authority_boundary(self):
+        from unittest.mock import patch
+
+        healthy = self._cmd(
+            self._fixture("btrfs-show-healthy.txt"),
+            command="btrfs filesystem show /",
+        )
+        assert _classify_btrfs_status(healthy, command_kind="show") == "ok"
+        assert _btrfs_missing_device_lines(healthy.stdout) == []
+
+        authoritative = self._cmd(
+            self._fixture("btrfs-show-authoritative-missing.txt"),
+            command="btrfs filesystem show /",
+        )
+        assert _classify_btrfs_status(authoritative, command_kind="show") == (
+            "device_missing"
+        )
+        assert _btrfs_missing_capture_is_authoritative(authoritative, "device_missing")
+
+        limited = self._cmd(
+            self._fixture("btrfs-show-limited-missing.txt"),
+            command="btrfs filesystem show /",
+            status="error",
+            return_code=1,
+            stderr="Operation not permitted",
+        )
+        assert _classify_btrfs_status(limited, command_kind="show") == (
+            "permission_denied"
+        )
+        assert not _btrfs_missing_capture_is_authoritative(limited, "device_missing")
+
+        malformed = self._cmd(
+            self._fixture("btrfs-show-malformed.txt"),
+            command="btrfs filesystem show /",
+        )
+        assert _classify_btrfs_status(malformed, command_kind="show") == "error"
+
+        truncated = self._cmd(
+            self._fixture("btrfs-show-truncated.txt"),
+            command="btrfs filesystem show /",
+            truncated=True,
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_btrfs_corpus")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(btrfs_show=truncated),
+        ):
+            engine.collect_storage()
+        raw = next(
+            raw for raw in engine.raw_diagnostics if raw.category == "btrfs_error"
+        )
+        assert raw.source_id == "BTRFS-MISSING-INCOMPLETE-001"
+        assert raw.payload["authoritative"] is False
+        engine._derive_observations()
+        engine._interpret()
+        assert not any(
+            finding.finding_id == "BTRFS-ERR-001" for finding in engine.findings
+        )
+
+        malformed_engine = SysCheckEngine(output_dir="/tmp/test_v03_btrfs_malformed")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(btrfs_show=malformed),
+        ):
+            malformed_engine.collect_storage()
+        assert any(
+            "device state is unknown" in item for item in malformed_engine.restrictions
+        )
+
+    def test_btrfs_stats_and_scrub_corpus_replay(self):
+        from unittest.mock import patch
+
+        for name, expected_id in (
+            ("btrfs-stats-errors.txt", "BTRFS-ERR-001"),
+            ("btrfs-scrub-no-history.txt", "BTRFS-SCRUB-001"),
+        ):
+            engine = SysCheckEngine(output_dir=f"/tmp/test_v03_{expected_id}")
+            key = "btrfs_stats" if "stats" in name else "btrfs_scrub"
+            with patch.object(
+                SysCheckEngine,
+                "_parallel_cmd",
+                return_value=self._storage_results(
+                    **{key: self._cmd(self._fixture(name), command=key)}
+                ),
+            ):
+                engine.collect_storage()
+            assert any(raw.source_id == expected_id for raw in engine.raw_diagnostics)
+
+        healthy_stats = self._cmd(
+            self._fixture("btrfs-stats-healthy.txt"), command="btrfs device stats /"
+        )
+        healthy_scrub = self._cmd(
+            self._fixture("btrfs-scrub-healthy.txt"), command="btrfs scrub status /"
+        )
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_btrfs_healthy")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(
+                btrfs_stats=healthy_stats, btrfs_scrub=healthy_scrub
+            ),
+        ):
+            engine.collect_storage()
+        assert not any(raw.category == "btrfs_error" for raw in engine.raw_diagnostics)
+        assert not any(raw.category == "btrfs_scrub" for raw in engine.raw_diagnostics)
+
+    @pytest.mark.parametrize(
+        ("fixture", "key", "source_id"),
+        [
+            (
+                "nvme-kernel-failure.txt",
+                "nvme_controller_reliability",
+                "NVME-CONTROLLER-RESET-001",
+            ),
+            ("filesystem-block-error.txt", "filesystem_io_error", "FS-IO-ERROR-001"),
+            ("filesystem-read-only.txt", "filesystem_io_error", "FS-IO-ERROR-001"),
+            ("oom-kernel-failure.txt", "oom_events", "KERNEL-OOM-001"),
+        ],
+    )
+    def test_kernel_positive_corpus_reaches_stable_finding(
+        self, fixture, key, source_id
+    ):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir=f"/tmp/test_v03_{source_id}")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                **{key: self._cmd(self._fixture(fixture), command=key)}
+            ),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        assert any(finding.finding_id == source_id for finding in engine.findings)
+        if fixture == "filesystem-read-only.txt":
+            raw = next(
+                raw for raw in engine.raw_diagnostics if raw.source_id == source_id
+            )
+            assert raw.payload["event_families"] == ["filesystem_read_only"]
+
+    @pytest.mark.parametrize(
+        ("fixture", "key", "source_id"),
+        [
+            (
+                "nvme-kernel-near-miss.txt",
+                "nvme_controller_reliability",
+                "NVME-CONTROLLER-RESET-001",
+            ),
+            ("filesystem-near-miss.txt", "filesystem_io_error", "FS-IO-ERROR-001"),
+            ("oom-kernel-near-miss.txt", "oom_events", "KERNEL-OOM-001"),
+        ],
+    )
+    def test_kernel_negative_corpus_stays_rejected(self, fixture, key, source_id):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir=f"/tmp/test_v03_negative_{source_id}")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                **{key: self._cmd(self._fixture(fixture), command=key)}
+            ),
+        ):
+            engine.collect_kernel_hw()
+        assert not any(raw.source_id == source_id for raw in engine.raw_diagnostics)
+
+    def _run_kernel_overlap(self, **overrides):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_overlap")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(**overrides),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        return {finding.finding_id for finding in engine.findings}
+
+    def test_overlap_nvme_timeout_and_block_io_keeps_two_layers(self):
+        findings = self._run_kernel_overlap(
+            nvme_controller_reliability=self._cmd(
+                self._fixture("nvme-kernel-failure.txt")
+            ),
+            filesystem_io_error=self._cmd(self._fixture("filesystem-block-error.txt")),
+        )
+        assert {"NVME-CONTROLLER-RESET-001", "FS-IO-ERROR-001"} <= findings
+
+    def test_overlap_nvme_reset_and_filesystem_error_keeps_two_layers(self):
+        findings = self._run_kernel_overlap(
+            nvme_controller_reliability=self._cmd(
+                "kernel: nvme nvme0: Device not ready; aborting reset, CSTS=0x0"
+            ),
+            filesystem_io_error=self._cmd(
+                "kernel: EXT4-fs (REDACTED): Remounting filesystem read-only"
+            ),
+        )
+        assert {"NVME-CONTROLLER-RESET-001", "FS-IO-ERROR-001"} <= findings
+
+    def test_overlap_oom_and_unrelated_mce_keeps_two_layers(self):
+        findings = self._run_kernel_overlap(
+            oom_events=self._cmd(self._fixture("oom-kernel-failure.txt")),
+            hardware_mce_edac=self._cmd(
+                "kernel: mce: [Hardware Error]: Machine check events logged"
+            ),
+        )
+        assert {"KERNEL-OOM-001", "HW-MCE-EDAC-001"} <= findings
+
+    def test_overlap_pcie_aer_and_nvme_recovery_keeps_two_layers(self):
+        replay = self._fixture("overlap-kernel-events.txt")
+        findings = self._run_kernel_overlap(
+            pcie_aer=self._cmd(replay),
+            nvme_controller_reliability=self._cmd(replay),
+        )
+        assert {"PCIE-AER-001", "NVME-CONTROLLER-RESET-001"} <= findings
+
+    def test_overlap_btrfs_error_and_block_io_keeps_two_layers(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_btrfs_block_overlap")
+        storage = self._storage_results(
+            btrfs_stats=self._cmd(self._fixture("btrfs-stats-errors.txt"))
+        )
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=storage):
+            engine.collect_storage()
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                filesystem_io_error=self._cmd(
+                    self._fixture("filesystem-block-error.txt")
+                )
+            ),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        findings = {finding.finding_id for finding in engine.findings}
+        assert {"BTRFS-ERR-001", "FS-IO-ERROR-001"} <= findings
+
+    def test_btrfs_stats_parser_keeps_valid_records_and_marks_malformed(self):
+        counters, valid_records, malformed = _parse_btrfs_device_stats(
+            self._fixture("btrfs-stats-healthy.txt")
+            + "\n"
+            + self._fixture("source-malformed.txt")
+        )
+        assert counters == {}
+        assert valid_records == 5
+        assert malformed is True
+
+    def test_nvme_tool_missing_is_an_explicit_deferred_source(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_nvme_source_missing")
+        missing = self._cmd(
+            self._fixture("nvme-smart-deferred-source.txt"),
+            command="nvme list",
+            status="not_found",
+            return_code=-1,
+        )
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._storage_results(nvme_list=missing),
+        ):
+            engine.collect_storage()
+        assert not any(raw.category == "nvme_smart" for raw in engine.raw_diagnostics)
+        assert any(
+            "NVMe tool output" in restriction and "COMMAND_NOT_FOUND" in restriction
+            for restriction in engine.restrictions
+        )
+
+    def test_kernel_journal_source_failure_is_not_a_zero_result(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_kernel_source_missing")
+        failed = self._cmd(
+            self._fixture("source-command-not-found.txt"),
+            command="journalctl -b -k --no-pager",
+            status="not_found",
+            return_code=-1,
+        )
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                nvme_controller_reliability=failed,
+            ),
+        ):
+            engine.collect_kernel_hw()
+        assert not any(
+            raw.source_id == "NVME-CONTROLLER-RESET-001"
+            for raw in engine.raw_diagnostics
+        )
+        assert any(
+            "current-boot journal query nvme_controller_reliability" in restriction
+            and "COMMAND_NOT_FOUND" in restriction
+            for restriction in engine.restrictions
+        )
+
+    @pytest.mark.parametrize(
+        ("fixture", "status", "return_code", "expected"),
+        [
+            ("source-timeout.txt", "timeout", -2, "TIMEOUT"),
+            (
+                "source-permission-denied.txt",
+                "permission_denied",
+                -3,
+                "PERMISSION_DENIED",
+            ),
+            ("source-malformed.txt", "ok", 0, "MALFORMED_OUTPUT"),
+        ],
+    )
+    def test_source_status_tokens_are_distinct(
+        self, fixture, status, return_code, expected
+    ):
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_source_status")
+        result = self._cmd(
+            self._fixture(fixture),
+            command="journalctl -b -k --no-pager",
+            status=status,
+            return_code=return_code,
+            truncated=False,
+        )
+        engine._record_source_status(
+            result,
+            "replay journal source",
+            authority_state="MALFORMED_OUTPUT"
+            if expected == "MALFORMED_OUTPUT"
+            else None,
+        )
+        assert any(
+            "replay journal source" in restriction
+            and f"status={expected}" in restriction
+            for restriction in engine.restrictions
+        )
+
+    def test_truncated_positive_journal_remains_partial_and_actionable(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_truncated_positive")
+        truncated = self._cmd(
+            self._fixture("source-truncated.txt"),
+            command="journalctl -b -k --no-pager",
+            truncated=True,
+        )
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                nvme_controller_reliability=truncated,
+            ),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        finding = next(
+            finding
+            for finding in engine.findings
+            if finding.finding_id == "NVME-CONTROLLER-RESET-001"
+        )
+        observation = next(
+            observation
+            for observation in engine.observations
+            if observation.obs_id == "NVME-CONTROLLER-RESET-001"
+        )
+        assert finding.confidence == "Guessing"
+        assert observation.data_complete is False
+        assert any(
+            "TRUNCATED_OUTPUT" in restriction for restriction in engine.restrictions
+        )
+
+    def test_deferred_smart_and_psi_cases_have_no_finding_owner(self):
+        deferred = (
+            "nvme-smart-healthy.txt",
+            "nvme-smart-positive.txt",
+            "nvme-smart-deferred-source.txt",
+            "psi-normal.txt",
+            "psi-nonzero-candidate.txt",
+            "overlap-memory-pressure-no-kill.txt",
+        )
+        for fixture in deferred:
+            content = self._fixture(fixture)
+            assert content
+        supported_categories = {
+            category
+            for rule in build_default_rule_engine()._registry.rules
+            for category in rule.supported_categories
+        }
+        assert "nvme_smart" not in supported_categories
+        assert "psi_memory_pressure" not in supported_categories
+        assert "systemd_oomd" not in supported_categories
+
+    def test_seg_fault_ownership_is_deterministic(self):
+        from unittest.mock import patch
+
+        for fixture, expected_id, forbidden_id in (
+            (
+                "segfault-wireplumber-only.txt",
+                "SEGFAULT-WP-001",
+                "SEGFAULT-SYS-001",
+            ),
+            (
+                "segfault-wireplumber-mixed.txt",
+                "SEGFAULT-SYS-001",
+                "SEGFAULT-WP-001",
+            ),
+        ):
+            engine = SysCheckEngine(output_dir=f"/tmp/test_v03_{expected_id}")
+            with patch.object(
+                SysCheckEngine,
+                "_parallel_cmd",
+                return_value=self._kernel_results(
+                    segfaults=self._cmd(self._fixture(fixture)),
+                ),
+            ):
+                engine.collect_kernel_hw()
+            engine._derive_observations()
+            engine._interpret()
+            finding_ids = {finding.finding_id for finding in engine.findings}
+            assert expected_id in finding_ids
+            assert forbidden_id not in finding_ids
+
+    def test_oom_and_oomd_text_stay_separate(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_oom_oomd_overlap")
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                oom_events=self._cmd(self._fixture("overlap-oom-oomd.txt")),
+            ),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        assert [finding.finding_id for finding in engine.findings] == ["KERNEL-OOM-001"]
+        assert not any(
+            raw.category in {"systemd_oomd", "psi_memory_pressure"}
+            for raw in engine.raw_diagnostics
+        )
+
+    def test_service_failure_and_unrelated_segfault_keep_two_findings(self):
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir="/tmp/test_v03_service_segfault_overlap")
+        service_replay = self._cmd(self._fixture("overlap-service-segfault.txt"))
+        systemd_results = {
+            "sys_failed": service_replay,
+            "usr_failed": self._cmd("0 loaded units listed."),
+            "analyze": self._cmd(""),
+            "blame": self._cmd(""),
+            "critical": self._cmd(""),
+            "timers": self._cmd(""),
+            "usr_timers": self._cmd(""),
+            "auto_restart": self._cmd(""),
+            "restarting": self._cmd(""),
+        }
+        with patch.object(
+            SysCheckEngine, "_parallel_cmd", return_value=systemd_results
+        ):
+            engine.collect_systemd()
+        with patch.object(
+            SysCheckEngine,
+            "_parallel_cmd",
+            return_value=self._kernel_results(
+                segfaults=service_replay,
+            ),
+        ):
+            engine.collect_kernel_hw()
+        engine._derive_observations()
+        engine._interpret()
+        finding_ids = {finding.finding_id for finding in engine.findings}
+        assert {"SYSD-SYS-FAIL-001", "SEGFAULT-SYS-001"} <= finding_ids
+
+    def test_nvme_smart_healthy_overlap_has_no_smart_finding(self):
+        findings = self._run_kernel_overlap(
+            nvme_controller_reliability=self._cmd(
+                self._fixture("overlap-nvme-smart-healthy.txt")
+            )
+        )
+        assert findings == {"NVME-CONTROLLER-RESET-001"}
+
+    def test_nvme_smart_candidate_and_filesystem_io_keep_layers_separate(self):
+        findings = self._run_kernel_overlap(
+            nvme_controller_reliability=self._cmd(
+                self._fixture("overlap-nvme-smart-issue-filesystem.txt")
+            ),
+            filesystem_io_error=self._cmd(
+                self._fixture("overlap-nvme-smart-issue-filesystem.txt")
+            ),
+        )
+        assert findings == {"NVME-CONTROLLER-RESET-001", "FS-IO-ERROR-001"}

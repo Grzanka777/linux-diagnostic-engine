@@ -1,0 +1,1 @@
+Brak uprawnień (bez sudo): journalctl -b -k --no-pager

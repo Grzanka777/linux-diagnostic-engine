@@ -1,0 +1,3 @@
+smartctl -a /dev/nvme0n1
+SMART / NVMe health source unavailable without a readable device node
+No Finding is permitted from this deferred source case.

@@ -1,0 +1,3 @@
+kernel: wireplumber[1001]: segfault at 0 ip 7f0000000001 sp 7fff00000001 error 4 in libspa-libcamera.so[1001,7f0000001000+f0000]
+kernel: wireplumber[1002]: segfault at 0 ip 7f0000000002 sp 7fff00000002 error 4 in libspa-libcamera.so[1002,7f0000002000+f0000]
+kernel: wireplumber[1003]: segfault at 0 ip 7f0000000003 sp 7fff00000003 error 4 in libspa-libcamera.so[1003,7f0000003000+f0000]

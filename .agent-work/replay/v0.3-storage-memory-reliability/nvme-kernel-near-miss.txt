@@ -1,0 +1,1 @@
+kernel: nvme nvme0: controller initialized; timeout configured to 30 seconds
