@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import sys
 from typing import TYPE_CHECKING, Iterable, Optional
 
 if TYPE_CHECKING:
@@ -15,6 +16,12 @@ if TYPE_CHECKING:
 
 
 def _syscheck():
+    loaded = sys.modules.get("syscheck")
+    if loaded is not None:
+        return loaded
+    main_module = sys.modules.get("__main__")
+    if main_module is not None and hasattr(main_module, "Finding"):
+        return main_module
     import syscheck
 
     return syscheck
@@ -59,6 +66,9 @@ class DuplicateEvidenceError(DiagnosticRuleError):
 class DiagnosticRule(ABC):
     rule_id: str
     supported_categories: frozenset = frozenset()
+    # Public Finding IDs emitted by this rule.  A trailing '*' denotes a
+    # deterministic family of IDs, such as a mount-specific storage Finding.
+    finding_id_patterns: tuple = ()
 
     @abstractmethod
     def evaluate(
@@ -72,6 +82,7 @@ class DiagnosticRule(ABC):
 class BtrfsDeviceErrorRule(DiagnosticRule):
     rule_id = "RULE-BTRFS-DEVICE-ERROR"
     supported_categories = frozenset({"btrfs_error"})
+    finding_id_patterns = ("BTRFS-ERR-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -155,6 +166,7 @@ class BtrfsDeviceErrorRule(DiagnosticRule):
 class BtrfsScrubStatusRule(DiagnosticRule):
     rule_id = "RULE-BTRFS-SCRUB-STATUS"
     supported_categories = frozenset({"btrfs_scrub"})
+    finding_id_patterns = ("BTRFS-SCRUB-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -197,6 +209,7 @@ class BtrfsScrubStatusRule(DiagnosticRule):
 class WirePlumberSegfaultRule(DiagnosticRule):
     rule_id = "RULE-SEGFAULT-WIREPLUMBER"
     supported_categories = frozenset({"segfault"})
+    finding_id_patterns = ("SEGFAULT-WP-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -242,6 +255,7 @@ class WirePlumberSegfaultRule(DiagnosticRule):
 class GeneralSegfaultRule(DiagnosticRule):
     rule_id = "RULE-SEGFAULT-GENERAL"
     supported_categories = frozenset({"segfault"})
+    finding_id_patterns = ("SEGFAULT-SYS-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -285,6 +299,7 @@ class GeneralSegfaultRule(DiagnosticRule):
 class MinorSegfaultRule(DiagnosticRule):
     rule_id = "RULE-SEGFAULT-MINOR"
     supported_categories = frozenset({"segfault_minor"})
+    finding_id_patterns = ("SEGFAULT-MIN-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -325,6 +340,7 @@ class MinorSegfaultRule(DiagnosticRule):
 class KernelTaintRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-TAINT"
     supported_categories = frozenset({"tainted"})
+    finding_id_patterns = ("KERNEL-TAINT-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -372,6 +388,7 @@ class KernelTaintRule(DiagnosticRule):
 class KernelOomRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-OOM"
     supported_categories = frozenset({"oom_event"})
+    finding_id_patterns = ("KERNEL-OOM-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -444,6 +461,7 @@ class KernelOomRule(DiagnosticRule):
 class GpuI915HangRule(DiagnosticRule):
     rule_id = "RULE-GPU-I915-HANG"
     supported_categories = frozenset({"gpu_i915_hang"})
+    finding_id_patterns = ("GPU-I915-HANG-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -521,6 +539,7 @@ class GpuI915HangRule(DiagnosticRule):
 class AmdgpuResetFailRule(DiagnosticRule):
     rule_id = "RULE-AMDGPU-RESET-FAIL"
     supported_categories = frozenset({"amdgpu_reset_fail"})
+    finding_id_patterns = ("AMDGPU-RESET-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -605,6 +624,7 @@ class AmdgpuResetFailRule(DiagnosticRule):
 class PcieAerErrorRule(DiagnosticRule):
     rule_id = "RULE-PCIE-AER-ERROR"
     supported_categories = frozenset({"pcie_aer_error"})
+    finding_id_patterns = ("PCIE-AER-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -669,6 +689,7 @@ class PcieAerErrorRule(DiagnosticRule):
 class NvmeControllerReliabilityRule(DiagnosticRule):
     rule_id = "RULE-NVME-CONTROLLER-RELIABILITY"
     supported_categories = frozenset({"nvme_controller_reliability"})
+    finding_id_patterns = ("NVME-CONTROLLER-RESET-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -739,6 +760,7 @@ class NvmeControllerReliabilityRule(DiagnosticRule):
 class HardwareMceEdacRule(DiagnosticRule):
     rule_id = "RULE-HARDWARE-MCE-EDAC-ERROR"
     supported_categories = frozenset({"hardware_mce_edac_error"})
+    finding_id_patterns = ("HW-MCE-EDAC-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -809,6 +831,7 @@ class HardwareMceEdacRule(DiagnosticRule):
 class FilesystemIoErrorRule(DiagnosticRule):
     rule_id = "RULE-FILESYSTEM-IO-ERROR"
     supported_categories = frozenset({"filesystem_io_error"})
+    finding_id_patterns = ("FS-IO-ERROR-001",)
     _RECOMMENDATION_PATTERN = (
         r"\b(?:Buffer I/O error\b|blk_update_request:\s*I/O error\b|"
         r"I/O error,\s*dev\b|EXT4-fs\s+error\b|EXT4-fs\s*(?:\([^)]+\))?"
@@ -886,6 +909,7 @@ class FilesystemIoErrorRule(DiagnosticRule):
 class HardwareThermalThrottlingRule(DiagnosticRule):
     rule_id = "RULE-HARDWARE-THERMAL-THROTTLING"
     supported_categories = frozenset({"hardware_thermal_throttling"})
+    finding_id_patterns = ("HW-THERMAL-THROTTLE-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -948,6 +972,7 @@ class HardwareThermalThrottlingRule(DiagnosticRule):
 class KernelOopsPanicRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-OOPS-PANIC"
     supported_categories = frozenset({"kernel_oops_panic"})
+    finding_id_patterns = ("KERNEL-OOPS-PANIC-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1029,6 +1054,7 @@ class KernelOopsPanicRule(DiagnosticRule):
 class KernelSoftLockupRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-SOFT-LOCKUP"
     supported_categories = frozenset({"kernel_soft_lockup"})
+    finding_id_patterns = ("KERNEL-SOFT-LOCKUP-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1094,6 +1120,7 @@ class KernelSoftLockupRule(DiagnosticRule):
 class KernelHardLockupRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-HARD-LOCKUP"
     supported_categories = frozenset({"kernel_hard_lockup"})
+    finding_id_patterns = ("KERNEL-HARD-LOCKUP-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1159,6 +1186,7 @@ class KernelHardLockupRule(DiagnosticRule):
 class KernelHungTaskRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-HUNG-TASK"
     supported_categories = frozenset({"kernel_hung_task"})
+    finding_id_patterns = ("KERNEL-HUNG-TASK-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1225,6 +1253,7 @@ class KernelHungTaskRule(DiagnosticRule):
 class KernelRcuStallRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-RCU-STALL"
     supported_categories = frozenset({"kernel_rcu_stall"})
+    finding_id_patterns = ("KERNEL-RCU-STALL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1291,6 +1320,7 @@ class KernelRcuStallRule(DiagnosticRule):
 class PlatformAcpiFirmwareErrorRule(DiagnosticRule):
     rule_id = "RULE-PLATFORM-ACPI-FIRMWARE-ERROR"
     supported_categories = frozenset({"platform_acpi_firmware_error"})
+    finding_id_patterns = ("PLATFORM-ACPI-FIRMWARE-ERROR-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1356,6 +1386,7 @@ class PlatformAcpiFirmwareErrorRule(DiagnosticRule):
 class KernelFirmwareLoadFailRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-FIRMWARE-LOAD-FAIL"
     supported_categories = frozenset({"kernel_firmware_load_fail"})
+    finding_id_patterns = ("KERNEL-FIRMWARE-LOAD-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1421,6 +1452,7 @@ class KernelFirmwareLoadFailRule(DiagnosticRule):
 class UsbEnumerationFailRule(DiagnosticRule):
     rule_id = "RULE-USB-ENUMERATION-FAIL"
     supported_categories = frozenset({"usb_enumeration_fail"})
+    finding_id_patterns = ("USB-ENUMERATION-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1486,6 +1518,7 @@ class UsbEnumerationFailRule(DiagnosticRule):
 class IommuFaultRule(DiagnosticRule):
     rule_id = "RULE-IOMMU-FAULT"
     supported_categories = frozenset({"iommu_fault"})
+    finding_id_patterns = ("IOMMU-FAULT-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1552,6 +1585,7 @@ class IommuFaultRule(DiagnosticRule):
 class NetworkManagerActivationFailureRule(DiagnosticRule):
     rule_id = "RULE-NETWORK-NM-ACTIVATION-FAILURE"
     supported_categories = frozenset({"network_manager_activation_failure"})
+    finding_id_patterns = ("NETWORK-NM-ACTIVATION-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1604,6 +1638,7 @@ class NetworkManagerActivationFailureRule(DiagnosticRule):
 class NetworkDeviceWatchdogRule(DiagnosticRule):
     rule_id = "RULE-NETWORK-DEVICE-WATCHDOG"
     supported_categories = frozenset({"network_device_watchdog"})
+    finding_id_patterns = ("NETWORK-DEVICE-WATCHDOG-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1658,6 +1693,7 @@ class NetworkDeviceWatchdogRule(DiagnosticRule):
 class PowerSourceCriticalRule(DiagnosticRule):
     rule_id = "RULE-POWER-SOURCE-CRITICAL"
     supported_categories = frozenset({"power_source_critical"})
+    finding_id_patterns = ("POWER-SOURCE-CRITICAL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1706,6 +1742,7 @@ class PowerSourceCriticalRule(DiagnosticRule):
 class GpuNvidiaXid79Rule(DiagnosticRule):
     rule_id = "RULE-GPU-NVIDIA-XID-79"
     supported_categories = frozenset({"gpu_nvidia_xid_79"})
+    finding_id_patterns = ("GPU-NVIDIA-XID-79-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1793,6 +1830,7 @@ class GpuNvidiaXid79Rule(DiagnosticRule):
 class FailedSystemUnitRule(DiagnosticRule):
     rule_id = "RULE-SYSTEMD-FAILED-SYSTEM"
     supported_categories = frozenset({"systemd_failed"})
+    finding_id_patterns = ("SYSD-SYS-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1836,6 +1874,7 @@ class FailedSystemUnitRule(DiagnosticRule):
 class FailedUserUnitRule(DiagnosticRule):
     rule_id = "RULE-SYSTEMD-FAILED-USER"
     supported_categories = frozenset({"systemd_failed"})
+    finding_id_patterns = ("SYSD-USR-FAIL-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1881,6 +1920,7 @@ class SystemdUserSourceFailureRule(DiagnosticRule):
 
     rule_id = "RULE-SYSTEMD-USER-SOURCE-FAILURE"
     supported_categories = frozenset({"systemd_user_source_failure"})
+    finding_id_patterns = ()
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1895,6 +1935,7 @@ class SystemdUserSourceFailureRule(DiagnosticRule):
 class KernelCountRule(DiagnosticRule):
     rule_id = "RULE-KERNEL-COUNT"
     supported_categories = frozenset({"kernel_count"})
+    finding_id_patterns = ("KRNL-INFO-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1934,6 +1975,7 @@ class KernelCountRule(DiagnosticRule):
 class BootDelayRule(DiagnosticRule):
     rule_id = "RULE-BOOT-DELAY"
     supported_categories = frozenset({"boot_time"})
+    finding_id_patterns = ("BOOT-SLOW-001",)
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -1987,6 +2029,7 @@ class BootDelayRule(DiagnosticRule):
 class StorageUsageRule(DiagnosticRule):
     rule_id = "RULE-STORAGE-USAGE"
     supported_categories = frozenset({"storage_usage"})
+    finding_id_patterns = ("STORAGE-USAGE-WARNING*", "STORAGE-USAGE-CRITICAL*")
 
     def __init__(self, evidence_builder):
         self._evidence_builder = evidence_builder
@@ -2054,6 +2097,13 @@ class DiagnosticRuleRegistry:
     def rules(self) -> tuple:
         return self._rules
 
+    @property
+    def finding_id_patterns(self) -> tuple:
+        """Return the public Finding ID families declared by registered rules."""
+        return tuple(
+            pattern for rule in self._rules for pattern in rule.finding_id_patterns
+        )
+
 
 class DiagnosticRuleEngine:
     def __init__(
@@ -2109,6 +2159,16 @@ class DiagnosticRuleEngine:
         if result.finding is None and not result.evidence:
             return None
         return result
+
+    @property
+    def finding_id_patterns(self) -> tuple:
+        """Return the public Finding ID families emitted by this engine."""
+        return self._registry.finding_id_patterns
+
+    @property
+    def rules(self) -> tuple:
+        """Return the registered rules for inventory validation."""
+        return self._registry.rules
 
 
 def build_default_rule_engine() -> DiagnosticRuleEngine:

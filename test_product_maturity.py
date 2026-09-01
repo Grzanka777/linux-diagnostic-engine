@@ -319,6 +319,22 @@ def test_sanitize_markdown_public_workflow_is_deterministic_and_preserves_meanin
     assert sanitize_artifact(output_one) == sanitized
 
 
+def test_sanitize_redacts_mount_paths_and_ps_user_columns():
+    raw = (
+        "USER         PID %CPU %MEM COMMAND\n"
+        "alice         42  1.0  2.0 /run/media/alice/Private Backup\n"
+    )
+
+    sanitized = syscheck._sanitize_text(raw)
+
+    assert "alice" not in sanitized
+    assert "/run/media/" not in sanitized
+    assert "Private Backup" not in sanitized
+    assert "<MEDIA>" in sanitized
+    assert "<USER>" in sanitized
+    assert "42" in sanitized
+
+
 def test_sanitize_snapshot_preserves_schema_ids_and_diagnostic_fields(tmp_path):
     snapshot = SystemSnapshot(
         metadata=SnapshotMetadata(

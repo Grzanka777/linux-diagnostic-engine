@@ -12772,14 +12772,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.5.0`" in report
+        assert "**Wersja produktu:** `0.6.0`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.5.0" in report
+        assert "Linux Diagnostic Engine 0.6.0" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod

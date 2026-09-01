@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.5.0
+Wersja produktu:                         0.6.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -25,6 +25,7 @@ Zasady:
 Użycie:
   lde [--version]
   lde run [--output-dir DIRECTORY] [--quiet] [--full] [--print-report] [--verbose]
+  lde explain FINDING-ID [--snapshot SNAPSHOT] [--json]
 """
 
 from __future__ import annotations
@@ -915,6 +916,11 @@ _IPV6_CANDIDATE_RE = re.compile(
 _HOME_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/home/[A-Za-z0-9._-]+")
 _ROOT_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/root(?=$|[/\s:])")
 _RUNTIME_USER_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/run/user/[0-9]+")
+_MEDIA_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/run/media/[^\n`]+")
+_PS_USER_COLUMN_RE = re.compile(
+    r"(?m)^(?P<user>[A-Za-z_][A-Za-z0-9_.-]{0,31})(?P<spacing>\s+)"
+    r"(?P<pid>[0-9]+)(?=\s+[0-9.]+\s+[0-9.]+)"
+)
 
 
 def _replace_ip_literals(text: str) -> str:
@@ -953,7 +959,9 @@ def _sanitize_text(text: str, *, hostname: str = "") -> str:
     text = _replace_ip_literals(text)
     text = _HOME_PATH_RE.sub("<HOME>", text)
     text = _ROOT_PATH_RE.sub("<HOME>", text)
-    return _RUNTIME_USER_PATH_RE.sub("/run/user/<USER>", text)
+    text = _RUNTIME_USER_PATH_RE.sub("/run/user/<USER>", text)
+    text = _MEDIA_PATH_RE.sub("<MEDIA>", text)
+    return _PS_USER_COLUMN_RE.sub(r"<USER>\g<spacing>\g<pid>", text)
 
 
 _SANITIZE_ID_KEYS = frozenset(
@@ -3663,6 +3671,7 @@ class SysCheckEngine:
                         payload={
                             "device_error_counters": dict(error_counters),
                             "stats_malformed": stats_malformed,
+                            "source_query": "btrfs_stats",
                         },
                     )
                 )
@@ -3723,6 +3732,7 @@ class SysCheckEngine:
                     payload={
                         "scrub_status": scrub_status,
                         "scrub_semantics": "never_run",
+                        "source_query": "btrfs_scrub",
                     },
                 )
             )
@@ -3738,8 +3748,16 @@ class SysCheckEngine:
             )
 
         # Analiza użycia storage
+        usage = _parse_storage_usage(r["df_h"].stdout) if r["df_h"].is_ok() else []
+        if not r["df_h"].is_ok():
+            self._record_source_status(r["df_h"], "df -h filesystem usage query")
+        elif not usage:
+            self._record_source_status(
+                r["df_h"],
+                "df -h filesystem usage query",
+                authority_state="MALFORMED_OUTPUT",
+            )
         if r["df_h"].is_ok():
-            usage = _parse_storage_usage(r["df_h"].stdout)
             for mount, pct in usage:
                 if mount == "/" or mount.startswith("/dev/"):
                     if pct >= STORAGE_CRITICAL_PERCENT:
@@ -3752,6 +3770,7 @@ class SysCheckEngine:
                                     "mountpoint": mount,
                                     "usage_percent": pct,
                                     "threshold_state": "critical",
+                                    "source_query": "df_h",
                                 },
                             )
                         )
@@ -3765,6 +3784,7 @@ class SysCheckEngine:
                                     "mountpoint": mount,
                                     "usage_percent": pct,
                                     "threshold_state": "warning",
+                                    "source_query": "df_h",
                                 },
                             )
                         )
@@ -4031,6 +4051,7 @@ class SysCheckEngine:
                         payload={
                             "segfault_type": "wireplumber",
                             "count": unique_segfault_count,
+                            "source_query": "segfaults",
                         },
                     )
                 )
@@ -4044,6 +4065,7 @@ class SysCheckEngine:
                         payload={
                             "segfault_type": "system_wide",
                             "count": unique_segfault_count,
+                            "source_query": "segfaults",
                         },
                     )
                 )
@@ -4053,7 +4075,10 @@ class SysCheckEngine:
                     segfaults_result,
                     source_id="SEGFAULT-MIN-001",
                     category="segfault_minor",
-                    payload={"count": unique_segfault_count},
+                    payload={
+                        "count": unique_segfault_count,
+                        "source_query": "segfaults",
+                    },
                 )
             )
 
@@ -4691,6 +4716,7 @@ class SysCheckEngine:
 
         for name, result in r.items():
             self._record_truncated_capture(result, f"systemd command {name}")
+        self._record_source_status(r["analyze"], "systemd-analyze boot timing query")
 
         self.report_lines.append(heading(2, "5. Systemd i proces uruchamiania"))
         for title, key in [
@@ -4719,7 +4745,11 @@ class SysCheckEngine:
                     sys_failed,
                     source_id="SYSD-SYS-FAIL-001",
                     category="systemd_failed",
-                    payload={"scope": "system", "units": _sys_units},
+                    payload={
+                        "scope": "system",
+                        "units": _sys_units,
+                        "source_query": "systemd_failed_system",
+                    },
                 )
             )
         elif system_failed_state in {"source_failure", "malformed_output"}:
@@ -4742,7 +4772,11 @@ class SysCheckEngine:
                     usr_failed,
                     source_id="SYSD-USR-FAIL-001",
                     category="systemd_failed",
-                    payload={"scope": "user", "units": _failed_units},
+                    payload={
+                        "scope": "user",
+                        "units": _failed_units,
+                        "source_query": "systemd_failed_user",
+                    },
                 )
             )
         elif user_failed_state in {"source_failure", "malformed_output"}:
@@ -4826,6 +4860,12 @@ class SysCheckEngine:
             total_seconds = (
                 _parse_systemd_duration(total_match.group(1)) if total_match else None
             )
+            if userspace_time is None:
+                self._record_source_status(
+                    r["analyze"],
+                    "systemd-analyze boot timing query",
+                    authority_state="MALFORMED_OUTPUT",
+                )
             blame_match = re.search(r"(\S+)\.service\s+([\d.]+)s", blame_out)
 
             if blame_match and userspace_match:
@@ -4868,6 +4908,7 @@ class SysCheckEngine:
                     "userspace_time": userspace_time,
                     "measurement_source": measurement_source,
                     "threshold": 30.0,
+                    "source_query": "systemd_analyze",
                 }
                 if target_time is not None:
                     payload["target_time"] = target_time
@@ -5035,11 +5076,15 @@ class SysCheckEngine:
                         kernels_result,
                         source_id="KRNL-INFO-001",
                         category="kernel_count",
-                        payload={"count": bootable_count},
+                        payload={
+                            "count": bootable_count,
+                            "source_query": "kernel_package",
+                        },
                     )
                 )
         else:
             self.report_lines.append(codeblock(kernels_result.to_fallback_text()))
+        self._record_source_status(kernels_result, "kernel package query")
 
     # ── Raport: Grafika ──────────────────────────────────────────
     def collect_graphics(self) -> None:
@@ -7279,6 +7324,1525 @@ def format_comparison_markdown(comp: SnapshotComparison) -> str:
     return "".join(lines)
 
 
+class FindingLifecycleState(str, Enum):
+    """Lifecycle states exposed by the before/after verification workflow."""
+
+    NEW = "NEW"
+    PERSISTENT = "PERSISTENT"
+    RESOLVED = "RESOLVED"
+
+
+@dataclass(frozen=True)
+class FindingLifecycleResult:
+    """Deterministic Finding lifecycle result for two validated snapshots.
+
+    ``unverified_finding_ids`` is deliberately not a lifecycle state.  It is a
+    conservative verification outcome for a baseline Finding whose absence
+    cannot be proved because the current source was not authoritative.
+    """
+
+    baseline_identity: dict = field(default_factory=dict)
+    current_identity: dict = field(default_factory=dict)
+    new_finding_ids: tuple = ()
+    persistent_finding_ids: tuple = ()
+    resolved_finding_ids: tuple = ()
+    unverified_finding_ids: tuple = ()
+    source_limitations: tuple = ()
+
+    def to_dict(self) -> dict:
+        """Return the stable machine-readable verification representation."""
+        return {
+            "baseline_identity": dict(self.baseline_identity),
+            "current_identity": dict(self.current_identity),
+            "new_finding_ids": list(self.new_finding_ids),
+            "persistent_finding_ids": list(self.persistent_finding_ids),
+            "resolved_finding_ids": list(self.resolved_finding_ids),
+            "unverified_finding_ids": list(self.unverified_finding_ids),
+            "source_limitations": list(self.source_limitations),
+        }
+
+
+class FindingLifecycleComparator:
+    """Compare Findings while keeping generic snapshot comparison unchanged."""
+
+    _FINDING_SOURCE_QUERIES = {
+        "BTRFS-ERR-001": ("btrfs_stats", "btrfs_show"),
+        "BTRFS-SCRUB-001": ("btrfs_scrub",),
+        "SEGFAULT-WP-001": ("segfaults",),
+        "SEGFAULT-SYS-001": ("segfaults",),
+        "SEGFAULT-MIN-001": ("segfaults",),
+        "KERNEL-TAINT-001": ("kernel_errors",),
+        "KRNL-INFO-001": ("kernel_package",),
+        "BOOT-SLOW-001": ("systemd_analyze",),
+        "NETWORK-NM-ACTIVATION-FAIL-001": ("nm_activation_failures",),
+        "NETWORK-DEVICE-WATCHDOG-001": ("network_device_watchdog",),
+        "POWER-SOURCE-CRITICAL-001": ("upower_power_sources",),
+    }
+
+    _NON_AUTHORITATIVE_MARKERS = (
+        "cannot establish an authoritative state",
+        "not authoritative",
+        "non-authoritative",
+        "unknown",
+        "unavailable",
+        "timeout",
+        "permission",
+        "command_not_found",
+        "failed_execution",
+        "malformed_output",
+        "truncated_output",
+        "brak sudo",
+        "wymaga sudo",
+    )
+
+    @classmethod
+    def compare(
+        cls, baseline: SystemSnapshot, current: SystemSnapshot
+    ) -> FindingLifecycleResult:
+        cls._validate_snapshot(baseline, label="baseline")
+        cls._validate_snapshot(current, label="current")
+
+        baseline_by_id = {finding.finding_id: finding for finding in baseline.findings}
+        current_by_id = {finding.finding_id: finding for finding in current.findings}
+        baseline_ids = set(baseline_by_id)
+        current_ids = set(current_by_id)
+
+        new_ids = tuple(sorted(current_ids - baseline_ids))
+        persistent_ids = tuple(sorted(baseline_ids & current_ids))
+        resolved_ids = []
+        unverified_ids = []
+        limitations: list[str] = []
+
+        for finding_id in sorted(baseline_ids - current_ids):
+            authoritative, reasons = cls._current_source_authority(
+                baseline, baseline_by_id[finding_id], current
+            )
+            if authoritative:
+                resolved_ids.append(finding_id)
+            else:
+                unverified_ids.append(finding_id)
+                limitations.extend(reasons)
+
+        return FindingLifecycleResult(
+            baseline_identity=cls._snapshot_identity(baseline),
+            current_identity=cls._snapshot_identity(current),
+            new_finding_ids=new_ids,
+            persistent_finding_ids=persistent_ids,
+            resolved_finding_ids=tuple(resolved_ids),
+            unverified_finding_ids=tuple(unverified_ids),
+            source_limitations=tuple(sorted(set(limitations))),
+        )
+
+    @staticmethod
+    def _snapshot_identity(snapshot: SystemSnapshot) -> dict:
+        metadata = snapshot.metadata
+        return {
+            "hostname": metadata.hostname,
+            "kernel": metadata.kernel,
+            "distro": metadata.distro,
+            "syscheck_version": metadata.syscheck_version,
+            "timestamp_utc": metadata.timestamp_utc,
+            "timestamp_local": metadata.timestamp_local,
+            "schema_version": snapshot.schema_version,
+        }
+
+    @classmethod
+    def _validate_snapshot(cls, snapshot: SystemSnapshot, *, label: str) -> None:
+        if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION:
+            raise UnsupportedSnapshotSchemaError(
+                f"Unsupported {label} snapshot schema version "
+                f"{snapshot.schema_version} (supported: {SNAPSHOT_SCHEMA_VERSION})"
+            )
+        errors = snapshot.validate()
+        finding_ids = [finding.finding_id for finding in snapshot.findings]
+        if any(not finding_id for finding_id in finding_ids):
+            errors.append("Finding IDs must be non-empty")
+        if snapshot.metadata.syscheck_version != REPORT_COMPATIBILITY_VERSION:
+            errors.append(
+                f"Unsupported {label} snapshot compatibility "
+                f"'{snapshot.metadata.syscheck_version}' "
+                f"(supported: {REPORT_COMPATIBILITY_VERSION})"
+            )
+        if errors:
+            raise ValueError(
+                f"Invalid {label} snapshot for verification: {'; '.join(errors)}"
+            )
+
+    @classmethod
+    def _current_source_authority(
+        cls,
+        baseline: SystemSnapshot,
+        baseline_finding: FindingSnapshot,
+        current: SystemSnapshot,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Return whether absence of one Finding is an authoritative absence.
+
+        Schema 3 persists negative authority as restrictions and positive
+        Finding lineage as Observation/RAW references.  A baseline Finding
+        without that lineage cannot be safely resolved.  For lineaged
+        Findings, only current restrictions relevant to the same source make
+        the absence unverified; unrelated restrictions do not block it.
+        """
+        raw_sources, lineage_reasons = cls._baseline_raw_sources(
+            baseline, baseline_finding
+        )
+        if lineage_reasons:
+            return False, lineage_reasons
+
+        source_keys = cls._source_keys(baseline_finding, raw_sources)
+        relevant_limitations = tuple(
+            sorted(
+                {
+                    restriction
+                    for restriction in current.restrictions
+                    if cls._restriction_matches_source(restriction, source_keys)
+                }
+            )
+        )
+        if relevant_limitations:
+            return False, relevant_limitations
+
+        current_observations = {obs.obs_id: obs for obs in current.observations}
+        for current_raw in current.raw_diagnostics:
+            if cls._raw_matches_source(
+                current_raw, source_keys
+            ) and not cls._raw_is_authoritative(current_raw):
+                return False, (
+                    f"Current source '{current_raw.source_id}' is not authoritative",
+                )
+
+        for observation_id in baseline_finding.source_observation_ids:
+            observation = current_observations.get(observation_id)
+            if observation is not None and (
+                not observation.data_complete or observation.contradictory_evidence
+            ):
+                return False, (
+                    f"Current observation '{observation_id}' is incomplete or "
+                    "contradictory",
+                )
+
+        return True, ()
+
+    @staticmethod
+    def _baseline_raw_sources(
+        baseline: SystemSnapshot, finding: FindingSnapshot
+    ) -> tuple[tuple[RawDiagnosticSnapshot, ...], tuple[str, ...]]:
+        observations = {
+            observation.obs_id: observation for observation in baseline.observations
+        }
+        evidence = {item.evidence_id: item for item in baseline.evidence}
+        raw_by_id = {raw.source_id: raw for raw in baseline.raw_diagnostics}
+        raw_ids = set()
+        reasons = []
+
+        if not finding.source_observation_ids and not finding.evidence_ids:
+            reasons.append(
+                f"Finding '{finding.finding_id}' has no persisted source lineage"
+            )
+
+        for observation_id in finding.source_observation_ids:
+            observation = observations.get(observation_id)
+            if observation is None:
+                reasons.append(
+                    f"Finding '{finding.finding_id}' references missing "
+                    f"observation '{observation_id}'"
+                )
+                continue
+            raw_ids.update(observation.source_raw_ids)
+
+        for evidence_id in finding.evidence_ids:
+            item = evidence.get(evidence_id)
+            if item is None:
+                reasons.append(
+                    f"Finding '{finding.finding_id}' references missing evidence "
+                    f"'{evidence_id}'"
+                )
+                continue
+            raw_ids.update(item.source_raw_ids)
+
+        if not raw_ids:
+            reasons.append(
+                f"Finding '{finding.finding_id}' has no persisted raw source lineage"
+            )
+        for raw_id in sorted(raw_ids):
+            if raw_id not in raw_by_id:
+                reasons.append(
+                    f"Finding '{finding.finding_id}' references missing raw "
+                    f"diagnostic '{raw_id}'"
+                )
+
+        return (
+            tuple(
+                raw_by_id[raw_id] for raw_id in sorted(raw_ids) if raw_id in raw_by_id
+            ),
+            tuple(sorted(set(reasons))),
+        )
+
+    @classmethod
+    def _source_keys(
+        cls, finding: FindingSnapshot, raw_sources: tuple[RawDiagnosticSnapshot, ...]
+    ) -> frozenset[str]:
+        values = set(finding.source_observation_ids)
+        values.update(finding.evidence_ids)
+        values.update(cls._FINDING_SOURCE_QUERIES.get(finding.finding_id, ()))
+        for raw in raw_sources:
+            values.add(raw.source_id)
+            values.add(raw.category)
+            values.update(cls._string_values(raw.payload))
+            values.update(cls._string_values(raw.provenance))
+        return frozenset(
+            value.strip().lower()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        )
+
+    @staticmethod
+    def _string_values(value: Any) -> set[str]:
+        if isinstance(value, str):
+            return {value}
+        if isinstance(value, dict):
+            values = set()
+            for nested in value.values():
+                values.update(FindingLifecycleComparator._string_values(nested))
+            return values
+        if isinstance(value, (list, tuple)):
+            values = set()
+            for nested in value:
+                values.update(FindingLifecycleComparator._string_values(nested))
+            return values
+        return set()
+
+    @classmethod
+    def _restriction_matches_source(
+        cls, restriction: str, source_keys: frozenset[str]
+    ) -> bool:
+        normalized = str(restriction).lower()
+        if not any(marker in normalized for marker in cls._NON_AUTHORITATIVE_MARKERS):
+            return False
+        normalized = re.sub(r"[_-]+", " ", normalized)
+        return any(
+            re.sub(r"[_-]+", " ", key) in normalized
+            for key in source_keys
+            if len(key) >= 3
+        )
+
+    @classmethod
+    def _raw_matches_source(
+        cls, raw: RawDiagnosticSnapshot, source_keys: frozenset[str]
+    ) -> bool:
+        raw_values = {raw.source_id, raw.category}
+        raw_values.update(cls._string_values(raw.payload))
+        raw_values.update(cls._string_values(raw.provenance))
+        normalized_values = tuple(
+            re.sub(r"[_-]+", " ", value.lower())
+            for value in raw_values
+            if isinstance(value, str) and value.strip()
+        )
+        return any(
+            re.sub(r"[_-]+", " ", key) in value
+            for key in source_keys
+            if len(key) >= 3
+            for value in normalized_values
+        )
+
+    @staticmethod
+    def _raw_is_authoritative(raw: RawDiagnosticSnapshot) -> bool:
+        provenance = raw.provenance
+        payload = raw.payload
+        if bool(provenance.get("truncated")) or bool(payload.get("capture_truncated")):
+            return False
+        if provenance.get("execution_status") not in (None, "", "ok"):
+            return False
+        if payload.get("authoritative") is False:
+            return False
+        return True
+
+    @classmethod
+    def relevant_source_limitations(
+        cls, snapshot: SystemSnapshot, finding: FindingSnapshot
+    ) -> tuple[str, ...]:
+        """Return only limitations that can affect one persisted Finding.
+
+        Explainability uses the same source-authority boundary as lifecycle
+        verification.  It must not turn an unrelated unavailable source into
+        a limitation for an otherwise lineaged Finding.
+        """
+        raw_sources, lineage_reasons = cls._baseline_raw_sources(snapshot, finding)
+        reasons = set(lineage_reasons)
+        source_keys = cls._source_keys(finding, raw_sources)
+        reasons.update(
+            restriction
+            for restriction in snapshot.restrictions
+            if cls._restriction_matches_source(restriction, source_keys)
+        )
+        reasons.update(
+            f"Current source '{raw.source_id}' is not authoritative"
+            for raw in raw_sources
+            if not cls._raw_is_authoritative(raw)
+        )
+        observations = {obs.obs_id: obs for obs in snapshot.observations}
+        for observation_id in finding.source_observation_ids:
+            observation = observations.get(observation_id)
+            if observation is not None and (
+                not observation.data_complete or observation.contradictory_evidence
+            ):
+                reasons.add(
+                    f"Current observation '{observation_id}' is incomplete or "
+                    "contradictory"
+                )
+        return tuple(sorted(reasons))
+
+
+def compare_finding_lifecycle(
+    baseline: SystemSnapshot, current: SystemSnapshot
+) -> FindingLifecycleResult:
+    """Public convenience wrapper for the Finding lifecycle comparison."""
+    return FindingLifecycleComparator.compare(baseline, current)
+
+
+def format_verification_cli(result: FindingLifecycleResult) -> str:
+    """Format deterministic, compact human-readable verification output."""
+    sections = (
+        ("Resolved", result.resolved_finding_ids),
+        ("Persistent", result.persistent_finding_ids),
+        ("New", result.new_finding_ids),
+    )
+    lines = ["LDE Verification", ""]
+    for title, finding_ids in sections:
+        lines.append(title)
+        if finding_ids:
+            lines.extend(f"  {finding_id}" for finding_id in finding_ids)
+        else:
+            lines.append("  none")
+        lines.append("")
+    if result.unverified_finding_ids:
+        lines.append("Unverified")
+        lines.extend(f"  {finding_id}" for finding_id in result.unverified_finding_ids)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# ── Finding explainability and actionability ────────────────────
+
+
+EXPLAIN_RULE_DERIVED = "RULE_DERIVED"
+EXPLAIN_SOURCE_LIMITED = "source_limited"
+
+
+@dataclass(frozen=True)
+class ExplainStep:
+    """One bounded, read-only investigation or verification step."""
+
+    instruction: str
+    command: str = ""
+
+    def to_dict(self) -> dict:
+        data = {"instruction": self.instruction}
+        if self.command:
+            data["command"] = self.command
+        return data
+
+
+@dataclass(frozen=True)
+class FindingExplanationDefinition:
+    """State-independent English metadata for one Finding ID family."""
+
+    finding_id_pattern: str
+    summary: str
+    why_reported: str
+    possible_impact: str
+    actionability: str
+    investigation: tuple[ExplainStep, ...]
+    verification: tuple[ExplainStep, ...]
+    sources: tuple[str, ...]
+    severity: str = EXPLAIN_RULE_DERIVED
+    confidence: str = EXPLAIN_RULE_DERIVED
+
+    def __post_init__(self) -> None:
+        if not self.finding_id_pattern or not self.summary:
+            raise ValueError("Finding explanation identity and summary are required")
+        if self.actionability not in {
+            actionability.value for actionability in Actionability
+        }:
+            raise ValueError(f"Invalid explanation actionability: {self.actionability}")
+        if self.severity not in VALID_SEVERITIES | {EXPLAIN_RULE_DERIVED}:
+            raise ValueError(f"Invalid explanation severity: {self.severity}")
+        if self.confidence not in VALID_CONFIDENCES | {EXPLAIN_RULE_DERIVED}:
+            raise ValueError(f"Invalid explanation confidence: {self.confidence}")
+        if not self.why_reported or not self.possible_impact:
+            raise ValueError("Finding explanation claims must be non-empty")
+        if not self.investigation or not self.verification or not self.sources:
+            raise ValueError(
+                "Finding explanation requires investigation, verification, and sources"
+            )
+
+
+def _explain_step(instruction: str, command: str = "") -> ExplainStep:
+    return ExplainStep(instruction=instruction, command=command)
+
+
+def _explain_definition(
+    finding_id_pattern: str,
+    summary: str,
+    why_reported: str,
+    possible_impact: str,
+    actionability: Actionability,
+    investigation: tuple[ExplainStep, ...],
+    verification: tuple[ExplainStep, ...],
+    sources: tuple[str, ...],
+) -> FindingExplanationDefinition:
+    return FindingExplanationDefinition(
+        finding_id_pattern=finding_id_pattern,
+        summary=summary,
+        why_reported=why_reported,
+        possible_impact=possible_impact,
+        actionability=actionability.value,
+        investigation=investigation,
+        verification=verification,
+        sources=sources,
+    )
+
+
+# This is the single public explainability registry.  Its ID patterns are
+# checked against DiagnosticRule metadata so a new public detector cannot
+# silently fall through to fabricated generic prose.
+FINDING_EXPLANATION_REGISTRY = {
+    "BTRFS-ERR-001": _explain_definition(
+        "BTRFS-ERR-001",
+        "Btrfs reported a device or filesystem error state.",
+        "LDE reports this Finding when the Btrfs device-statistics or filesystem query returns an error state.",
+        "Reads or writes may be unavailable or unreliable; the event does not establish data loss or its scope.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Confirm the affected filesystem and device state.",
+                "btrfs filesystem show /",
+            ),
+            _explain_step(
+                "Review the read-only device counters.", "btrfs device stats /"
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the same Btrfs read-only queries after the external change."
+            ),
+            _explain_step(
+                "Treat a missing, incomplete, or permission-limited query as unknown rather than resolved."
+            ),
+        ),
+        ("Btrfs filesystem show", "Btrfs device statistics"),
+    ),
+    "BTRFS-SCRUB-001": _explain_definition(
+        "BTRFS-SCRUB-001",
+        "Btrfs scrub status is incomplete, failed, or otherwise noteworthy.",
+        "LDE reports this Finding when the read-only Btrfs scrub-status query returns a non-healthy status.",
+        "Filesystem integrity may need review; this Finding does not prove corruption or prescribe a scrub action.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Inspect the current scrub status without starting or changing a scrub.",
+                "btrfs scrub status /",
+            ),
+            _explain_step(
+                "Confirm the filesystem identity and device state.",
+                "btrfs filesystem show /",
+            ),
+        ),
+        (
+            _explain_step("Repeat the scrub-status query after the external change."),
+            _explain_step(
+                "Require an authoritative status response before calling the Finding resolved."
+            ),
+        ),
+        ("Btrfs scrub status", "Btrfs filesystem metadata"),
+    ),
+    "SEGFAULT-WP-001": _explain_definition(
+        "SEGFAULT-WP-001",
+        "A WirePlumber-related segmentation fault was observed.",
+        "LDE reports this Finding when a current-boot journal entry matches the WirePlumber segmentation-fault detector.",
+        "Audio-session behavior may be interrupted; the event alone does not identify the root cause or guarantee recurrence.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the surrounding current-boot journal lines.",
+                "journalctl -b --no-pager | grep -C 20 -iE 'wireplumber|segfault'",
+            ),
+            _explain_step(
+                "Check the installed WirePlumber version without changing packages.",
+                "wireplumber --version",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the journal query in a later boot and compare recurrence."
+            ),
+            _explain_step(
+                "Confirm whether audio-session behavior is currently affected."
+            ),
+        ),
+        ("Current-boot journal", "WirePlumber version"),
+    ),
+    "SEGFAULT-SYS-001": _explain_definition(
+        "SEGFAULT-SYS-001",
+        "A system-wide segmentation fault pattern was observed.",
+        "LDE reports this Finding when the current-boot journal contains a segmentation fault pattern outside the dedicated minor or WirePlumber path.",
+        "The affected process may have terminated; the event alone does not identify the root cause, affected component, or future behavior.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the exact process and nearby kernel or service messages.",
+                "journalctl -b --no-pager | grep -C 20 -iE 'segfault|general protection fault'",
+            ),
+            _explain_step("Record whether the same process appears more than once."),
+        ),
+        (
+            _explain_step(
+                "Repeat the read-only journal query after the external change."
+            ),
+            _explain_step(
+                "Verify current process or service behavior independently of journal absence."
+            ),
+        ),
+        ("Current-boot journal", "Process or service status"),
+    ),
+    "SEGFAULT-MIN-001": _explain_definition(
+        "SEGFAULT-MIN-001",
+        "A lower-severity segmentation fault event was observed.",
+        "LDE reports this Finding when a segmentation-fault event matches the minor-event detector.",
+        "A process may have terminated; one event does not establish a system-wide problem or its cause.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the exact journal entry and process name.",
+                "journalctl -b --no-pager | grep -C 10 -iE 'segfault|general protection fault'",
+            ),
+            _explain_step("Check whether the event recurs in the current boot."),
+        ),
+        (
+            _explain_step(
+                "Compare the event count with a later read-only journal query."
+            ),
+            _explain_step(
+                "Verify the affected application behavior rather than using silence as proof of resolution."
+            ),
+        ),
+        ("Current-boot journal", "Application or process status"),
+    ),
+    "KERNEL-TAINT-001": _explain_definition(
+        "KERNEL-TAINT-001",
+        "The running kernel exposes one or more taint flags.",
+        "LDE reports this Finding when the kernel taint state or matching kernel-journal evidence is present.",
+        "Kernel support and later incident interpretation may be affected; the flags do not identify one root cause by themselves.",
+        Actionability.CONDITIONAL,
+        (
+            _explain_step(
+                "Read the numeric kernel taint state.", "cat /proc/sys/kernel/tainted"
+            ),
+            _explain_step(
+                "Review the current-boot kernel messages around taint markers.",
+                "journalctl -b -k --no-pager | grep -iE 'taint|tainted'",
+            ),
+        ),
+        (
+            _explain_step("Repeat both read-only checks after the external change."),
+            _explain_step(
+                "Interpret a missing journal marker separately from the numeric taint state."
+            ),
+        ),
+        ("/proc/sys/kernel/tainted", "Current-boot kernel journal"),
+    ),
+    "KERNEL-OOM-001": _explain_definition(
+        "KERNEL-OOM-001",
+        "The kernel reported an out-of-memory event.",
+        "LDE reports this Finding when the current-boot kernel journal matches the out-of-memory detector.",
+        "Processes may have been terminated and service behavior may have been interrupted; the event does not identify which resource change would fix it.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the OOM messages and selected process context.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'oom-killer|out of memory'",
+            ),
+            _explain_step(
+                "Inspect current memory pressure without changing the system.",
+                "free -h",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the kernel query in a later boot and check for recurrence."
+            ),
+            _explain_step(
+                "Verify affected services independently of an empty current journal."
+            ),
+        ),
+        ("Current-boot kernel journal", "Current memory counters"),
+    ),
+    "GPU-I915-HANG-001": _explain_definition(
+        "GPU-I915-HANG-001",
+        "The i915 graphics path reported a hang or recovery event.",
+        "LDE reports this Finding when current-boot kernel evidence matches the i915 hang detector.",
+        "Graphics or display operations may have stalled; the event does not prove whether hardware, firmware, kernel, or workload caused it.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the i915 messages around the event.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'i915.*hang|gpu hang|resetting chip'",
+            ),
+            _explain_step("Record the active GPU and kernel driver.", "lspci -nnk"),
+        ),
+        (
+            _explain_step(
+                "Repeat the same journal and driver queries after the external change."
+            ),
+            _explain_step(
+                "Verify current display responsiveness and check for a new hang marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI device and driver inventory"),
+    ),
+    "AMDGPU-RESET-FAIL-001": _explain_definition(
+        "AMDGPU-RESET-FAIL-001",
+        "The amdgpu path reported a failed or incomplete reset.",
+        "LDE reports this Finding when current-boot kernel evidence matches the amdgpu reset-failure detector.",
+        "GPU or display operations may remain unavailable; the event does not establish the responsible component.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the reset-failure sequence in the kernel journal.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'amdgpu.*reset|GPU reset failed|ring.*timeout'",
+            ),
+            _explain_step("Record the GPU driver binding.", "lspci -nnk"),
+        ),
+        (
+            _explain_step("Repeat the read-only queries after the external change."),
+            _explain_step(
+                "Verify current graphics behavior and check for a new reset failure."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI device and driver inventory"),
+    ),
+    "GPU-NVIDIA-XID-79-001": _explain_definition(
+        "GPU-NVIDIA-XID-79-001",
+        "The NVIDIA driver reported Xid 79.",
+        "LDE reports this Finding when a current-boot kernel journal line matches NVIDIA Xid 79.",
+        "The GPU or its driver path may have become unavailable; the Xid alone does not identify the root cause.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the exact Xid line and surrounding kernel messages.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'Xid.*79'",
+            ),
+            _explain_step("Record the active kernel driver and device.", "lspci -nnk"),
+        ),
+        (
+            _explain_step(
+                "Repeat the Xid query after the external change and compare recurrence."
+            ),
+            _explain_step(
+                "Verify current GPU responsiveness independently of journal absence."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI device and driver inventory"),
+    ),
+    "PCIE-AER-001": _explain_definition(
+        "PCIE-AER-001",
+        "PCIe Advanced Error Reporting recorded an error event.",
+        "LDE reports this Finding when the current-boot kernel journal matches the PCIe AER detector.",
+        "A PCIe link or device may have experienced a recoverable or serious communication issue; severity remains evidence-derived.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the AER class, device identifier, and nearby messages.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'pcie.*aer|aer:|corrected|uncorrected'",
+            ),
+            _explain_step("Inspect PCIe device and driver bindings.", "lspci -nnk"),
+        ),
+        (
+            _explain_step("Repeat the AER query after the external change."),
+            _explain_step(
+                "Confirm whether new errors are absent from an authoritative current-boot source."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI device inventory"),
+    ),
+    "NVME-CONTROLLER-RESET-001": _explain_definition(
+        "NVME-CONTROLLER-RESET-001",
+        "The NVMe controller reliability detector observed a reset or failure marker.",
+        "LDE reports this Finding when current-boot evidence matches the NVMe controller-reliability detector.",
+        "Storage availability or latency may be affected; the event does not prove media failure or identify a repair.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the controller reset sequence and device name.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'nvme.*reset|controller is down|I/O.*timeout'",
+            ),
+            _explain_step(
+                "Inspect detected NVMe topology when the utility is available.",
+                "nvme list-subsys",
+            ),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify storage availability and check for a new controller marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "NVMe subsystem inventory"),
+    ),
+    "HW-MCE-EDAC-001": _explain_definition(
+        "HW-MCE-EDAC-001",
+        "Machine-check or EDAC hardware-error evidence was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the MCE or EDAC detector.",
+        "Hardware or memory reliability may be affected; the event does not identify a failing part without further evidence.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the complete MCE or EDAC message context.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'mce|edac|machine check'",
+            ),
+            _explain_step("Record the relevant hardware inventory.", "lspci -nnk"),
+        ),
+        (
+            _explain_step(
+                "Repeat the read-only kernel query after the external change."
+            ),
+            _explain_step(
+                "Require authoritative recurrence or absence evidence before changing the lifecycle state."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI and memory-related inventory"),
+    ),
+    "FS-IO-ERROR-001": _explain_definition(
+        "FS-IO-ERROR-001",
+        "A filesystem or block I/O error marker was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the filesystem I/O-error detector.",
+        "Reads, writes, or filesystem availability may be affected; the event does not establish corruption scope or root cause.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the I/O error context and affected device.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'Buffer I/O error|blk_update_request|I/O error|EXT4-fs error|XFS'",
+            ),
+            _explain_step(
+                "Map mounted filesystems to devices without modifying them.",
+                "findmnt -o SOURCE,FSTYPE,TARGET",
+            ),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify filesystem availability and compare authoritative new I/O evidence."
+            ),
+        ),
+        ("Current-boot kernel journal", "Mounted filesystem inventory"),
+    ),
+    "HW-THERMAL-THROTTLE-001": _explain_definition(
+        "HW-THERMAL-THROTTLE-001",
+        "A thermal-throttling or thermal-threshold event was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the thermal-throttling detector.",
+        "Performance may have been reduced to protect hardware; the event does not establish the thermal cause or component.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the thermal event and nearby kernel messages.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'temperature above threshold|thermal threshold|throttl'",
+            ),
+            _explain_step(
+                "Read current sensor values when the sensors utility is available.",
+                "sensors",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the journal and sensor checks after the external change."
+            ),
+            _explain_step(
+                "Verify whether new thermal markers occur under the same workload."
+            ),
+        ),
+        ("Current-boot kernel journal", "Current hardware sensor readings"),
+    ),
+    "KERNEL-OOPS-PANIC-001": _explain_definition(
+        "KERNEL-OOPS-PANIC-001",
+        "A kernel oops or panic marker was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches an oops or panic detector.",
+        "Kernel or system availability may have been affected; the event does not assign a root cause to one component.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Preserve and review the current-boot kernel context.",
+                "journalctl -b -k --no-pager | grep -C 30 -iE 'kernel panic|Oops:|BUG:'",
+            ),
+            _explain_step("Record the running kernel version.", "uname -r"),
+        ),
+        (
+            _explain_step(
+                "Repeat the kernel query after the external change and compare recurrence."
+            ),
+            _explain_step(
+                "Verify current system responsiveness independently of journal silence."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "KERNEL-SOFT-LOCKUP-001": _explain_definition(
+        "KERNEL-SOFT-LOCKUP-001",
+        "The kernel reported a soft lockup.",
+        "LDE reports this Finding when current-boot kernel evidence matches the soft-lockup detector.",
+        "A CPU or kernel path may have been delayed; the event does not identify the responsible workload or code path.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the call trace and surrounding soft-lockup messages.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'soft lockup'",
+            ),
+            _explain_step("Record the running kernel version.", "uname -r"),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify responsiveness and check for a new soft-lockup marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "KERNEL-HARD-LOCKUP-001": _explain_definition(
+        "KERNEL-HARD-LOCKUP-001",
+        "The kernel reported a hard lockup.",
+        "LDE reports this Finding when current-boot kernel evidence matches the hard-lockup detector.",
+        "System responsiveness may have been severely affected; the event does not identify the responsible component.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the NMI or call-trace context.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'hard lockup'",
+            ),
+            _explain_step("Record the running kernel version.", "uname -r"),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify system responsiveness and check for a new hard-lockup marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "KERNEL-HUNG-TASK-001": _explain_definition(
+        "KERNEL-HUNG-TASK-001",
+        "The kernel reported a task blocked beyond its threshold.",
+        "LDE reports this Finding when current-boot kernel evidence matches the hung-task detector.",
+        "A process may be blocked on I/O or synchronization; the event does not establish why it is blocked.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the blocked task and call trace context.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'blocked for more than'",
+            ),
+            _explain_step("Record the running kernel version.", "uname -r"),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify the affected workload and check for a new blocked-task marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "KERNEL-RCU-STALL-001": _explain_definition(
+        "KERNEL-RCU-STALL-001",
+        "The kernel reported an RCU stall.",
+        "LDE reports this Finding when current-boot kernel evidence matches the RCU-stall detector.",
+        "Kernel callbacks or system progress may have been delayed; the event does not identify the responsible code path.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the CPU and callback context around the stall.",
+                "journalctl -b -k --no-pager | grep -C 20 -iE 'rcu.*detected.*stall|rcu.*starved'",
+            ),
+            _explain_step("Record the running kernel version.", "uname -r"),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify current responsiveness and check for a new RCU marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "PLATFORM-ACPI-FIRMWARE-ERROR-001": _explain_definition(
+        "PLATFORM-ACPI-FIRMWARE-ERROR-001",
+        "The kernel reported an ACPI or platform-firmware error.",
+        "LDE reports this Finding when current-boot kernel evidence matches the ACPI/platform-firmware detector.",
+        "One or more platform features may behave unexpectedly; the event does not prove that firmware is the sole cause.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the exact ACPI message and nearby platform context.",
+                "journalctl -b -k --no-pager | grep -C 10 -iE 'ACPI (BIOS )?(Error|Exception)'",
+            ),
+            _explain_step(
+                "Record the current kernel and firmware-facing device inventory.",
+                "uname -r",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the ACPI query after the external change and compare recurrence."
+            ),
+            _explain_step(
+                "Verify the affected platform feature rather than treating journal silence as proof."
+            ),
+        ),
+        ("Current-boot kernel journal", "Running kernel identity"),
+    ),
+    "KERNEL-FIRMWARE-LOAD-FAIL-001": _explain_definition(
+        "KERNEL-FIRMWARE-LOAD-FAIL-001",
+        "The kernel reported a firmware-load failure.",
+        "LDE reports this Finding when current-boot kernel evidence matches the firmware-load-failure detector.",
+        "The related device feature may be unavailable or degraded; the event does not identify which package or update would fix it.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Identify the missing firmware name in the kernel journal.",
+                "journalctl -b -k --no-pager | grep -C 5 -iE 'failed to load|Direct firmware load for|request_firmware'",
+            ),
+            _explain_step(
+                "Inspect firmware search paths without changing them.",
+                "find /lib/firmware /usr/lib/firmware -maxdepth 2 -type f -print",
+            ),
+        ),
+        (
+            _explain_step("Repeat the journal query after the external change."),
+            _explain_step(
+                "Verify the affected device feature and check for a new load failure."
+            ),
+        ),
+        ("Current-boot kernel journal", "Firmware file paths"),
+    ),
+    "USB-ENUMERATION-FAIL-001": _explain_definition(
+        "USB-ENUMERATION-FAIL-001",
+        "A USB enumeration failure was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the USB enumeration-failure detector.",
+        "The USB device or port may be unavailable; the event does not identify whether the device, cable, port, or controller is responsible.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the USB enumeration sequence.",
+                "journalctl -b -k --no-pager | grep -C 10 -iE 'device descriptor read|unable to enumerate|device not accepting address'",
+            ),
+            _explain_step("List currently visible USB devices.", "lsusb"),
+        ),
+        (
+            _explain_step("Repeat the USB journal query after the external change."),
+            _explain_step(
+                "Verify whether the affected device is currently enumerated."
+            ),
+        ),
+        ("Current-boot kernel journal", "USB device inventory"),
+    ),
+    "IOMMU-FAULT-001": _explain_definition(
+        "IOMMU-FAULT-001",
+        "An IOMMU translation or device fault was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the IOMMU-fault detector.",
+        "DMA access or the affected device may have been blocked; the event does not identify the responsible device or driver by itself.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the fault address, device identifier, and nearby kernel context.",
+                "journalctl -b -k --no-pager | grep -C 10 -iE 'AMD-Vi.*Event logged|DMAR:.*Request device|Unhandled context fault'",
+            ),
+            _explain_step("Map the device identifier to PCI inventory.", "lspci -nnk"),
+        ),
+        (
+            _explain_step("Repeat the IOMMU query after the external change."),
+            _explain_step(
+                "Verify the affected device function and check for a new fault."
+            ),
+        ),
+        ("Current-boot kernel journal", "PCI device inventory"),
+    ),
+    "NETWORK-NM-ACTIVATION-FAIL-001": _explain_definition(
+        "NETWORK-NM-ACTIVATION-FAIL-001",
+        "NetworkManager reported a failed connection activation.",
+        "LDE reports this Finding when current-boot NetworkManager evidence matches the activation-failure detector.",
+        "The connection may have been unavailable or unstable; the event does not distinguish DHCP, authentication, link, or configuration causes.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the NetworkManager activation messages.",
+                "journalctl -b --no-pager -u NetworkManager | grep -C 10 -iE 'activation failed|failed to activate'",
+            ),
+            _explain_step(
+                "Inspect current link and connection state.", "nmcli device status"
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the read-only NetworkManager query after the external change."
+            ),
+            _explain_step(
+                "Verify current connectivity independently of the absence of an activation error."
+            ),
+        ),
+        ("NetworkManager journal", "NetworkManager device status"),
+    ),
+    "NETWORK-DEVICE-WATCHDOG-001": _explain_definition(
+        "NETWORK-DEVICE-WATCHDOG-001",
+        "A network device watchdog or transmit-hang marker was observed.",
+        "LDE reports this Finding when current-boot kernel evidence matches the network-device watchdog detector.",
+        "The interface may have stopped transmitting; the event does not identify the device, driver, or external cause without context.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Review the watchdog message and interface name.",
+                "journalctl -b -k --no-pager | grep -C 10 -iE 'watchdog|Tx Unit Hang'",
+            ),
+            _explain_step("Inspect current interface state.", "ip -details link"),
+        ),
+        (
+            _explain_step("Repeat the kernel query after the external change."),
+            _explain_step(
+                "Verify current link state and check for a new watchdog marker."
+            ),
+        ),
+        ("Current-boot kernel journal", "Network interface inventory"),
+    ),
+    "POWER-SOURCE-CRITICAL-001": _explain_definition(
+        "POWER-SOURCE-CRITICAL-001",
+        "UPower reported a critical or empty power-source state.",
+        "LDE reports this Finding when UPower exposes a critical or empty source state, not from percentage alone.",
+        "A battery or UPS may not sustain the system; the event does not identify the physical or electrical cause.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Inspect read-only UPower state and source details.", "upower -d"
+            ),
+            _explain_step("Check the current power-source summary.", "upower -e"),
+        ),
+        (
+            _explain_step("Repeat the UPower queries after the external change."),
+            _explain_step(
+                "Verify the current source state and system behavior independently."
+            ),
+        ),
+        ("UPower power-source state",),
+    ),
+    "SYSD-SYS-FAIL-001": _explain_definition(
+        "SYSD-SYS-FAIL-001",
+        "One or more system-scope systemd units failed.",
+        "LDE reports this Finding when the system-scope failed-unit query returns one or more failed units.",
+        "The related service or boot function may be unavailable; the unit name alone does not establish why it failed.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step("List failed system units.", "systemctl --failed"),
+            _explain_step(
+                "Review the affected unit's status and current-boot journal."
+            ),
+        ),
+        (
+            _explain_step("Repeat the failed-unit query after the external change."),
+            _explain_step(
+                "Verify the unit's intended function, not only that the failure list is empty."
+            ),
+        ),
+        ("System-scope systemd state", "Current-boot unit journal"),
+    ),
+    "SYSD-USR-FAIL-001": _explain_definition(
+        "SYSD-USR-FAIL-001",
+        "One or more user-scope systemd units failed.",
+        "LDE reports this Finding when the user-scope failed-unit query returns one or more failed units.",
+        "A user-session service or feature may be unavailable; the unit name alone does not establish why it failed.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step("List failed user units.", "systemctl --user --failed"),
+            _explain_step("Review the affected user unit's status and journal."),
+        ),
+        (
+            _explain_step(
+                "Repeat the user-scope failed-unit query after the external change."
+            ),
+            _explain_step("Verify the intended user-session function independently."),
+        ),
+        ("User-scope systemd state", "User-session unit journal"),
+    ),
+    "KRNL-INFO-001": _explain_definition(
+        "KRNL-INFO-001",
+        "The installed kernel inventory contains an informational condition.",
+        "LDE reports this Finding when the read-only kernel-package and boot-image inventory meets the configured informational condition.",
+        "Boot storage usage or fallback-kernel availability may warrant review; this is not a failure claim.",
+        Actionability.INFORMATIONAL,
+        (
+            _explain_step("List bootable kernel images.", "ls /boot/vmlinuz-*"),
+            _explain_step("Record the running kernel.", "uname -r"),
+        ),
+        (
+            _explain_step(
+                "Repeat the inventory after the external package or boot change."
+            ),
+            _explain_step(
+                "Confirm that the running kernel and intended fallback remain available."
+            ),
+        ),
+        ("Kernel package inventory", "/boot kernel images"),
+    ),
+    "BOOT-SLOW-001": _explain_definition(
+        "BOOT-SLOW-001",
+        "The measured boot duration exceeded the configured threshold.",
+        "LDE reports this Finding when the read-only boot-time measurement exceeds the configured threshold.",
+        "Startup may be slower than intended; the measurement does not identify a root cause or justify disabling a service.",
+        Actionability.CONDITIONAL,
+        (
+            _explain_step(
+                "Inspect the boot critical path.", "systemd-analyze critical-chain"
+            ),
+            _explain_step(
+                "Inspect units contributing to boot time.", "systemd-analyze blame"
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the boot-time measurement after the external change."
+            ),
+            _explain_step(
+                "Compare several authoritative boots before attributing improvement to one change."
+            ),
+        ),
+        ("systemd-analyze boot timing",),
+    ),
+    "STORAGE-USAGE-WARNING*": _explain_definition(
+        "STORAGE-USAGE-WARNING*",
+        "A monitored filesystem crossed the configured storage-warning threshold.",
+        "LDE reports this Finding when read-only `df` data places a monitored mount at or above the warning threshold and below the critical threshold.",
+        "Low free space may affect updates or application behavior; the measurement does not identify what can safely be removed.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step("Confirm the current filesystem percentage.", "df -h"),
+            _explain_step(
+                "Inspect large top-level paths without deleting anything.",
+                "du -sh /* | sort -rh | head -10",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the filesystem measurement after the external change."
+            ),
+            _explain_step(
+                "Verify the same mount remains below the configured threshold."
+            ),
+        ),
+        ("df filesystem usage", "Read-only directory size summary"),
+    ),
+    "STORAGE-USAGE-CRITICAL*": _explain_definition(
+        "STORAGE-USAGE-CRITICAL*",
+        "A monitored filesystem crossed the configured storage-critical threshold.",
+        "LDE reports this Finding when read-only `df` data places a monitored mount at or above the critical threshold.",
+        "Writes or services may fail because free space is constrained; the measurement does not identify a safe cleanup action.",
+        Actionability.ACTIONABLE,
+        (
+            _explain_step(
+                "Confirm the current filesystem percentage and mount.", "df -h"
+            ),
+            _explain_step(
+                "Inspect large top-level paths without deleting anything.",
+                "du -sh /* | sort -rh | head -10",
+            ),
+        ),
+        (
+            _explain_step(
+                "Repeat the filesystem measurement after the external change."
+            ),
+            _explain_step(
+                "Verify the same mount is below the critical threshold and affected services work."
+            ),
+        ),
+        ("df filesystem usage", "Read-only directory size summary"),
+    ),
+}
+
+
+def _finding_id_pattern_matches(pattern: str, finding_id: str) -> bool:
+    if pattern.endswith("*"):
+        return finding_id.startswith(pattern[:-1])
+    return pattern == finding_id
+
+
+def find_finding_explanation_definition(
+    finding_id: str,
+) -> FindingExplanationDefinition:
+    """Resolve an exact or deterministic family definition for a Finding ID."""
+    if not finding_id or not finding_id.strip():
+        raise ValueError("Finding ID must be non-empty")
+    direct = FINDING_EXPLANATION_REGISTRY.get(finding_id)
+    if direct is not None:
+        return direct
+    for pattern, definition in FINDING_EXPLANATION_REGISTRY.items():
+        if _finding_id_pattern_matches(pattern, finding_id):
+            return definition
+    raise ValueError(f"Unknown Finding ID: {finding_id}")
+
+
+def validate_finding_explanation_registry() -> tuple[str, ...]:
+    """Validate explainability coverage against the default rule inventory."""
+    from diagnostic_rules import build_default_rule_engine
+
+    default_engine = build_default_rule_engine()
+    expected = set(default_engine.finding_id_patterns)
+    actual = set(FINDING_EXPLANATION_REGISTRY)
+    errors = []
+    for rule in default_engine.rules:
+        if "finding_id_patterns" not in vars(rule.__class__):
+            errors.append(
+                f"Rule '{rule.rule_id}' lacks an explicit Finding ID declaration"
+            )
+    for pattern in sorted(expected - actual):
+        errors.append(f"Missing explanation definition for '{pattern}'")
+    for pattern in sorted(actual - expected):
+        errors.append(f"Explanation definition has no detector for '{pattern}'")
+    for pattern, definition in FINDING_EXPLANATION_REGISTRY.items():
+        if definition.finding_id_pattern != pattern:
+            errors.append(f"Explanation key mismatch for '{pattern}'")
+        for step in definition.investigation + definition.verification:
+            command = step.command.lower()
+            if any(
+                marker in command
+                for marker in (
+                    "sudo",
+                    "systemctl disable",
+                    "systemctl enable",
+                    "reset-failed",
+                    "pacman ",
+                    "scrub start",
+                    "repair",
+                    "replace",
+                    "rm ",
+                    "mv ",
+                    "tee ",
+                )
+            ):
+                errors.append(
+                    f"Mutation-like investigation command for '{pattern}': {step.command}"
+                )
+    return tuple(errors)
+
+
+@dataclass(frozen=True)
+class FindingExplanation:
+    """Resolved explanation, optionally enriched from one validated snapshot."""
+
+    finding_id: str
+    title: str
+    summary: str
+    severity: str
+    confidence: str
+    why_reported: str
+    possible_impact: str
+    actionability: str
+    investigation: tuple[ExplainStep, ...]
+    verification: tuple[ExplainStep, ...]
+    sources: tuple[str, ...]
+    limitations: tuple[str, ...] = ()
+    present: Optional[bool] = None
+    runtime_status: str = "No snapshot supplied; state-independent definition."
+    source_status: str = "STATIC_DEFINITION"
+    source_observation_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+    evidence: tuple[dict, ...] = ()
+    definition_id: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "finding_id": self.finding_id,
+            "title": self.title,
+            "summary": self.summary,
+            "severity": self.severity,
+            "confidence": self.confidence,
+            "why_reported": self.why_reported,
+            "possible_impact": self.possible_impact,
+            "actionability": self.actionability,
+            "investigation": [step.to_dict() for step in self.investigation],
+            "verification": [step.to_dict() for step in self.verification],
+            "sources": list(self.sources),
+            "limitations": list(self.limitations),
+            "present": self.present,
+            "runtime_status": self.runtime_status,
+            "source_status": self.source_status,
+            "source_observation_ids": list(self.source_observation_ids),
+            "evidence_ids": list(self.evidence_ids),
+            "evidence": list(self.evidence),
+            "definition_id": self.definition_id,
+        }
+
+
+def _canonical_snapshot_actionability(value: str, fallback: str) -> str:
+    """Read current and legacy enum spellings without widening the contract."""
+    if value == EXPLAIN_SOURCE_LIMITED:
+        return value
+    valid = {actionability.value for actionability in Actionability}
+    if value in valid:
+        return value
+    if value.startswith("Actionability."):
+        candidate = value.rsplit(".", 1)[-1].lower()
+        if candidate in valid:
+            return candidate
+    return fallback
+
+
+def explain_finding(
+    finding_id: str, snapshot: Optional[SystemSnapshot] = None
+) -> FindingExplanation:
+    """Build a bounded explanation without collecting or inferring diagnostics."""
+    definition = find_finding_explanation_definition(finding_id)
+    common = {
+        "finding_id": finding_id,
+        "summary": definition.summary,
+        "severity": definition.severity,
+        "confidence": definition.confidence,
+        "why_reported": definition.why_reported,
+        "possible_impact": definition.possible_impact,
+        "actionability": definition.actionability,
+        "investigation": definition.investigation,
+        "verification": definition.verification,
+        "sources": definition.sources,
+        "definition_id": definition.finding_id_pattern,
+    }
+    if snapshot is None:
+        return FindingExplanation(**common, title=definition.summary)
+
+    FindingLifecycleComparator._validate_snapshot(snapshot, label="explain")
+    finding = next(
+        (
+            candidate
+            for candidate in snapshot.findings
+            if candidate.finding_id == finding_id
+        ),
+        None,
+    )
+    if finding is None:
+        return FindingExplanation(
+            **common,
+            title=definition.summary,
+            present=False,
+            runtime_status="Finding is not present in the supplied snapshot.",
+            source_status="NOT_PRESENT_IN_SNAPSHOT",
+        )
+
+    limitations = FindingLifecycleComparator.relevant_source_limitations(
+        snapshot, finding
+    )
+    evidence_by_id = {item.evidence_id: item for item in snapshot.evidence}
+    evidence = tuple(
+        {
+            "evidence_id": item.evidence_id,
+            "evidence_type": item.evidence_type,
+            "summary": item.summary,
+            "source_observation_ids": list(item.source_observation_ids),
+            "source_raw_ids": list(item.source_raw_ids),
+            "completeness": item.completeness,
+            "contradictory": item.contradictory,
+        }
+        for evidence_id in finding.evidence_ids
+        if (item := evidence_by_id.get(evidence_id)) is not None
+    )
+    actionability = (
+        EXPLAIN_SOURCE_LIMITED
+        if limitations
+        else (finding.actionability or definition.actionability)
+    )
+    runtime_values = {
+        **common,
+        "title": finding.title or definition.summary,
+        "severity": finding.severity or definition.severity,
+        "confidence": finding.confidence or definition.confidence,
+        "actionability": _canonical_snapshot_actionability(
+            actionability, definition.actionability
+        ),
+    }
+    return FindingExplanation(
+        **runtime_values,
+        limitations=limitations,
+        present=True,
+        runtime_status="Finding is present in the supplied snapshot.",
+        source_status="LIMITED" if limitations else "SNAPSHOT_LINEAGE",
+        source_observation_ids=tuple(finding.source_observation_ids),
+        evidence_ids=tuple(finding.evidence_ids),
+        evidence=evidence,
+    )
+
+
+def format_finding_explanation(
+    explanation: FindingExplanation, *, json_output: bool = False
+) -> str:
+    """Format the compact public explain surface."""
+    if json_output:
+        return (
+            json.dumps(
+                explanation.to_dict(), indent=2, ensure_ascii=False, sort_keys=True
+            )
+            + "\n"
+        )
+
+    def render_steps(title: str, steps: tuple[ExplainStep, ...]) -> list[str]:
+        lines = [title, ""]
+        for step in steps:
+            lines.append(f"- {step.instruction}")
+            if step.command:
+                lines.append(f"  Command: `{step.command}`")
+        lines.append("")
+        return lines
+
+    lines = [
+        "LDE Finding Explanation",
+        "",
+        f"Finding: {explanation.finding_id}",
+        f"Summary: {explanation.summary}",
+        f"Severity: {explanation.severity}",
+        f"Confidence: {explanation.confidence}",
+        f"Actionability: {explanation.actionability}",
+        f"Runtime status: {explanation.runtime_status}",
+        f"Source status: {explanation.source_status}",
+        "",
+        "Why LDE reports it",
+        "",
+        explanation.why_reported,
+        "",
+        "Possible impact",
+        "",
+        explanation.possible_impact,
+        "",
+    ]
+    lines.extend(render_steps("Investigate", explanation.investigation))
+    lines.extend(render_steps("Verify", explanation.verification))
+    lines.extend(["Sources", ""])
+    lines.extend(f"- {source}" for source in explanation.sources)
+    lines.append("")
+    lines.extend(["Limitations", ""])
+    if explanation.limitations:
+        lines.extend(f"- {limitation}" for limitation in explanation.limitations)
+    else:
+        lines.append("- None recorded for this explanation context.")
+    lines.append("")
+    if explanation.source_observation_ids:
+        lines.append(
+            "Source observation IDs: " + ", ".join(explanation.source_observation_ids)
+        )
+    if explanation.evidence_ids:
+        lines.append("Evidence IDs: " + ", ".join(explanation.evidence_ids))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _run_cli_diagnostics(
+    *, output_dir: str, quiet: bool, full: bool, verbose: bool
+) -> tuple[SysCheckEngine, Path]:
+    """Run the existing engine once for run, snapshot creation, or verify."""
+    engine = SysCheckEngine(
+        output_dir=output_dir,
+        quiet=quiet or not verbose,
+        full=full,
+    )
+    report_path = Path(engine.run_all()).expanduser().resolve()
+    return engine, report_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -7368,6 +8932,21 @@ def main() -> None:
         help="Explicit new output path; the input is never overwritten",
     )
 
+    # ── Finding explanation command ─────────────────────────────
+    explain_parser = subparsers.add_parser(
+        "explain", help="Explain one Finding and its bounded next steps"
+    )
+    explain_parser.add_argument("finding_id", help="Finding ID to explain")
+    explain_parser.add_argument(
+        "--snapshot",
+        type=str,
+        default=None,
+        help="Enrich the explanation from a validated schema-3 snapshot",
+    )
+    explain_parser.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+
     # ── Snapshot utility commands ─────────────────────────────────
     snapshot_parser = subparsers.add_parser(
         "snapshot", help="Validate or inspect a JSON snapshot"
@@ -7379,6 +8958,58 @@ def main() -> None:
         "validate", help="Validate a schema-3 JSON snapshot"
     )
     validate_parser.add_argument("input", help="Path to the JSON snapshot")
+    create_parser = snapshot_subparsers.add_parser(
+        "create", help="Run diagnostics and create a JSON snapshot"
+    )
+    create_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="Explicit new output path for the JSON snapshot",
+    )
+    create_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"Report directory (default: {get_default_reports_dir()})",
+    )
+    create_parser.add_argument(
+        "--quiet", "-q", action="store_true", help="Suppress progress output"
+    )
+    create_parser.add_argument(
+        "--full", "-f", action="store_true", help="Keep full command output"
+    )
+    create_parser.add_argument(
+        "--verbose", action="store_true", help="Show detailed diagnostic progress"
+    )
+    snapshot_compare_parser = snapshot_subparsers.add_parser(
+        "compare", help="Compare two JSON snapshots"
+    )
+    snapshot_compare_parser.add_argument("old", help="Path to the older JSON snapshot")
+    snapshot_compare_parser.add_argument("new", help="Path to the newer JSON snapshot")
+    snapshot_compare_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Write the comparison report to a Markdown file",
+    )
+
+    # ── Verification workflow ────────────────────────────────────
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify a baseline snapshot against the current machine"
+    )
+    verify_parser.add_argument("baseline", help="Path to the baseline JSON snapshot")
+    verify_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"Report directory (default: {get_default_reports_dir()})",
+    )
+    verify_parser.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+    verify_parser.add_argument(
+        "--verbose", action="store_true", help="Show detailed diagnostic progress"
+    )
 
     args = parser.parse_args()
 
@@ -7414,8 +9045,55 @@ def main() -> None:
         print(f"Notice: {SANITIZATION_NOTICE}")
         return
 
-    # ── Snapshot validation handling ──────────────────────────────
+    # ── Finding explanation handling ─────────────────────────────
+    if args.command == "explain":
+        registry_errors = validate_finding_explanation_registry()
+        if registry_errors:
+            _cli_error(
+                "Invalid Finding explanation registry: " + "; ".join(registry_errors)
+            )
+        snapshot = None
+        if args.snapshot:
+            try:
+                snapshot = SystemSnapshot.from_json(args.snapshot)
+                FindingLifecycleComparator._validate_snapshot(snapshot, label="explain")
+            except FileNotFoundError as exc:
+                _cli_error(f"Snapshot input not found: {exc.filename or args.snapshot}")
+            except (IsADirectoryError, PermissionError) as exc:
+                _cli_error(f"Cannot read snapshot input: {exc}")
+            except (AttributeError, ValueError, UnicodeError) as exc:
+                _cli_error(f"Invalid snapshot input: {exc}")
+        try:
+            explanation = explain_finding(args.finding_id, snapshot=snapshot)
+        except (AttributeError, ValueError, UnicodeError) as exc:
+            _cli_error(str(exc))
+        sys.stdout.write(format_finding_explanation(explanation, json_output=args.json))
+        return
+
+    # The nested spelling is a compatibility alias for the stable top-level
+    # comparator; both paths use exactly the same implementation and output.
+    if args.command == "snapshot" and args.snapshot_command == "compare":
+        args.command = "compare"
+
+    # ── Snapshot utility handling ─────────────────────────────────
     if args.command == "snapshot":
+        if args.snapshot_command == "create":
+            output_dir = args.output_dir or str(get_default_reports_dir())
+            try:
+                engine, _report_path = _run_cli_diagnostics(
+                    output_dir=output_dir,
+                    quiet=args.quiet,
+                    full=args.full,
+                    verbose=args.verbose,
+                )
+                build_snapshot(engine).to_json(args.output)
+            except FileExistsError as exc:
+                _cli_error(str(exc))
+            except (OSError, UnicodeError, ValueError) as exc:
+                _cli_error(f"Cannot create snapshot: {exc}")
+            print(f"Snapshot saved to: {Path(args.output).expanduser().resolve()}")
+            return
+
         try:
             snapshot = SystemSnapshot.from_json(args.input)
         except FileNotFoundError as exc:
@@ -7426,6 +9104,48 @@ def main() -> None:
             _cli_error(f"Invalid snapshot input: {exc}")
         print(f"Snapshot valid: {Path(args.input).expanduser().resolve()}")
         print(f"Schema: {snapshot.schema_version}")
+        return
+
+    # ── Finding lifecycle verification handling ──────────────────
+    if args.command == "verify":
+        try:
+            baseline_snapshot = SystemSnapshot.from_json(args.baseline)
+        except FileNotFoundError as exc:
+            _cli_error(f"Baseline snapshot not found: {exc.filename or args.baseline}")
+        except (IsADirectoryError, PermissionError) as exc:
+            _cli_error(f"Cannot read baseline snapshot: {exc}")
+        except (AttributeError, ValueError, UnicodeError) as exc:
+            _cli_error(f"Invalid baseline snapshot: {exc}")
+        try:
+            FindingLifecycleComparator._validate_snapshot(
+                baseline_snapshot, label="baseline"
+            )
+        except (AttributeError, ValueError, UnicodeError) as exc:
+            _cli_error(f"Invalid baseline snapshot: {exc}")
+
+        output_dir = args.output_dir or str(get_default_reports_dir())
+        try:
+            engine, _report_path = _run_cli_diagnostics(
+                output_dir=output_dir,
+                quiet=not args.verbose,
+                full=False,
+                verbose=args.verbose,
+            )
+            current_snapshot = build_snapshot(engine)
+            lifecycle = compare_finding_lifecycle(baseline_snapshot, current_snapshot)
+        except FileExistsError as exc:
+            _cli_error(str(exc))
+        except (OSError, UnicodeError, ValueError) as exc:
+            _cli_error(f"Verification failed: {exc}")
+
+        if args.json:
+            print(
+                json.dumps(
+                    lifecycle.to_dict(), indent=2, ensure_ascii=False, sort_keys=True
+                )
+            )
+        else:
+            sys.stdout.write(format_verification_cli(lifecycle))
         return
 
     # ── Compare handling ──────────────────────────────────────────
@@ -7468,13 +9188,13 @@ def main() -> None:
 
     # The engine's existing diagnostic progress is reserved for --verbose;
     # default output stays compact without changing collection or rules.
-    engine = SysCheckEngine(
-        output_dir=output_dir,
-        quiet=quiet or not verbose,
-        full=full,
-    )
     try:
-        report_path = Path(engine.run_all()).expanduser().resolve()
+        engine, report_path = _run_cli_diagnostics(
+            output_dir=output_dir,
+            quiet=quiet,
+            full=full,
+            verbose=verbose,
+        )
     except FileExistsError as exc:
         _cli_error(str(exc))
 
