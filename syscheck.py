@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.6.0
+Wersja produktu:                         0.6.1
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -30,43 +30,45 @@ Użycie:
 
 from __future__ import annotations
 
-import os
-import subprocess
 import argparse
 import datetime
 import ipaddress
 import json
+import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
-from urllib.parse import quote
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Iterable, List, NoReturn, Optional, Tuple
+from typing import Any, ClassVar, NoReturn
+from urllib.parse import quote
 
 # ── Stałe ────────────────────────────────────────────────────────
 from constants import (  # type: ignore[import-untyped]
     DISTRO_CONFIG,
+    INVALID_TEMPERATURE_CELSIUS,
+    KERNEL_NON_BOOTABLE_SUFFIXES,
     MAX_RECOMMENDED_KERNELS,
-    get_default_reports_dir,
     PRODUCT_NAME,
     PRODUCT_SHORT_NAME,
     PRODUCT_VERSION,
-    REPORT_COMPATIBILITY_VERSION,
+    RE_AMDGPU_RESET_FAIL,
     RE_AUTH_FAIL,
+    RE_FILESYSTEM_IO_ERROR,
     RE_FIRMWARE,
     RE_GFX_ERROR,
-    RE_KERNEL_ERROR,
-    RE_KERNEL_TAINT,
-    RE_AMDGPU_RESET_FAIL,
-    RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_IOMMU_FAULT,
+    RE_KERNEL_ERROR,
+    RE_KERNEL_FIRMWARE_LOAD_FAIL,
     RE_KERNEL_HARD_LOCKUP,
     RE_KERNEL_HUNG_TASK,
     RE_KERNEL_OOPS_BUG,
@@ -75,19 +77,21 @@ from constants import (  # type: ignore[import-untyped]
     RE_KERNEL_RCU_STALL,
     RE_KERNEL_SOFT_LOCKUP,
     RE_KERNEL_STALL_RELIABILITY,
-    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
-    RE_KERNEL_FIRMWARE_LOAD_FAIL,
-    RE_USB_ENUMERATION_FAIL,
-    RE_IOMMU_FAULT,
-    RE_PLATFORM_DEVICE_RELIABILITY,
+    RE_KERNEL_TAINT,
+    RE_NETWORK_DEVICE_WATCHDOG,
+    RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
     RE_NVIDIA_XID_79,
     RE_NVME_CONTROLLER_RELIABILITY,
     RE_OOM,
     RE_PCIE_AER,
-    RE_NETWORK_DEVICE_WATCHDOG,
-    RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
+    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
+    RE_PLATFORM_DEVICE_RELIABILITY,
     RE_SEGFAULT,
+    RE_USB_ENUMERATION_FAIL,
+    REPORT_COMPATIBILITY_VERSION,
     SEGFAULT_ALERT_THRESHOLD,
+    STORAGE_CRITICAL_PERCENT,
+    STORAGE_WARNING_PERCENT,
     TIMEOUT_LONG,
     TIMEOUT_MEDIUM,
     TIMEOUT_SHORT,
@@ -97,10 +101,7 @@ from constants import (  # type: ignore[import-untyped]
     TRUNCATE_NFT,
     TRUNCATE_NORMAL,
     TRUNCATE_RESOLVECTL,
-    INVALID_TEMPERATURE_CELSIUS,
-    STORAGE_WARNING_PERCENT,
-    STORAGE_CRITICAL_PERCENT,
-    KERNEL_NON_BOOTABLE_SUFFIXES,
+    get_default_reports_dir,
 )
 
 # ──────────────────────────────────────────────────────────────────
@@ -152,7 +153,7 @@ _SYSTEMD_DURATION_EXPRESSION = (
 )
 
 
-def _parse_systemd_duration(text: str) -> Optional[float]:
+def _parse_systemd_duration(text: str) -> float | None:
     """Parse a systemd duration expression into seconds.
 
     The parser accepts the fixed-length units emitted by systemd-analyze,
@@ -340,7 +341,7 @@ class Observation:
 
     obs_id: str
     category: str
-    details: Dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
     data_complete: bool = True
     contradictory_evidence: bool = False
     direct_measurement: bool = True
@@ -374,7 +375,7 @@ class RawDiagnostic:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RawDiagnostic":
+    def from_dict(cls, data: dict) -> RawDiagnostic:
         return cls(
             source_id=str(data.get("source_id", "")),
             category=str(data.get("category", "")),
@@ -410,9 +411,9 @@ def derive_confidence(
 
 
 def run_cmd(
-    cmd: List[str],
+    cmd: list[str],
     timeout: int = TIMEOUT_SHORT,
-    env: Optional[Dict[str, str]] = None,
+    env: dict[str, str] | None = None,
     optional_dependency: bool = False,
 ) -> CmdResult:
     """
@@ -425,8 +426,8 @@ def run_cmd(
     cmd_str = " ".join(cmd)
     collected_at = datetime.datetime.now().isoformat(timespec="seconds")
 
-    def drain(stream: Any) -> Tuple[bytes, bool]:
-        chunks: List[bytes] = []
+    def drain(stream: Any) -> tuple[bytes, bool]:
+        chunks: list[bytes] = []
         retained = 0
         truncated = False
         while True:
@@ -453,8 +454,8 @@ def run_cmd(
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
-        stdout_holder: List[Tuple[bytes, bool]] = []
-        stderr_holder: List[Tuple[bytes, bool]] = []
+        stdout_holder: list[tuple[bytes, bool]] = []
+        stderr_holder: list[tuple[bytes, bool]] = []
         stdout_thread = threading.Thread(
             target=lambda: stdout_holder.append(drain(proc.stdout)), daemon=True
         )
@@ -675,7 +676,7 @@ class CapabilityProbeSpec:
     """One existing read-only source query exposed by ``lde capabilities``."""
 
     family: str
-    command: Tuple[str, ...]
+    command: tuple[str, ...]
     timeout: int = TIMEOUT_SHORT
     optional_dependency: bool = False
     empty_means_not_applicable: bool = False
@@ -760,49 +761,55 @@ def _capability_from_result(
     """
     if result.execution_status == "not_found":
         status = CAPABILITY_UNAVAILABLE
-    elif result.execution_status == "permission_denied":
-        status = CAPABILITY_LIMITED
-    elif result.execution_status == "timeout" or result.truncated:
+    elif (
+        result.execution_status == "permission_denied"
+        or result.execution_status == "timeout"
+        or result.truncated
+    ):
         status = CAPABILITY_LIMITED
     elif result.execution_status != "ok":
         captured = f"{result.stdout}\n{result.stderr}"
-        if _stderr_contains(
-            captured,
-            (
-                "permission denied",
-                "operation not permitted",
-                "access denied",
-                "not permitted",
-            ),
+        if (
+            _stderr_contains(
+                captured,
+                (
+                    "permission denied",
+                    "operation not permitted",
+                    "access denied",
+                    "not permitted",
+                ),
+            )
+            or spec.mode == "systemd_user"
+            and _stderr_contains(
+                captured,
+                (
+                    "failed to connect to bus",
+                    "no medium found",
+                    "no data available",
+                    "user scope bus",
+                    "local transport",
+                    "no such file or directory",
+                    "not running systemd",
+                ),
+            )
         ):
             status = CAPABILITY_LIMITED
-        elif spec.mode == "systemd_user" and _stderr_contains(
-            captured,
-            (
-                "failed to connect to bus",
-                "no medium found",
-                "no data available",
-                "user scope bus",
-                "local transport",
-                "no such file or directory",
-                "not running systemd",
-            ),
-        ):
-            status = CAPABILITY_LIMITED
-        elif _stderr_contains(
-            captured,
-            (
-                "not a btrfs filesystem",
-                "unit networkmanager.service could not be found",
-                "unit networkmanager.service not found",
-                "no sensors found",
-                "no nvme controllers",
-            ),
-        ):
-            status = CAPABILITY_NOT_APPLICABLE
-        elif spec.mode == "systemd_system" and _stderr_contains(
-            captured,
-            ("not booted with systemd",),
+        elif (
+            _stderr_contains(
+                captured,
+                (
+                    "not a btrfs filesystem",
+                    "unit networkmanager.service could not be found",
+                    "unit networkmanager.service not found",
+                    "no sensors found",
+                    "no nvme controllers",
+                ),
+            )
+            or spec.mode == "systemd_system"
+            and _stderr_contains(
+                captured,
+                ("not booted with systemd",),
+            )
         ):
             status = CAPABILITY_NOT_APPLICABLE
         elif spec.family in {
@@ -1138,7 +1145,7 @@ def _style_cli_status(status: str, stream: Any) -> str:
 
 
 def format_cli_summary(
-    engine: "SysCheckEngine", report_path: str | Path, *, stream: Any = None
+    engine: SysCheckEngine, report_path: str | Path, *, stream: Any = None
 ) -> str:
     """Format the compact, English public summary for a completed run."""
     output_stream = sys.stdout if stream is None else stream
@@ -1221,7 +1228,7 @@ def severity_tag(level: str) -> str:
     return tags.get(level, level)
 
 
-def _get_script_pids() -> List[str]:
+def _get_script_pids() -> list[str]:
     """Zwraca listę PIDów procesów syscheck.py w bieżącej sesji."""
     try:
         import psutil  # type: ignore[import-untyped]
@@ -1356,13 +1363,13 @@ _BTRFS_DEVICE_STAT_RECORD_RE = re.compile(
 )
 
 
-def _btrfs_missing_device_lines(text: str) -> List[str]:
+def _btrfs_missing_device_lines(text: str) -> list[str]:
     """Return only structured Btrfs device records marked ``MISSING``."""
     return [line for line in text.splitlines() if _BTRFS_MISSING_DEVICE_RE.search(line)]
 
 
 def _classify_btrfs_status(
-    cmd_result: CmdResult, *, command_kind: Optional[str] = None
+    cmd_result: CmdResult, *, command_kind: str | None = None
 ) -> str:
     """
     Klasyfikuje wynik polecenia btrfs.
@@ -1442,14 +1449,14 @@ def _btrfs_missing_capture_is_authoritative(result: CmdResult, status: str) -> b
     )
 
 
-def _parse_btrfs_device_stats(text: str) -> Tuple[Dict[str, int], int, bool]:
+def _parse_btrfs_device_stats(text: str) -> tuple[dict[str, int], int, bool]:
     """Parse Btrfs device-stat records and retain malformed-output evidence.
 
     Returns ``(non_zero_error_counters, valid_record_count, malformed)``.  A
     valid record may be a non-error counter such as ``cleaner_ios``; only
     counters ending in ``_errs`` can become a device-error observation.
     """
-    counters: Dict[str, int] = {}
+    counters: dict[str, int] = {}
     valid_records = 0
     malformed = False
     for line in text.splitlines():
@@ -1468,33 +1475,57 @@ def _parse_btrfs_device_stats(text: str) -> Tuple[Dict[str, int], int, bool]:
     return counters, valid_records, malformed
 
 
-def _get_bootable_kernels_from_modules() -> List[str]:
-    """Zwraca listę wersji kernel z /usr/lib/modules/."""
-    modules_dir = Path("/usr/lib/modules")
-    if not modules_dir.is_dir():
-        return []
-    return sorted(
-        [
-            d.name
-            for d in modules_dir.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
-    )
+def _get_bootable_kernels_from_modules(
+    modules_dir: Path | str = Path("/usr/lib/modules"),
+) -> list[str] | None:
+    """Zwraca listę wersji kernel z /usr/lib/modules/.
+
+    Zwraca:
+    - List[str]: autorytatywna lista wersji (w tym [] gdy katalog jest czytelny, ale pusty)
+    - None: źródło niedostępne / nieznane (brak uprawnień, brak katalogu, błąd I/O)
+    """
+    mod_path = Path(modules_dir)
+    try:
+        if not mod_path.is_dir():
+            return None
+        versions = []
+        for d in mod_path.iterdir():
+            try:
+                if d.is_dir() and not d.name.startswith("."):
+                    versions.append(d.name)
+            except OSError:
+                continue
+        return sorted(versions)
+    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+        return None
 
 
-def _get_bootable_kernels_from_boot() -> List[str]:
-    """Zwraca listę nazw kernel dla których istnieje vmlinuz w /boot."""
-    boot_dir = Path("/boot")
-    if not boot_dir.is_dir():
-        return []
-    kernels = []
-    for f in boot_dir.iterdir():
-        if f.name.startswith("vmlinuz-"):
-            kernels.append(f.name[len("vmlinuz-") :])
-    return sorted(kernels)
+def _get_bootable_kernels_from_boot(
+    boot_dir: Path | str = Path("/boot"),
+) -> list[str] | None:
+    """Zwraca listę nazw kernel dla których istnieje vmlinuz w /boot.
+
+    Zwraca:
+    - List[str]: autorytatywna lista nazw kerneli (w tym [] gdy /boot jest czytelny, ale brak vmlinuz-*)
+    - None: źródło niedostępne / nieznane (brak uprawnień, brak katalogu, błąd I/O)
+    """
+    boot_path = Path(boot_dir)
+    try:
+        if not boot_path.is_dir():
+            return None
+        kernels = []
+        for f in boot_path.iterdir():
+            try:
+                if f.name.startswith("vmlinuz-"):
+                    kernels.append(f.name[len("vmlinuz-") :])
+            except OSError:
+                continue
+        return sorted(kernels)
+    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+        return None
 
 
-def _count_kernel_packages(pkg_list: str) -> Tuple[int, int, List[str]]:
+def _count_kernel_packages(pkg_list: str) -> tuple[int, int, list[str]]:
     """
     Zlicza pakiety kernel vs non-bootable (headers, firmware).
     Zwraca: (bootable_kernel_count, total_linux_packages, list_of_bootable_kernels)
@@ -1552,7 +1583,7 @@ def _count_kernel_packages(pkg_list: str) -> Tuple[int, int, List[str]]:
     return len(bootable), total_packages, bootable
 
 
-def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
+def _parse_storage_usage(df_h_output: str) -> list[tuple[str, int]]:
     """Parsuje df -h i zwraca listę (mountpoint, usage_percent)."""
     results = []
     for line in df_h_output.split("\n"):
@@ -1569,7 +1600,7 @@ def _parse_storage_usage(df_h_output: str) -> List[Tuple[str, int]]:
 
 def _parse_upower_critical_states(
     output: str,
-) -> Tuple[List[Dict[str, str]], bool, int]:
+) -> tuple[list[dict[str, str]], bool, int]:
     """Parse only explicit critical states from a UPower diagnostic dump.
 
     The parser intentionally does not infer a critical condition from a
@@ -1584,7 +1615,7 @@ def _parse_upower_critical_states(
         # no device is exposed.
         return [], False, 0
 
-    critical: List[Dict[str, str]] = []
+    critical: list[dict[str, str]] = []
     malformed = False
     source_count = 0
     for block in blocks[1:]:
@@ -1604,8 +1635,8 @@ def _parse_upower_critical_states(
 
 
 def _journal_filter_command(
-    upstream_cmd: str, regexes: List[str], tail_lines: Optional[int] = None
-) -> List[str]:
+    upstream_cmd: str, regexes: list[str], tail_lines: int | None = None
+) -> list[str]:
     """Build a status-aware journal filter with bounded pipeline semantics."""
     # The diagnostic regexes use Python/PCRE constructs such as ``(?:...)``
     # and ``\b``.  Keep the shell stage aligned with those existing patterns,
@@ -1634,7 +1665,7 @@ def _journal_filter_command(
     return ["bash", "-c", " ".join(parts)]
 
 
-def _journal_count_command(upstream_cmd: str, regex: str) -> List[str]:
+def _journal_count_command(upstream_cmd: str, regex: str) -> list[str]:
     """Build a status-aware count command with explicit grep no-match handling."""
     return [
         "bash",
@@ -1649,8 +1680,8 @@ def _journal_count_command(upstream_cmd: str, regex: str) -> List[str]:
 
 
 def _oom_collector_command(
-    upstream_cmd: str, regex: str, tail_lines: Optional[int] = None
-) -> List[str]:
+    upstream_cmd: str, regex: str, tail_lines: int | None = None
+) -> list[str]:
     """Build the OOM collector bash command with safe PIPESTATUS handling.
 
     Args:
@@ -1668,7 +1699,7 @@ def _oom_collector_command(
     return _journal_filter_command(upstream_cmd, [regex], tail_lines=tail_lines)
 
 
-def _pcie_aer_severity(line: str) -> Optional[str]:
+def _pcie_aer_severity(line: str) -> str | None:
     """Return the explicit AER severity encoded in a matched kernel line."""
     normalized = line.lower()
     if "uncorrected (fatal)" in normalized:
@@ -1680,7 +1711,7 @@ def _pcie_aer_severity(line: str) -> Optional[str]:
     return None
 
 
-def _nvme_controller_reliability_severity(line: str) -> Optional[str]:
+def _nvme_controller_reliability_severity(line: str) -> str | None:
     """Return the severity class encoded in a matched NVMe kernel line."""
     if "device not ready; aborting reset" in line.lower():
         return "reset_failure"
@@ -1689,7 +1720,7 @@ def _nvme_controller_reliability_severity(line: str) -> Optional[str]:
     return None
 
 
-def _hardware_mce_edac_severity(line: str) -> Optional[str]:
+def _hardware_mce_edac_severity(line: str) -> str | None:
     """Return the severity class encoded in a matched MCE/EDAC kernel line."""
     normalized = line.lower()
     if (
@@ -1705,7 +1736,7 @@ def _hardware_mce_edac_severity(line: str) -> Optional[str]:
     return None
 
 
-def _filesystem_io_error_severity(line: str) -> Optional[str]:
+def _filesystem_io_error_severity(line: str) -> str | None:
     """Return the severity class encoded in a matched filesystem/block-I/O kernel line."""
     if not re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE):
         return None
@@ -1726,7 +1757,7 @@ def _filesystem_io_error_severity(line: str) -> Optional[str]:
     return "io_error"
 
 
-def _filesystem_io_error_family(line: str) -> Optional[str]:
+def _filesystem_io_error_family(line: str) -> str | None:
     """Classify a matched I/O event without inferring its root cause."""
     if not re.search(RE_FILESYSTEM_IO_ERROR, line, re.IGNORECASE):
         return None
@@ -1758,7 +1789,7 @@ def _filesystem_io_error_family(line: str) -> Optional[str]:
     return "unknown"
 
 
-def _kernel_oops_panic_severity(line: str) -> Optional[str]:
+def _kernel_oops_panic_severity(line: str) -> str | None:
     """Return the explicit severity ('P0' or 'P1') encoded in a matched kernel oops/panic line."""
     if re.search(RE_KERNEL_PANIC, line, re.IGNORECASE):
         return "P0"
@@ -1793,8 +1824,6 @@ class FindingClassification:
 
 class UnsupportedObservationCategoryError(ValueError):
     """Rzucany gdy kategoria Observation nie jest obsługiwana."""
-
-    pass
 
 
 class FindingClassificationPolicy:
@@ -3017,7 +3046,7 @@ class EvidenceBuilder:
         raise ValueError(f"Unsupported evidence category: {cat}")
 
 
-import diagnostic_rules as _diagnostic_rules  # noqa: E402
+import diagnostic_rules as _diagnostic_rules
 
 # Compatibility re-exports for existing syscheck imports.
 AmdgpuResetFailRule = _diagnostic_rules.AmdgpuResetFailRule
@@ -3094,16 +3123,16 @@ class SysCheckEngine:
         self.desktop_environment: str = ""
         self.session_type: str = ""
         self.distro_config: dict = DISTRO_CONFIG.get("arch", DISTRO_CONFIG["arch"])
-        self.report_lines: List[str] = []
-        self.findings: List[Finding] = []
-        self.observations: List[Observation] = []  # Stage 2: OBS
-        self.recommendation_plan: Optional[RecommendationPlan] = None  # Stage 4: REC
-        self.raw_diagnostics: List[RawDiagnostic] = []
-        self.evidence_objects: List[Evidence] = []
-        self.pipeline_accounting: List[Dict[str, str]] = []
-        self.restrictions: List[str] = []
-        self.commands_used: List[str] = []
-        self._script_pids: List[str] = []
+        self.report_lines: list[str] = []
+        self.findings: list[Finding] = []
+        self.observations: list[Observation] = []  # Stage 2: OBS
+        self.recommendation_plan: RecommendationPlan | None = None  # Stage 4: REC
+        self.raw_diagnostics: list[RawDiagnostic] = []
+        self.evidence_objects: list[Evidence] = []
+        self.pipeline_accounting: list[dict[str, str]] = []
+        self.restrictions: list[str] = []
+        self.commands_used: list[str] = []
+        self._script_pids: list[str] = []
 
     # ── Logowanie ────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -3134,9 +3163,9 @@ class SysCheckEngine:
     # ── Wykonanie komend ─────────────────────────────────────────
     def cmd(
         self,
-        cmd: List[str],
+        cmd: list[str],
         timeout: int = TIMEOUT_SHORT,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
         optional_dependency: bool = False,
     ) -> CmdResult:
         self.commands_used.append(" ".join(cmd))
@@ -3146,9 +3175,9 @@ class SysCheckEngine:
 
     def cmd_ok(
         self,
-        cmd: List[str],
+        cmd: list[str],
         timeout: int = TIMEOUT_SHORT,
-        env: Optional[Dict[str, str]] = None,
+        env: dict[str, str] | None = None,
         fallback: str = "",
         optional_dependency: bool = False,
     ) -> str:
@@ -3160,7 +3189,7 @@ class SysCheckEngine:
         return fallback if fallback else result.to_fallback_text()
 
     def _record_truncated_capture(
-        self, result: Optional[CmdResult], source_name: str
+        self, result: CmdResult | None, source_name: str
     ) -> None:
         """Record that a bounded result cannot prove absence of a finding."""
         if result is None or not result.truncated:
@@ -3174,10 +3203,10 @@ class SysCheckEngine:
 
     def _record_source_status(
         self,
-        result: Optional[CmdResult],
+        result: CmdResult | None,
         source_name: str,
         *,
-        authority_state: Optional[str] = None,
+        authority_state: str | None = None,
     ) -> None:
         """Record a source state that cannot prove health or failure.
 
@@ -3263,12 +3292,12 @@ class SysCheckEngine:
             )
 
     # ── Równoległe wykonanie grupy komend ────────────────────────
-    def _parallel(self, tasks: Dict[str, Tuple[List[str], int]]) -> Dict[str, str]:
+    def _parallel(self, tasks: dict[str, tuple[list[str], int]]) -> dict[str, str]:
         """
         Uruchamia wiele komend równolegle. Zwraca słownik name->stdout.
         tasks: {nazwa: ([cmd, ...], timeout)}
         """
-        results: Dict[str, str] = {}
+        results: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tasks))) as executor:
             future_map = {
                 executor.submit(self.cmd_ok, cmd, timeout): name
@@ -3284,13 +3313,13 @@ class SysCheckEngine:
 
     # ── Równoległe wykonanie z CmdResult ─────────────────────────
     def _parallel_cmd(
-        self, tasks: Dict[str, Tuple[List[str], int, bool]]
-    ) -> Dict[str, CmdResult]:
+        self, tasks: dict[str, tuple[list[str], int, bool]]
+    ) -> dict[str, CmdResult]:
         """
         Uruchamia wiele komend równolegle. Zwraca słownik name->CmdResult.
         tasks: {nazwa: ([cmd, ...], timeout, optional_dependency)}
         """
-        results: Dict[str, CmdResult] = {}
+        results: dict[str, CmdResult] = {}
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tasks))) as executor:
             future_map = {
                 executor.submit(self.cmd, cmd, timeout, None, optional): name
@@ -3379,7 +3408,7 @@ class SysCheckEngine:
         modules_list = r["mod_ls"]
         niri_ver = r["niri_ver"]
 
-        os_info: Dict[str, str] = {}
+        os_info: dict[str, str] = {}
         if osr:
             for line in osr.split("\n"):
                 if "=" in line:
@@ -3445,10 +3474,35 @@ class SysCheckEngine:
         self.report_lines.append(codeblock(boot_list))
 
         # Dodaj podsumowanie kernel
-        self.report_lines.append(
-            f"**Wersje w /usr/lib/modules:** {len(bootable_versions)}\n"
-        )
-        self.report_lines.append(f"**Obrazy w /boot:** {len(bootable_kernels)}\n")
+        if bootable_versions is not None:
+            self.report_lines.append(
+                f"**Wersje w /usr/lib/modules:** {len(bootable_versions)}\n"
+            )
+        else:
+            self.report_lines.append(
+                "**Wersje w /usr/lib/modules:** (niedostępne — brak uprawnień lub katalogu)\n"
+            )
+            restriction = (
+                "Katalog /usr/lib/modules jest niedostępny "
+                "(permission denied lub brak katalogu); "
+                "wersje modułów kernela są nieznane (unknown / unavailable)."
+            )
+            if restriction not in self.restrictions:
+                self.restrictions.append(restriction)
+
+        if bootable_kernels is not None:
+            self.report_lines.append(f"**Obrazy w /boot:** {len(bootable_kernels)}\n")
+        else:
+            self.report_lines.append(
+                "**Obrazy w /boot:** (niedostępne — brak uprawnień lub katalogu)\n"
+            )
+            restriction = (
+                "Katalog /boot jest niedostępny bez uprawnień roota "
+                "(PermissionError: permission denied) lub nie istnieje; "
+                "obrazy kernela w /boot są niedostępne (unavailable / unknown)."
+            )
+            if restriction not in self.restrictions:
+                self.restrictions.append(restriction)
 
     # ── Raport: CPU, RAM, zram, procesy ──────────────────────────
     def collect_resources(self) -> None:
@@ -4927,7 +4981,7 @@ class SysCheckEngine:
 
     # ── Pomocnicze do analizy jednostek systemd ──────────────────
     @classmethod
-    def _classify_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
+    def _classify_failed_units(cls, result: CmdResult) -> tuple[str, list[str]]:
         """Classify a systemd failed-unit query before interpretation."""
         if result.execution_status == "empty_ok":
             return "malformed_output", []
@@ -4946,7 +5000,7 @@ class SysCheckEngine:
         return "malformed_output", []
 
     @classmethod
-    def _classify_user_failed_units(cls, result: CmdResult) -> Tuple[str, List[str]]:
+    def _classify_user_failed_units(cls, result: CmdResult) -> tuple[str, list[str]]:
         """Backward-compatible name for the user-systemd classifier."""
         return cls._classify_failed_units(result)
 
@@ -4956,7 +5010,7 @@ class SysCheckEngine:
         return "●" in output and "failed" in output.lower() and "0 loaded" not in output
 
     @staticmethod
-    def _extract_failed_unit_names(output: str) -> List[str]:
+    def _extract_failed_unit_names(output: str) -> list[str]:
         """Wyciąga nazwy jednostek z outputu systemctl --failed."""
         units = []
         for line in output.split("\n"):
@@ -5035,9 +5089,38 @@ class SysCheckEngine:
 
             self.report_lines.append(
                 f"**Bootowalne pakiety kernel:** {bootable_count}\n"
-                f"**Rzeczywiste wersje w /usr/lib/modules:** {len(modules_versions)}\n"
-                f"**Obrazy kernel w /boot:** {len(boot_images)}\n"
             )
+            if modules_versions is not None:
+                self.report_lines.append(
+                    f"**Rzeczywiste wersje w /usr/lib/modules:** {len(modules_versions)}\n"
+                )
+            else:
+                self.report_lines.append(
+                    "**Rzeczywiste wersje w /usr/lib/modules:** (niedostępne — brak uprawnień lub katalogu)\n"
+                )
+                restriction = (
+                    "Katalog /usr/lib/modules jest niedostępny "
+                    "(permission denied lub brak katalogu); "
+                    "wersje modułów kernela są nieznane (unknown / unavailable)."
+                )
+                if restriction not in self.restrictions:
+                    self.restrictions.append(restriction)
+
+            if boot_images is not None:
+                self.report_lines.append(
+                    f"**Obrazy kernel w /boot:** {len(boot_images)}\n"
+                )
+            else:
+                self.report_lines.append(
+                    "**Obrazy kernel w /boot:** (niedostępne — brak uprawnień lub katalogu)\n"
+                )
+                restriction = (
+                    "Katalog /boot jest niedostępny bez uprawnień roota "
+                    "(PermissionError: permission denied) lub nie istnieje; "
+                    "obrazy kernela w /boot są niedostępne (unavailable / unknown)."
+                )
+                if restriction not in self.restrictions:
+                    self.restrictions.append(restriction)
 
             if len(bootable_list) > 0:
                 self.report_lines.append(
@@ -5505,7 +5588,7 @@ class SysCheckEngine:
             if obs:
                 self.observations.append(obs)
 
-    def _raw_to_observation(self, raw: RawDiagnostic) -> Optional[Observation]:
+    def _raw_to_observation(self, raw: RawDiagnostic) -> Observation | None:
         """Konwertuje jeden RawDiagnostic na Observation."""
         cat = raw.category
         payload = raw.payload
@@ -6039,7 +6122,7 @@ class DiagnosticRecommendation:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "DiagnosticRecommendation":
+    def from_dict(cls, data: dict) -> DiagnosticRecommendation:
         return cls(
             recommendation_id=str(data.get("recommendation_id", "")),
             priority=int(data.get("priority", 5)),
@@ -6151,8 +6234,8 @@ class RecommendationEngine:
         return RecommendationPlan(recommendations=tuple(unique_recs))
 
     def _finding_to_recommendation(
-        self, f: "Finding", restrictions: tuple
-    ) -> Optional["DiagnosticRecommendation"]:
+        self, f: Finding, restrictions: tuple
+    ) -> DiagnosticRecommendation | None:
         rec_id = f"REC-{f.finding_id}"
 
         # Classify action type
@@ -6210,12 +6293,12 @@ class RecommendationEngine:
         )
 
     @staticmethod
-    def _classify_action(f: "Finding") -> str:
+    def _classify_action(f: Finding) -> str:
         """Klasyfikacja akcji z explicit recommendation_intent, nie z finding_id."""
         return f.recommendation_intent.value
 
     @staticmethod
-    def _classify_impact(f: "Finding") -> str:
+    def _classify_impact(f: Finding) -> str:
         sev = f.severity
         if sev == "P0":
             return "critical"
@@ -6228,7 +6311,7 @@ class RecommendationEngine:
         return "low"
 
     @staticmethod
-    def _classify_effort(f: "Finding") -> str:
+    def _classify_effort(f: Finding) -> str:
         """Wysiłek na podstawie domain i kind, nie finding_id."""
         kind = f.kind
         if kind == FindingKind.SCRUB_STATUS:
@@ -6242,7 +6325,7 @@ class RecommendationEngine:
         return "low"
 
     @staticmethod
-    def _classify_risk(f: "Finding") -> str:
+    def _classify_risk(f: Finding) -> str:
         sev = f.severity
         if sev in ("P0", "P1"):
             return "high"
@@ -6251,7 +6334,7 @@ class RecommendationEngine:
         return "low"
 
     @staticmethod
-    def _detect_blockers(f: "Finding", restrictions: tuple) -> list:
+    def _detect_blockers(f: Finding, restrictions: tuple) -> list:
         blocked = []
         kind = f.kind
         for r in restrictions:
@@ -6265,7 +6348,7 @@ class RecommendationEngine:
         return blocked
 
     @staticmethod
-    def _derive_title(f: "Finding", action_type: str) -> str:
+    def _derive_title(f: Finding, action_type: str) -> str:
         prefix = {
             "investigate": "Sprawdź: ",
             "verify": "Zweryfikuj: ",
@@ -6276,7 +6359,7 @@ class RecommendationEngine:
         return prefix + f.title
 
     @staticmethod
-    def _derive_rationale(f: "Finding") -> str:
+    def _derive_rationale(f: Finding) -> str:
         conf = f.confidence
         sev = f.severity
         if conf == "Guessing":
@@ -6349,8 +6432,6 @@ VALID_CONFIDENCES = frozenset({"Certain", "Likely", "Guessing"})
 class UnsupportedSnapshotSchemaError(ValueError):
     """Rzucany gdy schema_version migawki jest nieobsługiwany lub nieprawidłowy."""
 
-    pass
-
 
 @dataclass(frozen=True)
 class SnapshotMetadata:
@@ -6372,7 +6453,7 @@ class SnapshotMetadata:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SnapshotMetadata":
+    def from_dict(cls, data: dict) -> SnapshotMetadata:
         return cls(
             hostname=str(data.get("hostname", "")),
             kernel=str(data.get("kernel", "")),
@@ -6409,7 +6490,7 @@ class EnvironmentSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "EnvironmentSnapshot":
+    def from_dict(cls, data: dict) -> EnvironmentSnapshot:
         return cls(
             storage=tuple(data.get("storage", [])),
             kernel_count=tuple(data.get("kernel_count", [])),
@@ -6434,7 +6515,7 @@ class ExecutionSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ExecutionSnapshot":
+    def from_dict(cls, data: dict) -> ExecutionSnapshot:
         return cls(
             commands_count=int(data.get("commands_count", 0)),
             raw_diagnostics_count=int(data.get("raw_diagnostics_count", 0)),
@@ -6481,7 +6562,7 @@ class ObservationSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ObservationSnapshot":
+    def from_dict(cls, data: dict) -> ObservationSnapshot:
         return cls(
             obs_id=str(data.get("obs_id", "")),
             category=str(data.get("category", "")),
@@ -6525,7 +6606,7 @@ class EvidenceSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "EvidenceSnapshot":
+    def from_dict(cls, data: dict) -> EvidenceSnapshot:
         return cls(
             evidence_id=str(data.get("evidence_id", "")),
             evidence_type=str(data.get("evidence_type", "")),
@@ -6560,7 +6641,7 @@ class RawDiagnosticSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RawDiagnosticSnapshot":
+    def from_dict(cls, data: dict) -> RawDiagnosticSnapshot:
         return cls(
             source_id=str(data.get("source_id", "")),
             category=str(data.get("category", "")),
@@ -6610,7 +6691,7 @@ class FindingSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "FindingSnapshot":
+    def from_dict(cls, data: dict) -> FindingSnapshot:
         return cls(
             finding_id=str(data.get("finding_id", "")),
             title=str(data.get("title", "")),
@@ -6670,7 +6751,7 @@ class SystemSnapshot:
         _write_new_text(path, payload)
 
     @classmethod
-    def from_json(cls, path: str) -> "SystemSnapshot":
+    def from_json(cls, path: str) -> SystemSnapshot:
         import json
 
         with open(path, encoding="utf-8") as f:
@@ -6682,7 +6763,7 @@ class SystemSnapshot:
         return cls._from_validated(data)
 
     @classmethod
-    def _from_validated(cls, data: dict) -> "SystemSnapshot":
+    def _from_validated(cls, data: dict) -> SystemSnapshot:
         # Schema version validation
         schema_ver = data.get("schema_version")
         if schema_ver is None:
@@ -6847,11 +6928,11 @@ class SnapshotBuilder:
         environment: EnvironmentSnapshot,
         observations: list,
         findings: list,
-        evidence: Optional[List[dict]] = None,
-        raw_diagnostics: Optional[List[dict]] = None,
-        recommendations: Optional[List[dict | DiagnosticRecommendation]] = None,
-        restrictions: Optional[List[str]] = None,
-        execution: Optional[ExecutionSnapshot] = None,
+        evidence: list[dict] | None = None,
+        raw_diagnostics: list[dict] | None = None,
+        recommendations: list[dict | DiagnosticRecommendation] | None = None,
+        restrictions: list[str] | None = None,
+        execution: ExecutionSnapshot | None = None,
     ) -> SystemSnapshot:
         if evidence is None:
             evidence = []
@@ -6947,7 +7028,7 @@ class SnapshotBuilder:
         )
 
 
-def build_snapshot(engine: "SysCheckEngine") -> SystemSnapshot:
+def build_snapshot(engine: SysCheckEngine) -> SystemSnapshot:
     """Buduje SystemSnapshot z danych silnika diagnostycznego."""
     metadata = SnapshotMetadata(
         hostname=engine.hostname,
@@ -8641,7 +8722,7 @@ class FindingExplanation:
     verification: tuple[ExplainStep, ...]
     sources: tuple[str, ...]
     limitations: tuple[str, ...] = ()
-    present: Optional[bool] = None
+    present: bool | None = None
     runtime_status: str = "No snapshot supplied; state-independent definition."
     source_status: str = "STATIC_DEFINITION"
     source_observation_ids: tuple[str, ...] = ()
@@ -8688,7 +8769,7 @@ def _canonical_snapshot_actionability(value: str, fallback: str) -> str:
 
 
 def explain_finding(
-    finding_id: str, snapshot: Optional[SystemSnapshot] = None
+    finding_id: str, snapshot: SystemSnapshot | None = None
 ) -> FindingExplanation:
     """Build a bounded explanation without collecting or inferring diagnostics."""
     definition = find_finding_explanation_definition(finding_id)

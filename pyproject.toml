@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linux-diagnostic-engine"
-version = "0.6.0"
+version = "0.6.1"
 description = "Read-only Linux system diagnostics and snapshot comparison CLI"
 readme = "README.md"
 license = "MIT"
@@ -17,3 +17,6 @@ lde = "syscheck:main"
 
 [tool.setuptools]
 py-modules = ["constants", "diagnostic_rules", "syscheck"]
+
+[tool.ruff]
+extend-exclude = ["build/**"]

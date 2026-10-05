@@ -10,23 +10,22 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import syscheck  # noqa: E402
-from syscheck import (  # noqa: E402
+import syscheck
+from syscheck import (
     Actionability,
     EvidenceSnapshot,
+    ExplainStep,
     FindingExplanation,
     FindingSnapshot,
     ObservationSnapshot,
     RawDiagnosticSnapshot,
     SnapshotMetadata,
     SystemSnapshot,
-    ExplainStep,
     explain_finding,
     find_finding_explanation_definition,
     format_finding_explanation,
     validate_finding_explanation_registry,
 )
-
 
 EXPLAIN_PATTERNS = tuple(syscheck.FINDING_EXPLANATION_REGISTRY)
 DIRECT_COMMANDS = (

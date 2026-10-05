@@ -1,10 +1,11 @@
 # Diagnostic rule runtime extracted from syscheck.py.
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
 import sys
-from typing import TYPE_CHECKING, Iterable, Optional
+from abc import ABC, abstractmethod
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from syscheck import (
@@ -29,7 +30,7 @@ def _syscheck():
 
 @dataclass(frozen=True)
 class DiagnosticRuleResult:
-    finding: Optional[Finding] = None
+    finding: Finding | None = None
     evidence: tuple = ()
 
 
@@ -2156,6 +2157,11 @@ class DiagnosticRuleEngine:
 
     @staticmethod
     def _normalize(result: DiagnosticRuleResult) -> DiagnosticRuleResult | None:
+        if not isinstance(result, DiagnosticRuleResult):
+            # Preserve the ValueError contract asserted by test_normalize_contract.
+            raise ValueError(  # noqa: TRY004
+                f"Expected DiagnosticRuleResult, got {type(result).__name__}"
+            )
         if result.finding is None and not result.evidence:
             return None
         return result

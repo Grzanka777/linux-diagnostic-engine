@@ -1,9 +1,8 @@
 """Focused packaging contract tests for the flat-module LDE distribution."""
 
-from pathlib import Path
 import subprocess
 import sys
-
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -17,7 +16,7 @@ class TestPackagingContract:
         manifest = _manifest_text()
 
         assert 'name = "linux-diagnostic-engine"' in manifest
-        assert 'version = "0.6.0"' in manifest
+        assert 'version = "0.6.1"' in manifest
         assert 'requires-python = ">=3.10"' in manifest
         assert "dependencies = []" in manifest
 
@@ -49,7 +48,7 @@ class TestPackagingContract:
         documentation = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
         assert "uv build --wheel" in documentation
-        assert "/linux_diagnostic_engine-0.6.0-py3-none-any.whl" in documentation
+        assert "/linux_diagnostic_engine-0.6.1-py3-none-any.whl" in documentation
         assert "/tmp/lde-venv/bin/lde --version" in documentation
         assert "/tmp/lde-venv/bin/lde --help" in documentation
         assert "python3 syscheck.py --help" in documentation
@@ -73,7 +72,7 @@ class TestPackagingContract:
         )
 
         assert version.returncode == 0
-        assert version.stdout.strip() == "Linux Diagnostic Engine 0.6.0"
+        assert version.stdout.strip() == "Linux Diagnostic Engine 0.6.1"
         assert version.stderr == ""
         assert help_output.returncode == 0
         assert "Linux Diagnostic Engine (LDE)" in help_output.stdout
@@ -97,7 +96,7 @@ class TestPackagingContract:
         import constants
         import syscheck
 
-        assert constants.PRODUCT_VERSION == "0.6.0"
+        assert constants.PRODUCT_VERSION == "0.6.1"
         assert constants.REPORT_COMPATIBILITY_VERSION == "2.1.0"
         assert syscheck.SNAPSHOT_SCHEMA_VERSION == 3
 

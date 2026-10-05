@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import syscheck  # noqa: E402
-from syscheck import (  # noqa: E402
+import syscheck
+from syscheck import (
     CAPABILITY_AVAILABLE,
     CAPABILITY_FAILED,
     CAPABILITY_LIMITED,
@@ -22,8 +22,8 @@ from syscheck import (  # noqa: E402
     EvidenceSnapshot,
     FindingSnapshot,
     ObservationSnapshot,
-    RawDiagnosticSnapshot,
     RawDiagnostic,
+    RawDiagnosticSnapshot,
     SnapshotMetadata,
     SourceCapability,
     SystemSnapshot,
@@ -32,7 +32,6 @@ from syscheck import (  # noqa: E402
     probe_source_capabilities,
     sanitize_artifact,
 )
-
 
 FIXTURE_DIR = (
     Path(__file__).parent / ".agent-work" / "replay" / "v0.5-multi-workstation"

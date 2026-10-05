@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -16,46 +17,44 @@ import pytest
 # Dodaj ścieżkę projektu do sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
+from syscheck import (  # type: ignore[import-untyped]
     RE_AMDGPU_RESET_FAIL,
     RE_FILESYSTEM_IO_ERROR,
     RE_GPU_I915_HANG,
     RE_HARDWARE_MCE_EDAC,
     RE_HARDWARE_THERMAL_THROTTLE,
+    RE_IOMMU_FAULT,
+    RE_KERNEL_ERROR,
+    RE_KERNEL_FIRMWARE_LOAD_FAIL,
     RE_KERNEL_HARD_LOCKUP,
     RE_KERNEL_HUNG_TASK,
-    RE_KERNEL_ERROR,
-    RE_KERNEL_TAINT,
     RE_KERNEL_OOPS_BUG,
     RE_KERNEL_OOPS_PANIC,
     RE_KERNEL_PANIC,
     RE_KERNEL_RCU_STALL,
     RE_KERNEL_SOFT_LOCKUP,
     RE_KERNEL_STALL_RELIABILITY,
-    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
-    RE_KERNEL_FIRMWARE_LOAD_FAIL,
-    RE_USB_ENUMERATION_FAIL,
-    RE_IOMMU_FAULT,
-    RE_PLATFORM_DEVICE_RELIABILITY,
-    RE_NVIDIA_XID_79,
-    RE_NVME_CONTROLLER_RELIABILITY,
     RE_NETWORK_DEVICE_WATCHDOG,
     RE_NETWORK_MANAGER_ACTIVATION_FAILURE,
+    RE_NVIDIA_XID_79,
+    RE_NVME_CONTROLLER_RELIABILITY,
     RE_PCIE_AER,
+    RE_PLATFORM_ACPI_FIRMWARE_ERROR,
+    RE_PLATFORM_DEVICE_RELIABILITY,
+    RE_USB_ENUMERATION_FAIL,
     CmdResult,
     Finding,
     Observation,
     RawDiagnostic,
     SysCheckEngine,
-    derive_confidence,
-    _classify_btrfs_status,
-    _btrfs_missing_device_lines,
     _btrfs_missing_capture_is_authoritative,
+    _btrfs_missing_device_lines,
+    _classify_btrfs_status,
     _count_kernel_packages,
     _count_unique_segfaults,
     _deduplicate_journal_lines,
-    _filesystem_io_error_severity,
     _filesystem_io_error_family,
+    _filesystem_io_error_severity,
     _filter_invalid_temperatures,
     _filter_own_journal_entries,
     _get_bootable_kernels_from_boot,
@@ -64,22 +63,22 @@ from syscheck import (  # type: ignore[import-untyped] # noqa: E402, F401
     _journal_count_command,
     _journal_filter_command,
     _kernel_oops_panic_severity,
-    _oom_collector_command,
-    _parse_systemd_duration,
-    build_snapshot,
-    get_default_reports_dir,
     _nvme_controller_reliability_severity,
+    _oom_collector_command,
     _parse_btrfs_device_stats,
-    _pcie_aer_severity,
     _parse_storage_usage,
+    _parse_systemd_duration,
     _parse_upower_critical_states,
+    _pcie_aer_severity,
     _write_new_text,
+    build_snapshot,
     confidence_tag,
+    derive_confidence,
     determine_cli_status,
+    get_default_reports_dir,
     run_cmd,
     severity_tag,
 )
-
 
 REAL_ACPI_REPLAY_LINE = (
     "kernel: ACPI BIOS Error (bug): Could not resolve symbol "
@@ -1050,7 +1049,10 @@ tmpfs            16G  225M   16G   2% /dev/shm
         assert len(usage) >= 2
 
     def test_81_percent_is_warning_level(self):
-        from constants import STORAGE_WARNING_PERCENT, STORAGE_CRITICAL_PERCENT  # noqa: E402, F811
+        from constants import (
+            STORAGE_CRITICAL_PERCENT,
+            STORAGE_WARNING_PERCENT,
+        )
 
         pct = 81
         assert pct >= STORAGE_WARNING_PERCENT
@@ -1507,6 +1509,7 @@ class TestIteration46CliUxStabilization:
         self, tmp_path, monkeypatch, capsys, source_kind, needle
     ):
         import json
+
         import syscheck
 
         invalid_path = tmp_path / "invalid.json"
@@ -1662,9 +1665,10 @@ class TestKernelModuleDetection:
 
     def test_get_boot_kernels(self):
         kernels = _get_bootable_kernels_from_boot()
-        assert isinstance(kernels, list)
-        for k in kernels:
-            assert k  # Non-empty strings
+        assert kernels is None or isinstance(kernels, list)
+        if kernels is not None:
+            for k in kernels:
+                assert k  # Non-empty strings
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1828,7 +1832,7 @@ class TestConfidenceModel:
     def test_kernel_count_confidence_is_certain(self):
         """KRNL-INFO-001: we can directly count packages → Certain."""
         # Counting packages is deterministic, so certainty is appropriate
-        pass  # Tested implicitly in TestKernelCounting
+        # Tested implicitly in TestKernelCounting
 
     def test_severity_model_includes_info(self):
         """Severity model includes Info level for non-problems."""
@@ -2084,19 +2088,19 @@ class TestExistingRegressions:
 # Test 18: Typed Snapshot models, schema versioning, validation (iteration 5)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import (  # noqa: E402
-    SystemSnapshot,
-    SnapshotMetadata,
+from syscheck import (
+    SNAPSHOT_SCHEMA_VERSION,
     EnvironmentSnapshot,
     ExecutionSnapshot,
-    ObservationSnapshot,
     FindingSnapshot,
+    ObservationSnapshot,
     SnapshotBuilder,
     SnapshotComparator,
     SnapshotComparison,
+    SnapshotMetadata,
     SnapshotMigrator,
+    SystemSnapshot,
     UnsupportedSnapshotSchemaError,
-    SNAPSHOT_SCHEMA_VERSION,
     format_comparison_markdown,
 )
 
@@ -2168,8 +2172,8 @@ class TestSchemaVersioning:
     def test_schema_v1_migration_to_v3_works(self):
         """v1 snapshots are migrated to v2 with empty recommendations."""
         import json
-        import tempfile
         import os
+        import tempfile
 
         v1_data = {
             "schema_version": 1,
@@ -2601,14 +2605,14 @@ class TestSnapshotMigrator:
 # Test 19: Recommendation Engine (iteration 6)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import (  # noqa: E402
-    DiagnosticDomain,
-    FindingKind,
+from syscheck import (
     Actionability,
-    RecommendationIntent,
+    DiagnosticDomain,
     DiagnosticRecommendation,
-    RecommendationPlan,
+    FindingKind,
     RecommendationEngine,
+    RecommendationIntent,
+    RecommendationPlan,
     derive_recommendation_priority,
     format_recommendation_markdown,
 )
@@ -2631,7 +2635,7 @@ class TestRecommendationModel:
         )
         import pytest
 
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             r.priority = 3
 
     def test_priority_must_be_1_to_5(self):
@@ -2929,8 +2933,8 @@ class TestSnapshotV2Migration:
 
     def test_v1_migrated_to_v3_has_empty_recommendations(self):
         import json
-        import tempfile
         import os
+        import tempfile
 
         v1 = {
             "schema_version": 1,
@@ -2988,7 +2992,7 @@ class TestSnapshotV2Migration:
 # Test 20: Classification Policy (iteration 8)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import (  # noqa: E402
+from syscheck import (
     FindingClassification,
     FindingClassificationPolicy,
     UnsupportedObservationCategoryError,
@@ -3007,7 +3011,7 @@ class TestFindingClassificationModel:
         )
         import pytest
 
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             c.domain = DiagnosticDomain.OTHER
 
     def test_all_fields_required(self):
@@ -3177,12 +3181,12 @@ class TestArchitecturalGuard:
 # Test 21: KernelCountRule Evidence Vertical Slice (iteration 13)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import (  # noqa: E402
-    DiagnosticRuleResult,
+from syscheck import (
     DiagnosticEvaluation,
+    DiagnosticRuleResult,
     EvidenceBuilder,
-    EvidenceType,
     EvidenceStrength,
+    EvidenceType,
     KernelCountRule,
     build_default_rule_engine,
 )
@@ -3320,7 +3324,7 @@ class TestInterpretEvidenceIntegration:
 # Test 22: StorageUsageRule Evidence Migration (iteration 14)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import StorageUsageRule  # noqa: E402
+from syscheck import StorageUsageRule
 
 
 class TestStorageUsageRuleEvidence:
@@ -3481,7 +3485,7 @@ class TestMixedEngineWithStorage:
 # Test 23: Systemd Rules Evidence Migration (iteration 15)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import FailedSystemUnitRule, FailedUserUnitRule  # noqa: E402
+from syscheck import FailedSystemUnitRule, FailedUserUnitRule
 
 
 class TestFailedSystemUnitRuleEvidence:
@@ -3580,7 +3584,7 @@ class TestSystemdAmbiguity:
 # Test 24: BtrfsScrubStatusRule Evidence Migration (iteration 16)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import BtrfsScrubStatusRule  # noqa: E402
+from syscheck import BtrfsScrubStatusRule
 
 
 class TestBtrfsScrubStatusRuleEvidence:
@@ -3623,7 +3627,11 @@ class TestBtrfsScrubStatusRuleEvidence:
 # Test 25: BtrfsDeviceErrorRule Evidence Migration (iteration 17)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import BtrfsDeviceErrorRule, EvidenceDirectness, EvidenceCompleteness  # noqa: E402
+from syscheck import (
+    BtrfsDeviceErrorRule,
+    EvidenceCompleteness,
+    EvidenceDirectness,
+)
 
 
 class TestBtrfsDeviceErrorRuleEvidence:
@@ -4249,10 +4257,10 @@ class TestBtrfsEngineIntegration:
 # Test 26: Segfault Rules Evidence Migration (iteration 18)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import (  # noqa: E402
-    WirePlumberSegfaultRule,
+from syscheck import (
     GeneralSegfaultRule,
     MinorSegfaultRule,
+    WirePlumberSegfaultRule,
 )
 
 
@@ -5114,7 +5122,7 @@ class TestSegfaultEngineIntegration:
 # Test 27: KernelTaintRule Evidence Migration (iteration 19)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import KernelTaintRule  # noqa: E402
+from syscheck import KernelTaintRule
 
 
 class TestKernelTaintRuleEvidence:
@@ -5475,7 +5483,7 @@ class TestKernelTaintEngineIntegration:
 # Test 28: BootDelayRule Evidence Migration (iteration 20)
 # ═══════════════════════════════════════════════════════════════════
 
-from syscheck import BootDelayRule  # noqa: E402
+from syscheck import BootDelayRule
 
 
 class TestBootDelayRuleEvidence:
@@ -5966,7 +5974,7 @@ class TestCompleteNativeRuntime:
             severity="P3",
             confidence="Certain",
         )
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             normalize(bare)
 
 
@@ -6207,8 +6215,9 @@ class TestBootTimeEndToEnd:
 
     def test_slow_boot_full_pipeline(self):
         """Slow boot produces Finding BOOT-SLOW-001 with populated Evidence."""
-        from syscheck import EvidenceType
         from unittest.mock import patch
+
+        from syscheck import EvidenceType
 
         # Stage 1: Collect
         engine = SysCheckEngine(output_dir="/tmp/test_boot_e2e")
@@ -6896,7 +6905,9 @@ class TestSegfaultAndTaintCollectorPath:
         ["io_timeout", "timeout_reset", "controller_down", "device_not_ready"],
     )
     def test_explicit_nvme_controller_events_match(self, event):
-        assert re.search(RE_NVME_CONTROLLER_RELIABILITY, self._line(event), re.I)
+        assert re.search(
+            RE_NVME_CONTROLLER_RELIABILITY, self._line(event), re.IGNORECASE
+        )
 
     @pytest.mark.parametrize(
         "line",
@@ -6911,7 +6922,7 @@ class TestSegfaultAndTaintCollectorPath:
         ],
     )
     def test_generic_nvme_init_reset_and_timeout_text_does_not_match(self, line):
-        assert re.search(RE_NVME_CONTROLLER_RELIABILITY, line, re.I) is None
+        assert re.search(RE_NVME_CONTROLLER_RELIABILITY, line, re.IGNORECASE) is None
 
     @pytest.mark.parametrize(
         ("event", "expected"),
@@ -7732,7 +7743,7 @@ class TestOomCollectorPath:
 
     def test_finding_oom_event_kind(self):
         """Finding uses OOM_EVENT kind, KERNEL domain, P2 severity, Certain confidence."""
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_oom_pipe")
         engine.raw_diagnostics = [
@@ -8495,7 +8506,7 @@ class TestGpuI915HangCollectorPath:
 
     def test_finding_gpu_i915_hang_kind(self):
         """Finding uses GPU_I915_HANG kind, HARDWARE domain, P2 severity, Certain confidence."""
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_gpu_hang_pipe")
         engine.raw_diagnostics = [
@@ -9127,9 +9138,9 @@ class TestAmdgpuResetFailCollectorPath:
     def test_finding_classification(self):
         """Finding uses AMDGPU_RESET_FAIL kind, HARDWARE, P2, Certain, ACTIONABLE, INVESTIGATE."""
         from syscheck import (
-            FindingKind,
-            DiagnosticDomain,
             Actionability,
+            DiagnosticDomain,
+            FindingKind,
             RecommendationIntent,
         )
 
@@ -9179,7 +9190,7 @@ class TestAmdgpuResetFailCollectorPath:
 
     def test_no_hardware_failure_claim(self):
         """Finding does not claim hardware failure."""
-        from syscheck import build_default_rule_engine, Observation
+        from syscheck import Observation, build_default_rule_engine
 
         engine = build_default_rule_engine()
         obs = Observation(
@@ -9207,7 +9218,7 @@ class TestAmdgpuResetFailCollectorPath:
 
     def test_no_current_unavailability_claim(self):
         """Finding does not claim current GPU unavailability."""
-        from syscheck import build_default_rule_engine, Observation
+        from syscheck import Observation, build_default_rule_engine
 
         engine = build_default_rule_engine()
         obs = Observation(
@@ -9235,7 +9246,7 @@ class TestAmdgpuResetFailCollectorPath:
 
     def test_no_arch_only_command(self):
         """Recommendation does not contain Arch-only 'pacman -Q'."""
-        from syscheck import build_default_rule_engine, Observation
+        from syscheck import Observation, build_default_rule_engine
 
         engine = build_default_rule_engine()
         obs = Observation(
@@ -9264,7 +9275,7 @@ class TestAmdgpuResetFailCollectorPath:
 
     def test_no_kernel_parameters(self):
         """Recommendation does not prescribe arbitrary kernel parameters."""
-        from syscheck import build_default_rule_engine, Observation
+        from syscheck import Observation, build_default_rule_engine
 
         engine = build_default_rule_engine()
         obs = Observation(
@@ -9295,7 +9306,7 @@ class TestAmdgpuResetFailCollectorPath:
 
     def test_verification_no_disappearance_claim(self):
         """Verification does not claim historical entry disappears."""
-        from syscheck import build_default_rule_engine, Observation
+        from syscheck import Observation, build_default_rule_engine
 
         engine = build_default_rule_engine()
         obs = Observation(
@@ -10081,7 +10092,7 @@ class TestNvidiaXid79CollectorPath:
 
     def test_finding_gpu_nvidia_xid_79_kind(self):
         """Finding uses GPU_NVIDIA_XID_79 kind, HARDWARE, P2, Certain."""
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_xid79_find")
         engine.raw_diagnostics = [
@@ -11804,7 +11815,7 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert re.search(RE_PLATFORM_DEVICE_RELIABILITY, line, re.IGNORECASE) is None
 
     def test_collector_emits_acpi_firmware_p2(self):
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_acpi_firmware")
         line = "kernel: ACPI BIOS Error (bug): Could not resolve symbol [_SB.PCI0.PB2], AE_NOT_FOUND (20230628/dswload2-162)"
@@ -11916,7 +11927,7 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert engine.pipeline_accounting == []
 
     def test_collector_emits_firmware_load_fail_p2(self):
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_firmware_load_fail")
         line = "kernel: iwlwifi 0000:00:14.3: Direct firmware load for iwlwifi-so-a0-gf-a0-89.ucode failed with error -2"
@@ -11934,7 +11945,7 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert "oprogramowania układowego" in finding.title
 
     def test_collector_emits_usb_enumeration_fail_p2(self):
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_usb_enum_fail")
         line = "kernel: usb 1-1: device descriptor read/64, error -71"
@@ -11950,7 +11961,7 @@ class TestPlatformFirmwareDeviceReliabilityPack:
         assert "USB" in finding.title
 
     def test_collector_emits_iommu_fault_p1(self):
-        from syscheck import FindingKind, DiagnosticDomain
+        from syscheck import DiagnosticDomain, FindingKind
 
         engine = SysCheckEngine(output_dir="/tmp/test_iommu_fault")
         line = "kernel: AMD-Vi: Event logged [IO_PAGE_FAULT device=01:00.0 domain=0x0010 address=0x00000000 flags=0x0000]"
@@ -12750,8 +12761,8 @@ class TestIteration011RealWorldCorrectness:
             "niri_ver": "(optional dependency unavailable)",
         }
         monkeypatch.setattr(engine, "_parallel", lambda _tasks: base_output)
-        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_modules", lambda: [])
-        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", lambda: [])
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_modules", list)
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", list)
         monkeypatch.setattr(engine, "detect_distro", lambda: None)
         for phase in (
             "collect_resources",
@@ -12772,14 +12783,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.6.0`" in report
+        assert "**Wersja produktu:** `0.6.1`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.6.0" in report
+        assert "Linux Diagnostic Engine 0.6.1" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -13250,7 +13261,7 @@ class TestV03StorageMemoryReliabilityReplayCorpus:
         assert actual == expected
         for path in self.corpus_dir.glob("*.txt"):
             text = path.read_text(encoding="utf-8")
-            assert "grzanka" not in text.lower()
+            assert "synthetic-user" not in text.lower()
             assert "localhost" not in text.lower()
             assert (
                 re.search(
@@ -14141,3 +14152,334 @@ class TestV04WorkstationCoverage:
                 check=False,
             )
             assert result.returncode == 0, (finding.finding_id, result.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 58: Kernel inventory robustness & non-root /boot permissions
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestKernelInventoryRobustness:
+    """Regression tests for unreadable /boot, missing paths, and races."""
+
+    def test_bootable_kernels_from_boot_permission_error_returns_none(self, tmp_path):
+        """Simulate /boot raising PermissionError (e.g. mode 0700 root:root).
+
+        Must return None (NOT []) to distinguish unknown from empty.
+        """
+        fake_boot = tmp_path / "boot"
+        fake_boot.mkdir()
+
+        def _raise_perm(*args, **kwargs):
+            raise PermissionError(13, "Permission denied", str(fake_boot))
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "iterdir", _raise_perm)
+            result = _get_bootable_kernels_from_boot(fake_boot)
+            assert result is None
+            assert result != []
+
+    def test_bootable_kernels_from_boot_missing_dir_returns_none(self, tmp_path):
+        """Missing /boot is unavailable source, returning None (not [])."""
+        non_existent = tmp_path / "does_not_exist"
+        result = _get_bootable_kernels_from_boot(non_existent)
+        assert result is None
+        assert result != []
+
+    def test_bootable_kernels_from_boot_not_a_dir_returns_none(self, tmp_path):
+        """Path pointing to regular file returns None."""
+        fake_file = tmp_path / "boot_file"
+        fake_file.write_text("not a dir", encoding="utf-8")
+        result = _get_bootable_kernels_from_boot(fake_file)
+        assert result is None
+
+    def test_bootable_kernels_from_boot_readable_with_images(self, tmp_path):
+        """Readable /boot returns sorted list of kernel version strings."""
+        fake_boot = tmp_path / "boot"
+        fake_boot.mkdir()
+        (fake_boot / "vmlinuz-6.12.1-cachyos").write_text("", encoding="utf-8")
+        (fake_boot / "vmlinuz-6.6.65-lts").write_text("", encoding="utf-8")
+        (fake_boot / "initramfs-linux.img").write_text("", encoding="utf-8")
+
+        result = _get_bootable_kernels_from_boot(fake_boot)
+        assert isinstance(result, list)
+        assert result == ["6.12.1-cachyos", "6.6.65-lts"]
+
+    def test_bootable_kernels_from_boot_readable_without_images(self, tmp_path):
+        """Readable /boot without vmlinuz-* returns [] (authoritative empty)."""
+        fake_boot = tmp_path / "boot"
+        fake_boot.mkdir()
+        (fake_boot / "initramfs-linux.img").write_text("", encoding="utf-8")
+        (fake_boot / "loader").mkdir()
+
+        result = _get_bootable_kernels_from_boot(fake_boot)
+        assert isinstance(result, list)
+        assert result == []
+        assert len(result) == 0
+
+    def test_bootable_kernels_from_boot_enumeration_race(self, tmp_path):
+        """Simulate an entry disappearing or OSError during iterdir iteration."""
+        fake_boot = tmp_path / "boot"
+        fake_boot.mkdir()
+
+        def _generator_with_race(self):
+            yield fake_boot / "vmlinuz-6.1.0"
+            raise OSError("Directory entry disappeared during scan")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "iterdir", _generator_with_race)
+            result = _get_bootable_kernels_from_boot(fake_boot)
+            assert result is None
+
+    def test_bootable_kernels_from_modules_robustness(self, tmp_path):
+        """_get_bootable_kernels_from_modules handles errors and races gracefully."""
+        # Readable with modules
+        mod_dir = tmp_path / "modules"
+        mod_dir.mkdir()
+        (mod_dir / "6.12.1-cachyos").mkdir()
+        (mod_dir / "6.6.65-lts").mkdir()
+        (mod_dir / ".hidden").mkdir()
+        (mod_dir / "modules.dep").write_text("", encoding="utf-8")
+        res = _get_bootable_kernels_from_modules(mod_dir)
+        assert res == ["6.12.1-cachyos", "6.6.65-lts"]
+
+        # Missing dir -> None
+        assert _get_bootable_kernels_from_modules(tmp_path / "nonexistent") is None
+
+        # Permission error -> None
+        def _raise_perm(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "iterdir", _raise_perm)
+            assert _get_bootable_kernels_from_modules(mod_dir) is None
+
+    def test_engine_run_all_with_unreadable_boot(self, tmp_path, monkeypatch):
+        """Full SysCheckEngine run survives unreadable /boot with correct semantics."""
+        import syscheck
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+
+        # Simulate inaccessible /boot
+        monkeypatch.setattr(
+            syscheck, "_get_bootable_kernels_from_boot", lambda *args, **kwargs: None
+        )
+
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        # Keep execution bounded and fast
+        base_output = {
+            "osr": 'NAME="Arch Linux"\nID=arch\nPRETTY_NAME="Arch Linux"',
+            "kernel": "6.12.1-arch1-1",
+            "hostname": "test-box",
+            "uptime": "up 2 hours",
+            "cmdline": "BOOT_IMAGE=/vmlinuz root=/dev/sda1 quiet",
+            "boot_ls": "ls: cannot open directory '/boot/': Permission denied\n(błąd rc=2)",
+            "mod_ls": "drwxr-xr-x 6.12.1-arch1-1",
+            "niri_ver": "",
+        }
+        monkeypatch.setattr(engine, "_parallel", lambda _tasks: base_output)
+        monkeypatch.setattr(
+            engine,
+            "cmd",
+            lambda *args, **kwargs: CmdResult(
+                command="pacman -Q",
+                stdout="linux 6.12.1-arch1-1",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+        )
+
+        # Mock out heavy phases to isolate base_info and packages
+        for phase in (
+            "collect_resources",
+            "collect_storage",
+            "collect_kernel_hw",
+            "collect_systemd",
+            "collect_graphics",
+            "collect_network",
+            "collect_userenv",
+        ):
+            monkeypatch.setattr(engine, phase, lambda: None)
+
+        report_file = engine.run_all()
+        assert Path(report_file).is_file()
+
+        content = Path(report_file).read_text(encoding="utf-8")
+        # Verify no false zero assertions
+        assert "**Obrazy w /boot:** (niedostępne" in content
+        assert "**Obrazy w /boot:** 0" not in content
+        assert "**Obrazy kernel w /boot:** 0" not in content
+
+        # Verify restriction is recorded
+        assert any("Katalog /boot jest niedostępny" in r for r in engine.restrictions)
+        # Verify no false findings generated from /boot limitation
+        finding_ids = [f.finding_id for f in engine.findings]
+        assert not any("BOOT" in fid for fid in finding_ids)
+
+    def test_cli_run_with_unreadable_boot(self, tmp_path):
+        """Exercise CLI entrypoint with simulated unreadable /boot."""
+        out_dir = tmp_path / "cli_reports"
+        out_dir.mkdir()
+
+        code = f"""
+import sys
+from pathlib import Path
+from unittest.mock import patch
+import syscheck
+
+orig_iterdir = Path.iterdir
+def custom_iterdir(self):
+    if str(self) == '/boot':
+        raise PermissionError(13, 'Permission denied', '/boot')
+    return orig_iterdir(self)
+
+with patch.object(Path, 'iterdir', custom_iterdir):
+    sys.argv = ['lde', 'run', '--output-dir', r'{out_dir}', '--quiet']
+    syscheck.main()
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"stderr: {proc.stderr}"
+        assert "Traceback" not in proc.stderr
+        reports = list(out_dir.glob("lde-*.md"))
+        assert len(reports) == 1
+        content = reports[0].read_text(encoding="utf-8")
+        assert "**Obrazy w /boot:** (niedostępne" in content
+        assert "**Obrazy w /boot:** 0" not in content
+
+    def test_lifecycle_verification_with_boot_restriction(self):
+        """Lifecycle verification proves source failure produces UNVERIFIED, not false RESOLVED."""
+        from syscheck import (
+            REPORT_COMPATIBILITY_VERSION,
+            EnvironmentSnapshot,
+            ExecutionSnapshot,
+            FindingLifecycleComparator,
+            FindingSnapshot,
+            ObservationSnapshot,
+            RawDiagnosticSnapshot,
+            SnapshotMetadata,
+            SystemSnapshot,
+        )
+
+        def _meta():
+            return SnapshotMetadata(
+                hostname="synthetic-host",
+                kernel="6.12.0-synthetic",
+                distro="synthetic-linux",
+                syscheck_version=REPORT_COMPATIBILITY_VERSION,
+                timestamp_utc="2026-09-10T10:00:00+00:00",
+                timestamp_local="2026-09-10T10:00:00+00:00",
+            )
+
+        # 1. Finding with source query 'kernel_package' (like KRNL-INFO-001)
+        # Unreadable /boot restriction does not block resolution when package query is authoritative
+        baseline_finding = FindingSnapshot(
+            finding_id="KRNL-INFO-001",
+            title="Zainstalowane kernele (3)",
+            severity="Info",
+            confidence="Certain",
+            evidence="Liczba kernel: 3.",
+            recommended_diagnostics="uname -r",
+            source_observation_ids=("OBS-KRNL-INFO-001",),
+        )
+        baseline = SystemSnapshot(
+            metadata=_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(
+                ObservationSnapshot(
+                    obs_id="OBS-KRNL-INFO-001",
+                    category="kernel_count",
+                    source_raw_ids=("RAW-KRNL-INFO-001",),
+                ),
+            ),
+            raw_diagnostics=(
+                RawDiagnosticSnapshot(
+                    source_id="RAW-KRNL-INFO-001",
+                    category="kernel_count",
+                    payload={"count": 3, "source_query": "kernel_package"},
+                    provenance={"execution_status": "ok", "truncated": False},
+                ),
+            ),
+            findings=(baseline_finding,),
+            execution=ExecutionSnapshot(),
+        )
+        boot_restriction = (
+            "Katalog /boot jest niedostępny bez uprawnień roota "
+            "(PermissionError: permission denied) lub nie istnieje; "
+            "obrazy kernela w /boot są niedostępne (unavailable / unknown)."
+        )
+        # In current run, finding disappeared and current run has authoritative package query
+        # plus the /boot restriction. Because /boot is unrelated to kernel_package, it resolves.
+        current_resolved = SystemSnapshot(
+            metadata=_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(),
+            raw_diagnostics=(
+                RawDiagnosticSnapshot(
+                    source_id="RAW-KRNL-INFO-001",
+                    category="kernel_count",
+                    payload={"count": 2, "source_query": "kernel_package"},
+                    provenance={"execution_status": "ok", "truncated": False},
+                ),
+            ),
+            findings=(),
+            restrictions=(boot_restriction,),
+            execution=ExecutionSnapshot(),
+        )
+        res_resolved = FindingLifecycleComparator.compare(baseline, current_resolved)
+        assert res_resolved.resolved_finding_ids == ("KRNL-INFO-001",)
+        assert res_resolved.unverified_finding_ids == ()
+
+        # 2. Finding tied to /boot: limitation matches source and forces UNVERIFIED
+        boot_finding = FindingSnapshot(
+            finding_id="BOOT-IMG-001",
+            title="Kernel boot image",
+            severity="Info",
+            confidence="Certain",
+            evidence="Boot image check",
+            recommended_diagnostics="ls /boot",
+            source_observation_ids=("OBS-BOOT-IMG-001",),
+        )
+        baseline_boot = SystemSnapshot(
+            metadata=_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(
+                ObservationSnapshot(
+                    obs_id="OBS-BOOT-IMG-001",
+                    category="boot_images",
+                    source_raw_ids=("RAW-BOOT-001",),
+                ),
+            ),
+            raw_diagnostics=(
+                RawDiagnosticSnapshot(
+                    source_id="RAW-BOOT-001",
+                    category="boot_images",
+                    payload={"path": "/boot"},
+                    provenance={"execution_status": "ok", "truncated": False},
+                ),
+            ),
+            findings=(boot_finding,),
+            execution=ExecutionSnapshot(),
+        )
+        current_unverified = SystemSnapshot(
+            metadata=_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(),
+            raw_diagnostics=(),
+            findings=(),
+            restrictions=(boot_restriction,),
+            execution=ExecutionSnapshot(),
+        )
+        res_unverified = FindingLifecycleComparator.compare(
+            baseline_boot, current_unverified
+        )
+        assert res_unverified.resolved_finding_ids == ()
+        assert res_unverified.unverified_finding_ids == ("BOOT-IMG-001",)
+        assert boot_restriction in res_unverified.source_limitations

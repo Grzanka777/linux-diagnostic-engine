@@ -9,22 +9,21 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import syscheck  # noqa: E402
-from syscheck import (  # noqa: E402
+import syscheck
+from syscheck import (
     EnvironmentSnapshot,
     ExecutionSnapshot,
     FindingLifecycleComparator,
     FindingSnapshot,
     ObservationSnapshot,
     RawDiagnosticSnapshot,
-    SnapshotComparison,
     SnapshotComparator,
+    SnapshotComparison,
     SnapshotMetadata,
     SystemSnapshot,
     compare_finding_lifecycle,
     format_verification_cli,
 )
-
 
 COMPATIBILITY = syscheck.REPORT_COMPATIBILITY_VERSION
 
