@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.7.0
+Wersja produktu:                         0.7.1
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -1090,7 +1090,59 @@ def _markdown_hostname(text: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+_PROCESS_SECTION_START = re.compile(
+    r"(?m)(?:^|(?<=\r))(?:### Top (?:CPU|MEM) \(pierwsze 15\)"
+    r"|(?:```\n)?[ \t]*USER[ \t]+PID[ \t]+%CPU[ \t]+%MEM[ \t]+VSZ[ \t]+RSS"
+    r"[ \t]+TTY[ \t]+STAT[ \t]+START[ \t]+TIME[ \t]+COMMAND)[ \t]*(?=[\r\n]|\Z)"
+)
+_REPORT_CODE_BLOCK = r"```\n(?:(?!```\n)[^\n]*\n)+```\n"
+# This consecutive layout cannot fit in either 16-line process capture.
+# A single heading or fence can be part of a process argument.
+_STORAGE_SECTION_START = re.compile(
+    r"(?m)^## 3\. Dyski, NVMe i Btrfs\n"
+    + "".join(
+        rf"### {re.escape(title)}\n{_REPORT_CODE_BLOCK}"
+        for title in (
+            "Urządzenia blokowe",
+            "Systemy plików (df -h)",
+            "Inode (df -i)",
+            "Btrfs — filesystem show",
+        )
+    )
+)
+_SENSOR_SECTION_START = "\n```\n### Sensory / temperatury\n"
+_SENSOR_SECTION_BODY = re.compile(
+    _REPORT_CODE_BLOCK + r"(?:ℹ️ Pominięto [0-9]+ nieprawidłowych odczytów czujników "
+    r"\(wartości poniżej -?[0-9]+(?:\.[0-9]+)?°C - niepodłączone czujniki\)\.\n\n)?"
+)
+
+
+def _omit_markdown_process_tables(text: str) -> str:
+    """Drop the whole untrusted region, including malformed rows and continuations."""
+    parts = []
+    offset = 0
+    while start := _PROCESS_SECTION_START.search(text, offset):
+        parts.append(text[offset : start.start()])
+        parts.append("> Process tables omitted from the sanitized report.\n\n")
+
+        storage = _STORAGE_SECTION_START.search(text, start.end())
+        if storage is None:
+            # A clipped report has no independently recognizable resumption point.
+            return "".join(parts)
+
+        offset = storage.start()
+        sensors = text.rfind(_SENSOR_SECTION_START, start.end(), offset)
+        if sensors != -1 and _SENSOR_SECTION_BODY.fullmatch(
+            text, sensors + len(_SENSOR_SECTION_START), offset
+        ):
+            offset = sensors + len("\n```\n")
+    parts.append(text[offset:])
+    return "".join(parts)
+
+
 def _sanitize_markdown(text: str) -> str:
+    # Only LF (including CRLF) delimits captured process lines.
+    text = _omit_markdown_process_tables(text.replace("\r\n", "\n")).replace("\r", "\n")
     hostname = _markdown_hostname(text)
     text = _sanitize_text(text, hostname=hostname)
     field_patterns = (
@@ -1119,7 +1171,8 @@ def sanitize_artifact(input_path: str | Path) -> str:
     """Return a sanitized Markdown report or validated schema-3 snapshot."""
     path = Path(input_path).expanduser()
     try:
-        raw_text = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8", newline="") as handle:
+            raw_text = handle.read()
     except (OSError, UnicodeError):
         raise
     suffix = path.suffix.lower()

@@ -334,6 +334,164 @@ def test_sanitize_redacts_mount_paths_and_ps_user_columns():
     assert "42" in sanitized
 
 
+@pytest.mark.parametrize(
+    "capture",
+    ["full", "malformed", "truncated", "false-boundary", "headingless", "empty"],
+)
+def test_sanitize_markdown_omits_process_payload_and_keeps_diagnostics(
+    tmp_path, monkeypatch, capture
+):
+    engine = syscheck.SysCheckEngine(str(tmp_path), quiet=True)
+    engine.hostname = "synthetic-host"
+    engine.active_kernel = "synthetic-kernel"
+    markers = [
+        f"SYNTHETIC_CANARY_{name}_END"
+        for name in (
+            "KEY",
+            "BEARER",
+            "PASSWORD",
+            "PROMPT1",
+            "PROMPT2",
+            "PRIVATEPATH",
+            "ID",
+            "FREE",
+        )
+    ]
+    key, bearer, password, prompt, continuation, path, identifier, freeform = markers
+    header = "USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND"
+    arguments = (
+        f'agent --api-key={key} --header "Authorization: Bearer {bearer}" '
+        f'--password {password} --prompt "{prompt}\n{continuation}" '
+        rf"/srv/{path} --project={identifier} \"{freeform}\""
+    )
+    table = f"{header}\nsynthetic-user 101 1.0 2.0 100 100 ? S 10:00 0:00 {arguments}"
+    if capture == "malformed":
+        table = f"malformed row {arguments}"
+    if capture == "truncated":
+        table += "x" * syscheck.TRUNCATE_NORMAL
+    if capture == "false-boundary":
+        table += (
+            "\n```\n### Sensory / temperatury\n```\n"
+            f"{freeform}\n```\n## 3. Dyski, NVMe i Btrfs\n"
+            f"### Urządzenia blokowe\n```\n{continuation}"
+        )
+    if capture == "empty":
+        table = ""
+
+    resources = {
+        "ps_cpu": table,
+        "ps_mem": "(nie znaleziono: ps)" if capture == "empty" else table,
+        "loadavg": "0.10 0.20 0.30",
+        "sensors": "temp1: +31.0°C",
+    }
+    monkeypatch.setattr(
+        engine,
+        "_parallel",
+        lambda tasks: {key: resources.get(key, "") for key in tasks},
+    )
+    engine.collect_resources()
+    sensors_heading = engine.report_lines.index("### Sensory / temperatury\n")
+    engine.report_lines.insert(
+        sensors_heading, "### Top MEM (pierwsze 15)\n" + syscheck.codeblock(table)
+    )
+    resource_report = "".join(engine.report_lines)
+    snapshot = syscheck.build_snapshot(engine)
+    snapshot_text = json.dumps(snapshot.to_dict())
+    assert all(marker not in snapshot_text for marker in markers)
+    if capture != "empty":
+        assert all(marker in resource_report for marker in markers)
+    if capture == "headingless":
+        resource_report = resource_report.replace("### Top CPU (pierwsze 15)\n", "")
+
+    monkeypatch.setattr(
+        engine,
+        "_parallel_cmd",
+        lambda tasks: {
+            key: _result(stdout="/dev/sda1 20G 5G 15G 25% /" if key == "df_h" else "")
+            for key in tasks
+        },
+    )
+    engine.report_lines.clear()
+    engine.collect_storage()
+    original = (
+        "**Hostname:** `synthetic-host`\n"
+        "Address: 192.0.2.25\n"
+        + resource_report
+        + "".join(engine.report_lines)
+        + "\n## 11. Problemy potwierdzone\nFinding F-1\n"
+    )
+    source = tmp_path / "raw.md"
+    output = tmp_path / "share.md"
+    source.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        syscheck.sys, "argv", ["lde", "sanitize", str(source), "--output", str(output)]
+    )
+    syscheck.main()
+
+    sanitized = output.read_text(encoding="utf-8")
+    assert source.read_text(encoding="utf-8") == original
+    assert sanitized == sanitize_artifact(source) == sanitize_artifact(output)
+    assert all(marker not in sanitized for marker in markers)
+    assert "synthetic-user" not in sanitized
+    for detail in (
+        "<HOST>",
+        "<IP>",
+        "0.10 0.20 0.30",
+        "+31.0°C",
+        "/dev/sda1",
+        "Finding F-1",
+    ):
+        assert detail in sanitized
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\r"])
+def test_direct_sanitize_fails_closed_on_incomplete_process_region(tmp_path, separator):
+    marker = "SYNTHETIC_TRUNCATED_CONTINUATION"
+    # The pseudo-storage suffix is part of the process payload. Bare CR does
+    # not increase the renderer's captured line count.
+    fake_storage = separator.join(
+        ["## 3. Dyski, NVMe i Btrfs"]
+        + [
+            f"### {title}{separator}```{separator}{marker}{separator}```"
+            for title in (
+                "Urządzenia blokowe",
+                "Systemy plików (df -h)",
+                "Inode (df -i)",
+                "Btrfs — filesystem show",
+            )
+        ]
+    )
+    if separator != "\r":
+        fake_storage = fake_storage.split(separator + "### Btrfs", 1)[0]
+    raw = (
+        "# Diagnostic report\nSafe prefix\n### Top CPU (pierwsze 15)\n"
+        f"```\nmalformed {marker}\n```\n### Sensory / temperatury\n```\n"
+        f"{marker}\n```\n{fake_storage}\n{marker}"
+    )
+    source = tmp_path / "raw.md"
+    output = tmp_path / "share.md"
+    source.write_bytes(raw.encode("utf-8"))
+    result = syscheck.subprocess.run(
+        [
+            sys.executable,
+            "syscheck.py",
+            "sanitize",
+            str(source),
+            "--output",
+            str(output),
+        ],
+        cwd=Path(syscheck.__file__).parent,
+        check=True,
+        capture_output=True,
+    )
+    assert result.stderr == b""
+    sanitized = output.read_text(encoding="utf-8")
+    assert "Safe prefix" in sanitized
+    assert marker not in sanitized
+    assert "Sensory / temperatury" not in sanitized
+    assert sanitized == sanitize_artifact(output)
+
+
 def test_sanitize_snapshot_preserves_schema_ids_and_diagnostic_fields(tmp_path):
     snapshot = SystemSnapshot(
         metadata=SnapshotMetadata(
