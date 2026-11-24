@@ -1,0 +1,47 @@
+{
+  "provenance": {
+    "source": "LDE 0.6.1 real CachyOS diagnostic run",
+    "sanitized_before_repository_admission": true,
+    "scope": [
+      "protected boot inventory",
+      "kernel package and module reconciliation",
+      "GPU inventory reconciliation",
+      "AMDGPU SVM journal evidence",
+      "incomplete Btrfs evidence"
+    ]
+  },
+  "boot": {
+    "enumeration_status": "permission_denied",
+    "module_tree_count": 3,
+    "boot_images": null
+  },
+  "kernel_inventory": {
+    "packages": [
+      "linux-cachyos 7.2.9-1",
+      "linux-cachyos-lts 6.18.55-1"
+    ],
+    "module_trees": [
+      "6.18.55-1-cachyos-lts",
+      "7.2.8-2-cachyos",
+      "7.2.9-1-cachyos"
+    ]
+  },
+  "gpu": {
+    "drm_tsv": "card0\t0000:03:00.0\t0x1002\tunknown\n",
+    "lspci_nnk": "0000:03:00.0 VGA compatible controller [0300]: Synthetic Graphics Adapter [1002:f00d]\n\tKernel driver in use: amdgpu\n"
+  },
+  "kernel_event": {
+    "amdgpu_svm": "kernel: amdgpu: SVM mapping failed, exceeds resident system memory limit",
+    "expected_finding_ids": []
+  },
+  "btrfs": {
+    "show_stdout": "devid 1 size 100.00GiB used 1.00GiB path /dev/nvme0n1p2 MISSING",
+    "show_stderr": "ERROR: cannot inspect all devices: Operation not permitted",
+    "return_code": 1,
+    "execution_status": "error",
+    "privilege_required": true,
+    "expected_authoritative": false,
+    "expected_finding": false
+  },
+  "privacy_sample": "# Synthetic privacy regression\n**Hostname:** `fixture-host`\n**Username:** `testuser`\nHome: /home/testuser/projects/lde\nRuntime user: /run/user/4242\nMAC: 02:00:00:00:00:01\nIPv4: 192.0.2.17\nIPv6: fe80::1%test0\nFilesystem UUID: 123e4567-e89b-12d3-a456-426614174000\n**Serial:** `TEST-SERIAL-0001`\nSerial Number: TEST-SERIAL-0002\n```text\nNode SN Model Namespace Usage Format FW Rev\n/dev/nvme0n1 TEST-SERIAL-0003 Synthetic-Model 1 1.00 GB 512 B 1.0\n```\n```text\nNode Generic SN Model Namespace Usage Format FW Rev\n/dev/nvme1n1 /dev/ng1n1 TEST-SERIAL-0004 Synthetic-Model 1 1.00 GB 512 B 1.0\n```\nTemporary report: /tmp/lde-fixture-run-0001/report.md\nCommand: editor --profile /home/testuser/.config/editor/profile\nMount: /run/media/testuser/backups\nUSER PID %CPU %MEM COMMAND\ntestuser 123 0.1 0.2 editor --config /home/testuser/.config/editor/profile\nInvocation ID: 0123456789abcdef0123456789abcdef\nOpaque digest: 0123456789abcdef0123456789abcdef\nFinding F-1; Device: /dev/nvme0n1; Btrfs MISSING remains incomplete.\n"
+}

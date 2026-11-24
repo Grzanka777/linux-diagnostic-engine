@@ -50,7 +50,7 @@ Install it into an isolated virtual environment:
 
 ```text
 uv venv /tmp/lde-venv
-uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.6.1-py3-none-any.whl
+uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.7.0-py3-none-any.whl
 ```
 
 The installed command is `lde`:
@@ -69,8 +69,8 @@ The installed command is `lde`:
 /tmp/lde-venv/bin/lde snapshot compare --help
 ```
 
-The public product version is `0.6.1`; `lde --version` prints
-`Linux Diagnostic Engine 0.6.1`. Without `--output-dir`, reports are written
+The public product version is `0.7.0`; `lde --version` prints
+`Linux Diagnostic Engine 0.7.0`. Without `--output-dir`, reports are written
 to `$XDG_DATA_HOME/lde/reports` or `~/.local/share/lde/reports`; an explicit
 `--output-dir` still overrides this default. A successful `lde run` prints a
 compact English summary with the exact absolute report path. Use
@@ -163,6 +163,23 @@ with stable placeholders and is deterministic. It reduces known host
 identifiers; it is not a guarantee of anonymity. Inspect the generated copy
 for custom hostnames, service/process/package names, command-line arguments,
 and other values that the explicit contract cannot safely classify.
+
+## Version 0.7.0 release overview
+
+Version 0.7.0 introduces cross-distribution portability and real-world diagnostic hardening:
+
+- **Distribution portability:** Native package management profiles for Arch/CachyOS (`pacman`), Fedora/RHEL (`rpm`), and Debian/Ubuntu (`dpkg-query`), alongside a fallback generic profile for unclassified systems.
+- **Kernel & module inventory normalization:** Split kernel package deduplication (Fedora `kernel-core`/`kernel-modules`), status filtering (Debian `install ok installed`), and unified enumeration of `/usr/lib/modules` and `/lib/modules`.
+- **Boot and EFI authority:** Distinct enumeration of boot images, initramfs archives, visible EFI files, and EFI/Linux UKI paths; unreadable boot paths report unknown/unavailable rather than claiming zero.
+- **Hardware & GPU reconciliation:** PCI class-code detection (0300, 0302, 0380) and exact BDF matching across sysfs DRM and lspci sources without commercial model speculation.
+- **Optional tool degradation:** Graceful handling of unavailable commands (`sensors`, `upower`, `nvme`, `btrfs`, `systemd-analyze`) without emitting false failures or assuming system health.
+- **Sanitizer hardening:** Redaction of private boot paths, machine IDs, network addresses, and workstation paths across all distribution formats.
+- **Contract & lifecycle preservation:** Strict preservation of diagnostic boundaries (`unknown != zero`, `unavailable != empty`, `permission denied != healthy`, `non-authoritative evidence != resolution`).
+
+### Validation baseline and scope boundary
+- **Fedora & Debian:** Validated inside real installed KVM virtual machines with UEFI firmware and mounted ESP.
+- **Arch / CachyOS:** Validated on a physical workstation.
+- **Scope bounds:** Virtual machine testing validates package, init, and filesystem portability; it does not validate physical discrete GPU hardware (Intel/NVIDIA/hybrid) or real UKI configurations (`NOT_OBSERVED`).
 
 ## Direct execution from a checkout
 

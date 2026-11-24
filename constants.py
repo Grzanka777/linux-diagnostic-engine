@@ -9,7 +9,7 @@ from pathlib import Path
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.6.1"
+PRODUCT_VERSION = "0.7.0"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for
@@ -236,31 +236,54 @@ DISTRO_CONFIG: dict[str, dict] = {
         "name": "Arch Linux / CachyOS",
         "pkg_list_orphans": ["pacman", "-Qdt"],
         "pkg_list_foreign": ["pacman", "-Qm"],
-        "pkg_query_kernels": [
-            "bash",
-            "-c",
-            "pacman -Q 2>/dev/null | grep -E '^linux'; "
-            'statuses=("${PIPESTATUS[@]}"); '
-            'if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; '
-            'elif [ "${statuses[1]}" -eq 1 ]; then exit 0; '
-            'else exit "${statuses[1]}"; fi',
-        ],
+        "pkg_query_installed": ["pacman", "-Q"],
+        "pkg_query_kernels": ["pacman", "-Q"],
         "pkg_timeout": TIMEOUT_MEDIUM,
         "kernel_filter_prefixes": list(KERNEL_NON_BOOTABLE_PREFIXES),
     },
     "debian": {
         "name": "Debian / Ubuntu",
-        "pkg_list_orphans": ["apt", "list", "?obsolete"],
-        "pkg_list_foreign": ["apt", "list", "?installed", "?origin(Debian)"],
-        "pkg_query_kernels": ["dpkg", "-l", "linux-image-*"],
+        # apt's obsolete-package view is not equivalent to autoremove candidates,
+        # and origin(Debian) is not a portable "foreign package" classifier.
+        "pkg_list_orphans": None,
+        "pkg_list_foreign": None,
+        "pkg_query_installed": [
+            "dpkg-query",
+            "-W",
+            "--showformat=${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\n",
+        ],
+        "pkg_query_kernels": [
+            "dpkg-query",
+            "-W",
+            "--showformat=${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\n",
+            "linux-image-*",
+        ],
         "pkg_timeout": TIMEOUT_MEDIUM,
         "kernel_filter_prefixes": [],
     },
     "rhel": {
         "name": "RHEL / Fedora",
-        "pkg_list_orphans": ["dnf", "repoquery", "--unneeded"],
-        "pkg_list_foreign": ["dnf", "list", "installed"],
-        "pkg_query_kernels": ["rpm", "-qa", "kernel*"],
+        # dnf repoquery depends on optional tooling/repository state; there is no
+        # stable cross-family equivalent for the Arch orphan/AUR classifications.
+        "pkg_list_orphans": None,
+        "pkg_list_foreign": None,
+        "pkg_query_installed": ["rpm", "-qa", "--qf", "%{NAME}\\n"],
+        "pkg_query_kernels": [
+            "rpm",
+            "-qa",
+            "--qf",
+            "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n",
+            "kernel*",
+        ],
+        "pkg_timeout": TIMEOUT_MEDIUM,
+        "kernel_filter_prefixes": [],
+    },
+    "generic": {
+        "name": "Generic Linux (package manager unconfigured)",
+        "pkg_list_orphans": None,
+        "pkg_list_foreign": None,
+        "pkg_query_installed": None,
+        "pkg_query_kernels": None,
         "pkg_timeout": TIMEOUT_MEDIUM,
         "kernel_filter_prefixes": [],
     },

@@ -1,0 +1,93 @@
+{
+  "schema": "lde-v0.7-multi-distro-portability/v1",
+  "records": [
+    {
+      "id": "arch_cachyos_host",
+      "family": "arch",
+      "evidence_type": "REAL_MACHINE",
+      "proves": [
+        "os-release identifies CachyOS with Arch family metadata",
+        "pacman is available and pacman -Qdt returns exit 1 with empty output",
+        "GNU grep -P accepts the synthetic journal-filter probe",
+        "both common module roots are readable and resolve to the same visible inventory",
+        "boot paths are permission restricted and must remain unknown"
+      ],
+      "cannot_prove": [
+        "Fedora or Debian package behavior",
+        "contents of protected boot or EFI filesystems",
+        "bootloader state or hardware behavior beyond this host"
+      ],
+      "observations": {
+        "os_release_id": "cachyos",
+        "os_release_id_like": ["arch"],
+        "pacman_qdt": "exit_1_empty_means_no_orphans",
+        "gnu_grep_p": "available",
+        "module_tree_entries": 3,
+        "usr_lib_modules": "readable",
+        "lib_modules": "readable_alias",
+        "boot": "permission_denied",
+        "boot_efi": "permission_denied",
+        "efi": "not_visible"
+      }
+    },
+    {
+      "id": "fedora_44_container",
+      "family": "fedora",
+      "evidence_type": "CONTAINER",
+      "proves": [
+        "the official Fedora userspace exposes rpm and dnf",
+        "GNU grep -P accepts the synthetic journal-filter probe",
+        "an empty successful kernel package query is distinct from a failed query"
+      ],
+      "cannot_prove": [
+        "installed kernels on a Fedora host because the base image contains no kernel packages",
+        "the running kernel because uname exposes the shared host kernel",
+        "hardware, boot, EFI, journal, or systemd host semantics"
+      ],
+      "observations": {
+        "release_major": 44,
+        "rpm_available": true,
+        "dnf_available": true,
+        "gnu_grep_p": "available",
+        "kernel_query": "exit_0_empty_base_image",
+        "systemd": "unavailable"
+      }
+    },
+    {
+      "id": "debian_13_container",
+      "family": "debian_ubuntu",
+      "evidence_type": "CONTAINER",
+      "proves": [
+        "the official Debian userspace exposes dpkg-query and apt",
+        "GNU grep -P accepts the synthetic journal-filter probe",
+        "dpkg-query wildcard no-match is a nonzero not-found state, not zero kernels"
+      ],
+      "cannot_prove": [
+        "installed kernels on a Debian host because the base image contains no kernel image packages",
+        "Ubuntu-specific host behavior",
+        "the running kernel, hardware, boot, EFI, journal, or systemd host semantics"
+      ],
+      "observations": {
+        "release": "Debian 13.7 trixie",
+        "dpkg_query_available": true,
+        "apt_available": true,
+        "gnu_grep_p": "available",
+        "kernel_query": "exit_1_no_packages_matched",
+        "systemd": "unavailable"
+      }
+    }
+  ],
+  "distro_detection_cases": [
+    {"id": "cachyos", "id_like": "arch", "profile": "arch"},
+    {"id": "arch", "id_like": "", "profile": "arch"},
+    {"id": "fedora", "id_like": "", "profile": "rhel"},
+    {"id": "debian", "id_like": "", "profile": "debian"},
+    {"id": "ubuntu", "id_like": "debian", "profile": "debian"},
+    {"id": "unknown-linux", "id_like": "", "profile": "generic"}
+  ],
+  "privacy": {
+    "raw_real_reports_included": false,
+    "host_personal_identifiers_included": false,
+    "environment_values_limited_to_statuses_and_counts": true
+  }
+}

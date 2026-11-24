@@ -4,7 +4,7 @@ Linux Diagnostic Engine (LDE) — kompleksowa, tylko do odczytu diagnostyka
 systemu Linux.
 
 Licencja:   MIT
-Wersja produktu:                         0.6.1
+Wersja produktu:                         0.7.0
 Kompatybilność raportów/snapshotów:      2.1.0
 
 Architektura trójfazowego potoku diagnostycznego:
@@ -38,6 +38,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -924,6 +925,15 @@ _HOME_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/home/[A-Za-z0-9._-]+")
 _ROOT_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/root(?=$|[/\s:])")
 _RUNTIME_USER_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/run/user/[0-9]+")
 _MEDIA_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/run/media/[^\n`]+")
+_EFI_ARTIFACT_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9._-])/(?:[^\s/`]+/)*EFI/[^\s`]+")
+_TEMP_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])(?:/tmp|/var/tmp)/[^\s`\"']+")
+_INVOCATION_ID_RE = re.compile(
+    r"(?im)(\bInvocation(?:[\s_-]+ID)?\s*[:=]\s*)([0-9a-f]{32})\b"
+)
+_SERIAL_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:Serial(?: Number)?|Device Serial)\s*[:=]\s*[^\s`]+"
+)
+_NVME_SERIAL_HEADER_RE = re.compile(r"(?i)^\s*Node\s+(?:Generic\s+)?SN\s+Model\b")
 _PS_USER_COLUMN_RE = re.compile(
     r"(?m)^(?P<user>[A-Za-z_][A-Za-z0-9_.-]{0,31})(?P<spacing>\s+)"
     r"(?P<pid>[0-9]+)(?=\s+[0-9.]+\s+[0-9.]+)"
@@ -968,7 +978,57 @@ def _sanitize_text(text: str, *, hostname: str = "") -> str:
     text = _ROOT_PATH_RE.sub("<HOME>", text)
     text = _RUNTIME_USER_PATH_RE.sub("/run/user/<USER>", text)
     text = _MEDIA_PATH_RE.sub("<MEDIA>", text)
+    text = _EFI_ARTIFACT_PATH_RE.sub("<EFI_ARTIFACT>", text)
+    text = _TEMP_PATH_RE.sub(_replace_temp_path, text)
+    text = _INVOCATION_ID_RE.sub(r"\1<INVOCATION_ID>", text)
+    text = _SERIAL_LABEL_RE.sub("Serial: <SERIAL>", text)
+    text = _sanitize_nvme_serial_columns(text)
     return _PS_USER_COLUMN_RE.sub(r"<USER>\g<spacing>\g<pid>", text)
+
+
+def _replace_temp_path(match: re.Match[str]) -> str:
+    path = match.group(0)
+    trailing = ""
+    while path and path[-1] in ".,;:!?)]}":
+        trailing = path[-1] + trailing
+        path = path[:-1]
+    return "<TMP>" + trailing
+
+
+def _sanitize_nvme_serial_columns(text: str) -> str:
+    """Redact the serial column in the standard ``nvme list`` table."""
+    lines = text.splitlines(keepends=True)
+    in_nvme_table = False
+    sanitized_lines = []
+    for line in lines:
+        if _NVME_SERIAL_HEADER_RE.search(line):
+            in_nvme_table = True
+            sanitized_lines.append(line)
+            continue
+        if not in_nvme_table:
+            sanitized_lines.append(line)
+            continue
+        if not line.strip() or line.lstrip().startswith("```"):
+            in_nvme_table = False
+            sanitized_lines.append(line)
+            continue
+        row = re.match(
+            r"^(?P<node>\s*/dev/nvme\S+)(?P<node_spacing>\s+)"
+            r"(?:(?P<generic>/dev/ng\S+)(?P<generic_spacing>\s+))?"
+            r"(?P<serial>\S+)(?P<tail>\s+.*)$",
+            line,
+        )
+        if row:
+            line = (
+                row.group("node")
+                + row.group("node_spacing")
+                + (row.group("generic") or "")
+                + (row.group("generic_spacing") or "")
+                + "<SERIAL>"
+                + row.group("tail")
+            )
+        sanitized_lines.append(line)
+    return "".join(sanitized_lines)
 
 
 _SANITIZE_ID_KEYS = frozenset(
@@ -989,6 +1049,7 @@ _SANITIZE_HOST_KEYS = frozenset({"hostname", "host_name"})
 _SANITIZE_USER_KEYS = frozenset({"username", "user_name"})
 _SANITIZE_HOME_KEYS = frozenset({"home", "home_path"})
 _SANITIZE_SERIAL_KEYS = frozenset({"serial", "serial_number", "device_serial"})
+_SANITIZE_INVOCATION_KEYS = frozenset({"invocation_id", "invocationid"})
 _SANITIZE_LABEL_KEYS = frozenset({"filesystem_label", "volume_label"})
 
 
@@ -1007,6 +1068,8 @@ def _sanitize_json_value(value: Any, *, key: str = "", hostname: str = "") -> An
         ]
     if not isinstance(value, str):
         return value
+    if lowered_key in _SANITIZE_INVOCATION_KEYS:
+        return "<INVOCATION_ID>"
     if lowered_key in _SANITIZE_ID_KEYS or lowered_key.endswith("_ids"):
         return value
     if lowered_key in _SANITIZE_HOST_KEYS:
@@ -1478,51 +1541,208 @@ def _parse_btrfs_device_stats(text: str) -> tuple[dict[str, int], int, bool]:
 def _get_bootable_kernels_from_modules(
     modules_dir: Path | str = Path("/usr/lib/modules"),
 ) -> list[str] | None:
-    """Zwraca listę wersji kernel z /usr/lib/modules/.
+    """Return version directories from one module root, preserving unknown state."""
+    return _get_bootable_kernels_from_module_roots((modules_dir,))
 
-    Zwraca:
-    - List[str]: autorytatywna lista wersji (w tym [] gdy katalog jest czytelny, ale pusty)
-    - None: źródło niedostępne / nieznane (brak uprawnień, brak katalogu, błąd I/O)
+
+def _get_bootable_kernels_from_module_roots(
+    modules_dirs: Iterable[Path | str] = (
+        Path("/usr/lib/modules"),
+        Path("/lib/modules"),
+    ),
+) -> list[str] | None:
+    """Return the union of visible module versions from common Linux roots.
+
+    Merged-/usr aliases are de-duplicated by their resolved directory. Missing
+    candidate roots are not treated as empty inventories; at least one root
+    must be readable. An unreadable existing root makes the combined result
+    incomplete and therefore unknown.
     """
-    mod_path = Path(modules_dir)
-    try:
-        if not mod_path.is_dir():
-            return None
-        versions = []
-        for d in mod_path.iterdir():
+    versions: set[str] = set()
+    seen_roots: set[Path] = set()
+    readable_roots = 0
+    incomplete = False
+    for modules_dir in modules_dirs:
+        path = Path(modules_dir)
+        try:
+            root_stat = path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            incomplete = True
+            continue
+        if not stat.S_ISDIR(root_stat.st_mode):
+            incomplete = True
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            incomplete = True
+            continue
+        if resolved in seen_roots:
+            continue
+        seen_roots.add(resolved)
+        try:
+            entries = list(path.iterdir())
+        except OSError:
+            incomplete = True
+            continue
+        readable_roots += 1
+        for entry in entries:
             try:
-                if d.is_dir() and not d.name.startswith("."):
-                    versions.append(d.name)
+                if stat.S_ISDIR(entry.stat().st_mode) and not entry.name.startswith(
+                    "."
+                ):
+                    versions.add(entry.name)
             except OSError:
-                continue
-        return sorted(versions)
-    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+                incomplete = True
+    if readable_roots == 0 or incomplete:
         return None
+    return sorted(versions)
+
+
+@dataclass(frozen=True)
+class BootSourceInventory:
+    """Visible boot artifacts from one known path, without global absence claims."""
+
+    label: str
+    status: str
+    kernel_images: tuple[str, ...] = ()
+    initramfs_images: tuple[str, ...] = ()
+    efi_artifacts: tuple[str, ...] = ()
+    unified_kernel_images: tuple[str, ...] = ()
+    limitation: str = ""
+
+
+def _inspect_boot_source(
+    source: Path | str, *, label: str | None = None
+) -> BootSourceInventory:
+    """Inspect a visible boot/EFI directory; absent paths remain unavailable.
+
+    This only inventories the named, currently visible directory. It does not
+    establish mount state or prove that another ESP/boot layout is absent.
+    """
+    path = Path(source)
+    source_label = label or str(path)
+    try:
+        if not stat.S_ISDIR(path.stat().st_mode):
+            return BootSourceInventory(
+                source_label,
+                "unavailable",
+                limitation="source is not visible as a directory; contents are unknown",
+            )
+        entries = list(path.iterdir())
+    except FileNotFoundError:
+        return BootSourceInventory(
+            source_label,
+            "unavailable",
+            limitation="source is not visible; contents and mount state are unknown",
+        )
+    except PermissionError:
+        return BootSourceInventory(
+            source_label,
+            "unavailable",
+            limitation="source access was denied; contents are unknown",
+        )
+    except OSError:
+        return BootSourceInventory(
+            source_label,
+            "unavailable",
+            limitation="source could not be read; contents are unknown",
+        )
+
+    kernels: list[str] = []
+    initramfs: list[str] = []
+    efi: list[str] = []
+    uki: list[str] = []
+    nested_incomplete = False
+    image_names = {"vmlinuz", "vmlinux", "image", "bzimage"}
+    for entry in entries:
+        name = entry.name
+        lowered = name.casefold()
+        try:
+            entry_stat = entry.stat()
+            is_file = stat.S_ISREG(entry_stat.st_mode)
+            is_dir = stat.S_ISDIR(entry_stat.st_mode)
+        except OSError:
+            nested_incomplete = True
+            continue
+        if is_file:
+            if lowered in image_names or lowered.startswith(
+                ("vmlinuz-", "image-", "bzimage-", "vmlinux-")
+            ):
+                kernels.append(name)
+            if lowered.startswith(("initramfs", "initrd")):
+                initramfs.append(name)
+            if lowered.endswith(".efi"):
+                efi.append(name)
+        if not is_dir or lowered != "efi":
+            continue
+        try:
+            efi_entries = list(entry.iterdir())
+        except OSError:
+            nested_incomplete = True
+            continue
+        for efi_entry in efi_entries:
+            if efi_entry.name.casefold() not in {"linux", "boot"}:
+                continue
+            try:
+                child_entries = list(efi_entry.iterdir())
+            except OSError:
+                nested_incomplete = True
+                continue
+            for child in child_entries:
+                try:
+                    if (
+                        stat.S_ISREG(child.stat().st_mode)
+                        and child.suffix.casefold() == ".efi"
+                    ):
+                        efi.append(child.name)
+                        if efi_entry.name.casefold() == "linux":
+                            uki.append(child.name)
+                except OSError:
+                    nested_incomplete = True
+
+    return BootSourceInventory(
+        source_label,
+        "partial" if nested_incomplete else "available",
+        tuple(sorted(kernels)),
+        tuple(sorted(initramfs)),
+        tuple(sorted(efi)),
+        tuple(sorted(uki)),
+        limitation=(
+            "one or more visible entries could not be inspected"
+            if nested_incomplete
+            else "visible directory only; mount layout is not inferred"
+        ),
+    )
+
+
+def _inspect_boot_sources(
+    *,
+    boot_dir: Path | str = Path("/boot"),
+    boot_efi_dir: Path | str = Path("/boot/efi"),
+    efi_dir: Path | str = Path("/efi"),
+) -> tuple[BootSourceInventory, ...]:
+    return (
+        _inspect_boot_source(boot_dir, label="/boot"),
+        _inspect_boot_source(boot_efi_dir, label="/boot/efi"),
+        _inspect_boot_source(efi_dir, label="/efi"),
+    )
 
 
 def _get_bootable_kernels_from_boot(
     boot_dir: Path | str = Path("/boot"),
 ) -> list[str] | None:
-    """Zwraca listę nazw kernel dla których istnieje vmlinuz w /boot.
+    """Return visible kernel image names from a readable /boot source.
 
-    Zwraca:
-    - List[str]: autorytatywna lista nazw kerneli (w tym [] gdy /boot jest czytelny, ale brak vmlinuz-*)
-    - None: źródło niedostępne / nieznane (brak uprawnień, brak katalogu, błąd I/O)
+    Only a complete inventory of the named directory can return a list.
+    Missing, protected, or partially readable sources remain unknown.
     """
-    boot_path = Path(boot_dir)
-    try:
-        if not boot_path.is_dir():
-            return None
-        kernels = []
-        for f in boot_path.iterdir():
-            try:
-                if f.name.startswith("vmlinuz-"):
-                    kernels.append(f.name[len("vmlinuz-") :])
-            except OSError:
-                continue
-        return sorted(kernels)
-    except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+    inventory = _inspect_boot_source(boot_dir, label="/boot")
+    if inventory.status != "available":
         return None
+    return sorted(name.removeprefix("vmlinuz-") for name in inventory.kernel_images)
 
 
 def _count_kernel_packages(pkg_list: str) -> tuple[int, int, list[str]]:
@@ -1532,7 +1752,7 @@ def _count_kernel_packages(pkg_list: str) -> tuple[int, int, list[str]]:
 
     Logika:
     - Zachowuje filtrowanie pakietów Arch/CachyOS `linux*`
-    - Z tabeli `dpkg -l` wybiera zainstalowane, wersjonowane linux-image
+    - Z machine-readable `dpkg-query -W` wybiera zainstalowane linux-image
     - Z `rpm -qa kernel*` wybiera unikalne wersje kernel/kernel-core
     """
     bootable = []
@@ -1568,8 +1788,12 @@ def _count_kernel_packages(pkg_list: str) -> tuple[int, int, list[str]]:
                     rpm_bootable[version] = line
             continue
 
-        # Wyodrębnij nazwę pakietu (pierwsze słowo)
+        # RPM package queries include several kernel subpackages. Only
+        # kernel/kernel-core identify installed kernel versions; modules and
+        # extras are not counted as separate kernels.
         pkg_name = line.split()[0] if " " in line else line
+        if not pkg_name.startswith("linux"):
+            continue
         total_packages += 1
         # Sprawdź prefiksy na nazwie pakietu
         filters = DISTRO_CONFIG.get("arch", {}).get("kernel_filter_prefixes", [])
@@ -1581,6 +1805,213 @@ def _count_kernel_packages(pkg_list: str) -> tuple[int, int, list[str]]:
         bootable.append(line)
     bootable.extend(rpm_bootable.values())
     return len(bootable), total_packages, bootable
+
+
+_PCI_ADDRESS_RE = re.compile(
+    r"^(?:(?P<domain>[0-9a-fA-F]{4}):)?"
+    r"(?P<bus>[0-9a-fA-F]{2}):(?P<slot>[0-9a-fA-F]{2})\.(?P<function>[0-7])$"
+)
+_PCI_ID_RE = re.compile(r"\[(?P<vendor>[0-9a-fA-F]{4}):(?P<device>[0-9a-fA-F]{4})\]")
+_LSPCI_HEADER_RE = re.compile(
+    r"^(?P<address>(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:"
+    r"[0-9a-fA-F]{2}\.[0-7])\s+(?P<description>.+)$"
+)
+_GPU_PCI_CLASS_RE = re.compile(
+    r"\[(?:0300|0302|0380)\]",
+)
+_UNKNOWN_GPU_IDS = frozenset({"", "unknown", "unavailable", "n/a", "none"})
+
+
+@dataclass(frozen=True)
+class _PciGpuIdentity:
+    pci_address: str
+    vendor_id: str
+    device_id: str
+
+
+@dataclass(frozen=True)
+class GpuInventoryRecord:
+    """Per-DRM-card identity with explicit field provenance."""
+
+    drm_node: str
+    pci_address: str | None
+    vendor_id: str | None
+    device_id: str | None
+    vendor_source: str
+    device_source: str
+    reconciliation_status: str
+
+
+def _normalize_pci_address(value: str) -> str | None:
+    match = _PCI_ADDRESS_RE.fullmatch(value.strip())
+    if match is None:
+        return None
+    domain = match.group("domain") or "0000"
+    return (
+        f"{domain}:{match.group('bus')}:{match.group('slot')}.{match.group('function')}"
+    ).lower()
+
+
+def _normalize_pci_id(value: str) -> str | None:
+    candidate = value.strip().lower().removeprefix("0x")
+    return candidate if re.fullmatch(r"[0-9a-f]{4}", candidate) else None
+
+
+def _parse_drm_gpu_inventory(text: str) -> tuple[GpuInventoryRecord, ...]:
+    """Parse the bounded TSV emitted by the per-card DRM sysfs collector."""
+    records = []
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4 or not re.fullmatch(r"card[0-9]+", fields[0].strip()):
+            continue
+        drm_node = fields[0].strip()
+        pci_address = _normalize_pci_address(fields[1])
+        vendor_id = (
+            None
+            if fields[2].strip().casefold() in _UNKNOWN_GPU_IDS
+            else _normalize_pci_id(fields[2])
+        )
+        device_id = (
+            None
+            if fields[3].strip().casefold() in _UNKNOWN_GPU_IDS
+            else _normalize_pci_id(fields[3])
+        )
+        complete = vendor_id is not None and device_id is not None
+        records.append(
+            GpuInventoryRecord(
+                drm_node=drm_node,
+                pci_address=pci_address,
+                vendor_id=vendor_id,
+                device_id=device_id,
+                vendor_source="DRM" if vendor_id is not None else "unknown",
+                device_source="DRM" if device_id is not None else "unknown",
+                reconciliation_status="drm_complete" if complete else "unknown",
+            )
+        )
+    return tuple(records)
+
+
+def _parse_lspci_gpu_inventory(text: str) -> dict[str, list[_PciGpuIdentity]]:
+    """Parse only identified PCI display-class devices from ``lspci -nnk``."""
+    devices: dict[str, list[_PciGpuIdentity]] = {}
+    for line in text.splitlines():
+        header = _LSPCI_HEADER_RE.match(line)
+        if header is None:
+            continue
+        description = header.group("description")
+        if not _GPU_PCI_CLASS_RE.search(description):
+            continue
+        pci_address = _normalize_pci_address(header.group("address"))
+        pci_ids = tuple(_PCI_ID_RE.finditer(description))
+        if pci_address is None or not pci_ids:
+            continue
+        ids = pci_ids[-1]
+        identity = _PciGpuIdentity(
+            pci_address=pci_address,
+            vendor_id=ids.group("vendor").lower(),
+            device_id=ids.group("device").lower(),
+        )
+        devices.setdefault(pci_address, []).append(identity)
+    return devices
+
+
+def _reconcile_gpu_inventory(
+    drm_output: str,
+    lspci_output: str,
+    *,
+    drm_available: bool = True,
+    lspci_available: bool = True,
+) -> tuple[GpuInventoryRecord, ...]:
+    """Fill only missing DRM PCI IDs using one compatible same-address record."""
+    if not drm_available:
+        return ()
+    drm_records = _parse_drm_gpu_inventory(drm_output)
+    pci_records = _parse_lspci_gpu_inventory(lspci_output) if lspci_available else {}
+    reconciled = []
+    for record in drm_records:
+        matches = pci_records.get(record.pci_address or "", [])
+        if len(matches) > 1:
+            reconciled.append(
+                _replace_gpu_inventory_record(record, reconciliation_status="conflict")
+            )
+            continue
+        if not matches:
+            reconciled.append(
+                _replace_gpu_inventory_record(
+                    record,
+                    reconciliation_status=(
+                        "drm_complete"
+                        if record.vendor_id is not None and record.device_id is not None
+                        else "unknown"
+                    ),
+                )
+            )
+            continue
+
+        pci = matches[0]
+        contradiction = (
+            record.vendor_id is not None and record.vendor_id != pci.vendor_id
+        ) or (record.device_id is not None and record.device_id != pci.device_id)
+        if contradiction:
+            reconciled.append(
+                _replace_gpu_inventory_record(record, reconciliation_status="conflict")
+            )
+            continue
+
+        vendor_missing = record.vendor_id is None
+        device_missing = record.device_id is None
+        reconciled.append(
+            GpuInventoryRecord(
+                drm_node=record.drm_node,
+                pci_address=record.pci_address,
+                vendor_id=pci.vendor_id if vendor_missing else record.vendor_id,
+                device_id=pci.device_id if device_missing else record.device_id,
+                vendor_source=(
+                    "lspci -nnk" if vendor_missing else record.vendor_source
+                ),
+                device_source=(
+                    "lspci -nnk" if device_missing else record.device_source
+                ),
+                reconciliation_status=(
+                    "lspci_fallback"
+                    if vendor_missing or device_missing
+                    else "drm_complete"
+                ),
+            )
+        )
+    return tuple(reconciled)
+
+
+def _replace_gpu_inventory_record(
+    record: GpuInventoryRecord, *, reconciliation_status: str
+) -> GpuInventoryRecord:
+    return GpuInventoryRecord(
+        drm_node=record.drm_node,
+        pci_address=record.pci_address,
+        vendor_id=record.vendor_id,
+        device_id=record.device_id,
+        vendor_source=record.vendor_source,
+        device_source=record.device_source,
+        reconciliation_status=reconciliation_status,
+    )
+
+
+_DRM_GPU_INVENTORY_SCRIPT = r"""
+shopt -s nullglob
+for card_path in /sys/class/drm/card[0-9]*; do
+    [[ -d "$card_path/device" ]] || continue
+    card_name=${card_path##*/}
+    [[ "$card_name" =~ ^card[0-9]+$ ]] || continue
+    device_path=$(readlink -f -- "$card_path/device" 2>/dev/null) || device_path=
+    pci_address=${device_path##*/}
+    if [[ ! "$pci_address" =~ ^([[:xdigit:]]{4}:)?[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]]; then
+        pci_address=unknown
+    fi
+    vendor_id=$(cat "$card_path/device/vendor" 2>/dev/null) || vendor_id=unknown
+    device_id=$(cat "$card_path/device/device" 2>/dev/null) || device_id=unknown
+    printf '%s\t%s\t%s\t%s\n' "$card_name" "$pci_address" "$vendor_id" "$device_id"
+done
+"""
 
 
 def _parse_storage_usage(df_h_output: str) -> list[tuple[str, int]]:
@@ -3098,6 +3529,61 @@ WirePlumberSegfaultRule = _diagnostic_rules.WirePlumberSegfaultRule
 build_default_rule_engine = _diagnostic_rules.build_default_rule_engine
 
 
+def _parse_os_release(text: str) -> dict[str, str] | None:
+    """Parse os-release assignments without evaluating shell syntax."""
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in line:
+            return None
+        key, raw_value = line.split("=", 1)
+        if not re.fullmatch(r"[A-Z0-9_]+", key):
+            return None
+        try:
+            parsed = shlex.split(raw_value, comments=True, posix=True)
+        except ValueError:
+            return None
+        values[key] = " ".join(parsed)
+    return values
+
+
+def _distro_profile_from_os_release(
+    os_info: dict[str, str] | None,
+) -> tuple[str, str]:
+    """Select a package profile from exact os-release identifiers/tokens."""
+    if os_info is None:
+        return "unknown", "generic"
+    distro_id = os_info.get("ID", "").strip().casefold() or "unknown"
+    id_like = set(os_info.get("ID_LIKE", "").casefold().split())
+    if distro_id in {"arch", "cachyos", "manjaro", "endeavouros"} or "arch" in id_like:
+        return distro_id, "arch"
+    if distro_id in {
+        "fedora",
+        "rhel",
+        "centos",
+        "almalinux",
+        "rocky",
+    } or id_like.intersection({"fedora", "rhel"}):
+        return distro_id, "rhel"
+    if distro_id in {"debian", "ubuntu", "linuxmint", "pop"} or "debian" in id_like:
+        return distro_id, "debian"
+    return distro_id, "generic"
+
+
+def _count_installed_packages(text: str, profile: str) -> int:
+    """Count only installed dpkg records; other providers emit installed rows."""
+    if profile != "debian":
+        return sum(bool(line.strip()) for line in text.splitlines())
+    count = 0
+    for line in text.splitlines():
+        match = re.match(r"^(\S{2})\s+(\S+)\s+(\S+)", line.strip())
+        if match is not None and match.group(1)[1] == "i":
+            count += 1
+    return count
+
+
 class SysCheckEngine:
     """Główna klasa wykonująca diagnostykę i budująca raport."""
 
@@ -3122,7 +3608,7 @@ class SysCheckEngine:
         self.os_name: str = ""
         self.desktop_environment: str = ""
         self.session_type: str = ""
-        self.distro_config: dict = DISTRO_CONFIG.get("arch", DISTRO_CONFIG["arch"])
+        self.distro_config: dict = DISTRO_CONFIG["generic"]
         self.report_lines: list[str] = []
         self.findings: list[Finding] = []
         self.observations: list[Observation] = []  # Stage 2: OBS
@@ -3133,6 +3619,7 @@ class SysCheckEngine:
         self.restrictions: list[str] = []
         self.commands_used: list[str] = []
         self._script_pids: list[str] = []
+        self._lspci_result: CmdResult | None = None
 
     # ── Logowanie ────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -3341,47 +3828,34 @@ class SysCheckEngine:
 
     # ── Detekcja dystrybucji ─────────────────────────────────────
     def detect_distro(self) -> None:
-        """Wykrywa dystrybucję i wybiera odpowiednie komendy pakietów."""
+        """Select a package profile, degrading safely on unknown metadata."""
         result = self.cmd(["cat", "/etc/os-release"])
-        osr = result.stdout
-        id_like = ""
-        distro_id = ""
-
-        if osr:
-            for line in osr.split("\n"):
-                if line.startswith("ID_LIKE="):
-                    id_like = line.split("=", 1)[1].strip('"').lower()
-                elif line.startswith("ID="):
-                    distro_id = line.split("=", 1)[1].strip('"').lower()
-
-        self.distro_id = distro_id or "unknown"
-
-        if "arch" in id_like or distro_id in (
-            "arch",
-            "cachyos",
-            "manjaro",
-            "endeavouros",
-        ):
-            self.distro_config = DISTRO_CONFIG["arch"]
-        elif "debian" in id_like or distro_id in (
-            "debian",
-            "ubuntu",
-            "linuxmint",
-            "pop",
-        ):
-            self.distro_config = DISTRO_CONFIG["debian"]
-        elif (
-            "rhel" in id_like
-            or "fedora" in id_like
-            or distro_id in ("fedora", "rhel", "centos", "almalinux", "rocky")
-        ):
-            self.distro_config = DISTRO_CONFIG["rhel"]
-        else:
-            self.distro_config = DISTRO_CONFIG["arch"]
+        if not result.is_ok() or result.truncated:
+            self.distro_id = "unknown"
+            self.distro_config = DISTRO_CONFIG["generic"]
+            self._record_source_status(result, "/etc/os-release")
             self.restrictions.append(
-                f"Dystrybucja '{distro_id or 'unknown'}' nie została rozpoznana — "
-                f"używam komend dla Arch Linux. Raport dotyczący pakietów może być niekompletny."
+                "Distro metadata from /etc/os-release is unavailable or incomplete; "
+                "package-manager selection is unknown."
             )
+            return
+
+        os_info = _parse_os_release(result.stdout)
+        distro_id, profile = _distro_profile_from_os_release(os_info)
+        self.distro_id = distro_id
+        self.distro_config = DISTRO_CONFIG[profile]
+        if profile == "generic":
+            if os_info is None or distro_id == "unknown":
+                message = (
+                    "/etc/os-release is missing, malformed, or has no usable ID; "
+                    "package-manager selection is unknown."
+                )
+            else:
+                message = (
+                    f"Distribution ID '{distro_id}' is not recognized; "
+                    "package-manager commands are not configured."
+                )
+            self.restrictions.append(message)
 
     # ── Raport: podstawowe dane ──────────────────────────────────
     def collect_base_info(self) -> None:
@@ -3466,7 +3940,7 @@ class SysCheckEngine:
         self.report_lines.append(f"- **Niri:** {niri_ver}\n\n")
 
         # Zainstalowane kernele (z /usr/lib/modules i /boot)
-        bootable_versions = _get_bootable_kernels_from_modules()
+        bootable_versions = _get_bootable_kernels_from_module_roots()
         bootable_kernels = _get_bootable_kernels_from_boot()
         self.report_lines.append(heading(3, "Zainstalowane moduły kernel (wersje)"))
         self.report_lines.append(codeblock(modules_list))
@@ -3489,6 +3963,34 @@ class SysCheckEngine:
             )
             if restriction not in self.restrictions:
                 self.restrictions.append(restriction)
+
+        self.report_lines.append(heading(3, "Widoczne źródła boot i EFI"))
+        for inventory in _inspect_boot_sources():
+            if inventory.status == "unavailable":
+                self.report_lines.append(
+                    f"- **{inventory.label}:** unknown / unavailable "
+                    f"({inventory.limitation}); no absence inferred.\n"
+                )
+                limitation = (
+                    f"Boot source {inventory.label} is unavailable; its contents "
+                    "and mount state are unknown."
+                )
+            else:
+                self.report_lines.append(
+                    f"- **{inventory.label}:** status={inventory.status}; "
+                    f"visible kernel images={len(inventory.kernel_images)}, "
+                    f"initramfs images={len(inventory.initramfs_images)}, "
+                    f"EFI artifacts={len(inventory.efi_artifacts)}, "
+                    f"UKIs under EFI/Linux={len(inventory.unified_kernel_images)}.\n"
+                )
+                limitation = (
+                    f"Boot source {inventory.label} covers visible entries only; "
+                    "mount layout and unobserved ESP locations are not inferred."
+                )
+                if inventory.status == "partial":
+                    limitation += " Some visible entries could not be inspected."
+            if limitation not in self.restrictions:
+                self.restrictions.append(limitation)
 
         if bootable_kernels is not None:
             self.report_lines.append(f"**Obrazy w /boot:** {len(bootable_kernels)}\n")
@@ -3975,7 +4477,7 @@ class SysCheckEngine:
                 TIMEOUT_LONG,
                 False,
             ),
-            "lspci": (["lspci", "-k"], TIMEOUT_SHORT, False),
+            "lspci": (["lspci", "-nnk"], TIMEOUT_SHORT, False),
             "lsusb": (["lsusb"], TIMEOUT_SHORT, False),
         }
         r = self._parallel_cmd(tasks_cmd)
@@ -4035,6 +4537,7 @@ class SysCheckEngine:
         )
         iommu_fault_result = r.get("iommu_fault") or platform_device_reliability_result
         lspci_result = r["lspci"]
+        self._lspci_result = lspci_result
         lsusb_result = r["lsusb"]
 
         self.report_lines.append(heading(2, "4. Kernel, sprzęt i sterowniki"))
@@ -4071,7 +4574,7 @@ class SysCheckEngine:
             self.restrictions.append(
                 "dmesg_restrict=1 — bezpośredni dmesg wymaga sudo."
             )
-        self.report_lines.append(heading(3, "lspci -k"))
+        self.report_lines.append(heading(3, "lspci -nnk"))
         self.report_lines.append(
             codeblock(
                 safestr(lspci_result.to_fallback_text(), TRUNCATE_LSPCI, full=self.full)
@@ -5027,43 +5530,119 @@ class SysCheckEngine:
         self.log_section("Pakiety i spójność")
 
         cfg = self.distro_config
-        tasks_cmd = {
-            "orphans": (cfg["pkg_list_orphans"], cfg["pkg_timeout"], False),
-            "foreign": (cfg["pkg_list_foreign"], cfg["pkg_timeout"], False),
-            "kernels": (cfg["pkg_query_kernels"], cfg["pkg_timeout"], False),
+        profile = next(
+            (
+                key
+                for key in ("arch", "debian", "rhel", "generic")
+                if cfg.get("name") == DISTRO_CONFIG[key]["name"]
+            ),
+            "generic",
+        )
+        query_specs = {
+            "installed": cfg.get("pkg_query_installed"),
+            "orphans": cfg.get("pkg_list_orphans"),
+            "foreign": cfg.get("pkg_list_foreign"),
+            "kernels": cfg.get("pkg_query_kernels"),
         }
-        r = self._parallel_cmd(tasks_cmd)
+        tasks_cmd = {
+            name: (command, cfg["pkg_timeout"], False)
+            for name, command in query_specs.items()
+            if command is not None and not (profile == "arch" and name == "kernels")
+        }
+        r = self._parallel_cmd(tasks_cmd) if tasks_cmd else {}
 
         for name, result in r.items():
             self._record_truncated_capture(result, f"package command {name}")
 
-        orphans_result = r["orphans"]
-        foreign_result = r["foreign"]
-        kernels_result = r["kernels"]
-
         self.report_lines.append(heading(2, "6. Pakiety i spójność systemu"))
-        self.report_lines.append(heading(3, "Pakiety osierocone"))
-
-        # Obsługa pacman -Qdt: rc=1 z pustym stdout oznacza "brak pakietów osieroconych"
-        if orphans_result.execution_status == "empty_ok" or (
-            orphans_result.return_code == 1
-            and not orphans_result.stdout
-            and not orphans_result.stderr
-        ):
-            self.report_lines.append("(brak pakietów osieroconych)\n\n")
+        installed_result = r.get("installed")
+        self.report_lines.append(heading(3, "Installed package inventory"))
+        if installed_result is None:
+            self.report_lines.append(
+                "Package inventory provider is not configured for this profile; "
+                "installed package count is unknown.\n\n"
+            )
             self.restrictions.append(
-                "Pacman -Qdt zwrócił rc=1 z pustym wyjściem — "
-                "oznacza to brak pakietów osieroconych, nie błąd polecenia."
+                "Installed package inventory has no configured provider; "
+                "no empty or healthy package state was inferred."
+            )
+        elif (
+            installed_result.execution_status in {"ok", "empty_ok"}
+            and not installed_result.truncated
+        ):
+            installed_count = _count_installed_packages(
+                installed_result.stdout, profile
+            )
+            self.report_lines.append(
+                f"Authoritative installed package rows: **{installed_count}**\n\n"
+            )
+        else:
+            self.report_lines.append(codeblock(installed_result.to_fallback_text()))
+        self._record_source_status(installed_result, "installed package inventory")
+
+        self.report_lines.append(heading(3, "Orphan package classification"))
+        orphans_result = r.get("orphans")
+        if orphans_result is None:
+            self.report_lines.append(
+                "Not classified: no equivalent read-only provider is configured.\n\n"
+            )
+            self.restrictions.append(
+                "Orphan package classification is unsupported for this profile; "
+                "it is not reported as empty."
+            )
+        elif profile == "arch" and (
+            orphans_result.execution_status == "empty_ok"
+            or (
+                orphans_result.return_code == 1
+                and not orphans_result.stdout
+                and not orphans_result.stderr
+            )
+        ):
+            self.report_lines.append("(no orphan packages reported)\n\n")
+            self.restrictions.append(
+                "pacman -Qdt returned rc=1 with empty output; this provider "
+                "defines that result as no orphan packages."
+            )
+        elif orphans_result.is_ok() and not orphans_result.truncated:
+            self.report_lines.append(
+                codeblock(orphans_result.stdout or "(no orphan packages reported)")
             )
         else:
             self.report_lines.append(codeblock(orphans_result.to_fallback_text()))
+        self._record_source_status(
+            orphans_result,
+            "orphan package query",
+            authority_state=(
+                "SUCCESS_AUTHORITATIVE"
+                if profile == "arch"
+                and orphans_result is not None
+                and orphans_result.return_code == 1
+                and not orphans_result.stdout
+                and not orphans_result.stderr
+                else None
+            ),
+        )
 
-        self.report_lines.append(heading(3, "Pakiety AUR / obce"))
-        if foreign_result.is_ok() or foreign_result.execution_status == "empty_ok":
-            aur_count = len(
-                [line for line in foreign_result.stdout.split("\n") if line.strip()]
+        self.report_lines.append(heading(3, "Foreign / AUR package classification"))
+        foreign_result = r.get("foreign")
+        if foreign_result is None:
+            self.report_lines.append(
+                "Not classified: no equivalent read-only provider is configured.\n\n"
             )
-            self.report_lines.append(f"Liczba pakietów obcych: **{aur_count}**\n\n")
+            self.restrictions.append(
+                "Foreign/AUR package classification is unsupported for this profile; "
+                "it is not reported as empty."
+            )
+        elif (
+            foreign_result.execution_status in {"ok", "empty_ok"}
+            and not foreign_result.truncated
+        ):
+            foreign_count = sum(
+                bool(line.strip()) for line in foreign_result.stdout.splitlines()
+            )
+            self.report_lines.append(
+                f"Authoritative provider rows: **{foreign_count}**\n\n"
+            )
             self.report_lines.append(
                 codeblock(
                     safestr(
@@ -5073,87 +5652,76 @@ class SysCheckEngine:
             )
         else:
             self.report_lines.append(codeblock(foreign_result.to_fallback_text()))
+        self._record_source_status(foreign_result, "foreign package query")
 
         self.report_lines.append(heading(3, "Zainstalowane kernele"))
-        if kernels_result.is_ok():
-            self.report_lines.append(codeblock(kernels_result.stdout))
-
-            # Poprawne zliczanie kernel - bez nagłówków i firmware
-            bootable_count, total_count, bootable_list = _count_kernel_packages(
-                kernels_result.stdout
-            )
-
-            # Dodatkowa informacja z /usr/lib/modules i /boot
-            modules_versions = _get_bootable_kernels_from_modules()
-            boot_images = _get_bootable_kernels_from_boot()
-
+        modules_versions = _get_bootable_kernels_from_module_roots()
+        boot_images = _get_bootable_kernels_from_boot()
+        kernels_result = r.get(
+            "kernels", r.get("installed") if profile == "arch" else None
+        )
+        if modules_versions is None:
             self.report_lines.append(
-                f"**Bootowalne pakiety kernel:** {bootable_count}\n"
+                "**Module tree inventory:** unknown / unavailable; no zero inferred.\n"
             )
-            if modules_versions is not None:
-                self.report_lines.append(
-                    f"**Rzeczywiste wersje w /usr/lib/modules:** {len(modules_versions)}\n"
-                )
-            else:
-                self.report_lines.append(
-                    "**Rzeczywiste wersje w /usr/lib/modules:** (niedostępne — brak uprawnień lub katalogu)\n"
-                )
-                restriction = (
-                    "Katalog /usr/lib/modules jest niedostępny "
-                    "(permission denied lub brak katalogu); "
-                    "wersje modułów kernela są nieznane (unknown / unavailable)."
-                )
-                if restriction not in self.restrictions:
-                    self.restrictions.append(restriction)
+            self.restrictions.append(
+                "Module-tree inventory from /usr/lib/modules and /lib/modules "
+                "is unavailable or incomplete."
+            )
+        else:
+            self.report_lines.append(
+                f"**Visible module-tree versions:** {len(modules_versions)}\n"
+            )
+        if boot_images is None:
+            self.report_lines.append(
+                "**/boot kernel image inventory:** unknown / unavailable; no zero inferred.\n"
+            )
+            self.restrictions.append(
+                "Visible /boot kernel image inventory is unavailable; no absent "
+                "image or boot layout was inferred."
+            )
+        else:
+            self.report_lines.append(
+                f"**Visible /boot kernel images:** {len(boot_images)}\n"
+            )
 
-            if boot_images is not None:
+        if kernels_result is None:
+            self.report_lines.append(
+                "Kernel package inventory provider is not configured; "
+                "installed kernel packages are unknown.\n"
+            )
+            self.restrictions.append(
+                "Kernel package inventory has no configured provider; "
+                "module and boot evidence remain independent."
+            )
+        elif (
+            kernels_result.execution_status in {"ok", "empty_ok"}
+            and not kernels_result.truncated
+        ):
+            kernel_output = kernels_result.stdout
+            if profile == "arch":
+                kernel_output = "\n".join(
+                    line
+                    for line in kernel_output.splitlines()
+                    if (
+                        line.strip().split(maxsplit=1)
+                        and line.strip().split(maxsplit=1)[0].startswith("linux")
+                    )
+                )
+            self.report_lines.append(
+                codeblock(kernel_output or "(no matching installed kernel packages)")
+            )
+            bootable_count, _total_count, bootable_list = _count_kernel_packages(
+                kernel_output
+            )
+            self.report_lines.append(
+                f"**Bootable kernel package records:** {bootable_count}\n"
+            )
+            if bootable_list:
                 self.report_lines.append(
-                    f"**Obrazy kernel w /boot:** {len(boot_images)}\n"
+                    f"**Reported installed kernel packages:** {', '.join(bootable_list)}\n\n"
                 )
-            else:
-                self.report_lines.append(
-                    "**Obrazy kernel w /boot:** (niedostępne — brak uprawnień lub katalogu)\n"
-                )
-                restriction = (
-                    "Katalog /boot jest niedostępny bez uprawnień roota "
-                    "(PermissionError: permission denied) lub nie istnieje; "
-                    "obrazy kernela w /boot są niedostępne (unavailable / unknown)."
-                )
-                if restriction not in self.restrictions:
-                    self.restrictions.append(restriction)
-
-            if len(bootable_list) > 0:
-                self.report_lines.append(
-                    f"**Zainstalowane:** {', '.join(bootable_list)}\n\n"
-                )
-
             if bootable_count > MAX_RECOMMENDED_KERNELS:
-                # Określ aktualny kernel
-                current = self.active_kernel
-                _removable = [
-                    k
-                    for k in bootable_list
-                    if k.split(" ")[0] != current
-                    and not current.startswith(k.split(" ")[0])
-                ]
-
-                _detail = (
-                    f"Aktualnie uruchomiony kernel: {current}\n"
-                    f"Zainstalowane pakiety kernel ({bootable_count}): "
-                    f"{', '.join(bootable_list)}\n"
-                    f"Zalecane jest zachowanie maksymalnie {MAX_RECOMMENDED_KERNELS} "
-                    f"kernel (aktualny + jeden zapasowy)."
-                )
-
-                _remediation = (
-                    "Aby usunąć nieużywane kernele, sprawdź najpierw który jest aktywny:\n"
-                    "1. `uname -r` — sprawdź aktywny kernel\n"
-                    "2. `pacman -Q linux-cachyos linux-lts` — lista kernel\n"
-                    "3. Usuń nieużywane: `sudo pacman -Rs <nieużywany-kernel>`\n\n"
-                    "UWAGA: Nie usuwaj kernela na którym aktualnie pracujesz! "
-                    "Zawsze zostaw co najmniej jeden zapasowy kernel."
-                )
-
                 self.raw_diagnostics.append(
                     _raw_from_result(
                         kernels_result,
@@ -5174,13 +5742,8 @@ class SysCheckEngine:
         self.log_section("Warstwa graficzna")
 
         tasks_cmd = {
-            "drm_vendor": (
-                ["bash", "-c", "cat /sys/class/drm/card*/device/vendor 2>/dev/null"],
-                TIMEOUT_SHORT,
-                False,
-            ),
-            "drm_device": (
-                ["bash", "-c", "cat /sys/class/drm/card*/device/device 2>/dev/null"],
+            "drm_inventory": (
+                ["bash", "-c", _DRM_GPU_INVENTORY_SCRIPT],
                 TIMEOUT_SHORT,
                 False,
             ),
@@ -5196,20 +5759,56 @@ class SysCheckEngine:
                 False,
             ),
         }
+        if self._lspci_result is None:
+            tasks_cmd["lspci"] = (["lspci", "-nnk"], TIMEOUT_SHORT, False)
         r = self._parallel_cmd(tasks_cmd)
+        drm_inventory_result = r["drm_inventory"]
+        lspci_result = self._lspci_result or r["lspci"]
 
         self.report_lines.append(heading(2, "7. Warstwa graficzna"))
         self.report_lines.append(heading(3, "DRM / GPU"))
-        self.report_lines.append(f"- Vendor: `{r['drm_vendor'].to_fallback_text()}`\n")
-
-        drm_device = r["drm_device"]
-        if drm_device.execution_status == "error" and drm_device.return_code == 1:
-            # rc=1 dla cat gdy plik nie istnieje lub brak dostępu
+        self.report_lines.append("- GPU inventory by DRM card:\n")
+        if not drm_inventory_result.is_ok() or drm_inventory_result.truncated:
             self.report_lines.append(
-                "- Device: `(brak dostępu lub nieznane urządzenie)`\n"
+                f"  - Identity unknown: `{drm_inventory_result.to_fallback_text()}`\n"
             )
         else:
-            self.report_lines.append(f"- Device: `{drm_device.to_fallback_text()}`\n")
+            gpu_records = _reconcile_gpu_inventory(
+                drm_inventory_result.stdout,
+                lspci_result.stdout,
+                drm_available=True,
+                lspci_available=lspci_result.is_ok() and not lspci_result.truncated,
+            )
+            if not gpu_records:
+                self.report_lines.append("  - (no DRM GPU devices found)\n")
+            for gpu in gpu_records:
+                pci_address = (
+                    f" (`{gpu.pci_address}`)" if gpu.pci_address is not None else ""
+                )
+                vendor = (
+                    f"`0x{gpu.vendor_id}` ({gpu.vendor_source})"
+                    if gpu.vendor_id is not None
+                    else "unknown"
+                )
+                device = (
+                    f"`0x{gpu.device_id}` ({gpu.device_source}"
+                    + (
+                        f" at matching PCI address {gpu.pci_address})"
+                        if gpu.device_source == "lspci -nnk"
+                        else ")"
+                    )
+                    if gpu.device_id is not None
+                    else "unknown"
+                )
+                note = ""
+                if gpu.reconciliation_status == "unknown":
+                    note = "; no compatible lspci identity available"
+                elif gpu.reconciliation_status == "conflict":
+                    note = "; lspci contradiction/ambiguity, DRM identity retained"
+                self.report_lines.append(
+                    f"  - `{gpu.drm_node}`{pci_address}: vendor {vendor}; "
+                    f"device {device}{note}.\n"
+                )
 
         self.report_lines.append(
             f"- DRM nodes:\n{codeblock(r['drm_ls'].to_fallback_text())}"

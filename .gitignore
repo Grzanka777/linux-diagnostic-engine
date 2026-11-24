@@ -29,6 +29,9 @@ venv/
 # Agent prompts
 .agent-work/prompts/
 
+# VM evidence artifacts
+.agent-work/vm-evidence-*/
+
 # Historical superseded reviews
 .agent-work/reviews/iteration-17-*.md
 .agent-work/reviews/iteration-18-*.md
