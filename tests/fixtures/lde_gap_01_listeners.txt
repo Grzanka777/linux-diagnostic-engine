@@ -1,0 +1,22 @@
+LISTEN 0 10 127.0.0.1:8080 *:*
+LISTEN 0 511 0.0.0.0:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 100.64.1.2%test0:8080 *:*
+LISTEN 0 64 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 2048 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 128 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 127.0.0.54:8080 *:*
+LISTEN 0 4096 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 16 100.64.1.2:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 128 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 127.0.0.53%test0:8080 *:*
+LISTEN 0 511 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 0.0.0.0:5355 *:*
+LISTEN 0 128 0.0.0.0:8080 *:*
+LISTEN 0 511 0.0.0.0:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 511 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 128 127.0.0.1:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 [::]:5355 *:*
+LISTEN 0 50 *:8080 *:* users:(("synthetic",pid=100,fd=9))
+LISTEN 0 4096 [2001:db8::1]%test0:8080 *:*
+LISTEN 0 128 [::]:8080 *:*

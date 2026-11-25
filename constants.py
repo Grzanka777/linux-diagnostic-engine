@@ -9,7 +9,7 @@ from pathlib import Path
 # ── Metadane produktu i kompatybilności ──────────────────────────
 PRODUCT_NAME = "Linux Diagnostic Engine"
 PRODUCT_SHORT_NAME = "LDE"
-PRODUCT_VERSION = "0.7.1"
+PRODUCT_VERSION = "0.8.0"
 
 # Legacy report/snapshot compatibility metadata; this is not the product
 # release version.  SCRIPT_VERSION remains as a compatibility alias for

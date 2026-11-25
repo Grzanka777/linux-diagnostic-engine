@@ -411,11 +411,94 @@ def derive_confidence(
     return "Likely"
 
 
+def _listener_bind_scope(endpoint: str) -> str:
+    address, separator, port = endpoint.rpartition(":")
+    if not separator or not re.fullmatch(r"[0-9]{1,5}", port) or int(port) > 65535:
+        return "UNKNOWN"
+
+    match = re.fullmatch(
+        r"(?:\[([^\[\]%]+)(%[^\[\]%\s]+)?\]|([^\[\]%]+))(%[^\[\]%\s]+)?",
+        address,
+    )
+    if match is None or (match[2] and match[4]):
+        return "UNKNOWN"
+    literal = match[1] or match[3]
+    if literal == "*" and not (match[1] or match[4]):
+        return "WILDCARD"
+
+    try:
+        ip = ipaddress.ip_address(literal)
+    except ValueError:
+        return "UNKNOWN"
+    if match[1] and ip.version != 6:
+        return "UNKNOWN"
+    # Keep IPv4-mapped IPv6 literals in their reported address family.
+    if int(ip) == 0:
+        return "WILDCARD"
+    if (ip.version == 4 and ip.is_loopback) or (ip.version == 6 and int(ip) == 1):
+        return "LOOPBACK"
+    return "SPECIFIC_ADDRESS"
+
+
+def _firewall_probe_state(provider: str, result: CmdResult) -> tuple[str, str]:
+    """Return the scoped state and the reason for any unknown result."""
+    output = result.stdout.strip()
+    if result.truncated:
+        return "unknown", "TRUNCATED_OUTPUT"
+    if result.execution_status in ("not_found", "timeout", "permission_denied"):
+        return "unknown", result.execution_status.upper()
+    if re.search(
+        r"permission denied|operation not permitted|need to be root|access denied",
+        result.stderr,
+        re.IGNORECASE,
+    ):
+        return "unknown", "PERMISSION_DENIED"
+    if result.stderr.strip():
+        return "unknown", "COMMAND_DIAGNOSTIC"
+
+    if provider == "firewalld":
+        states = set(output.splitlines())
+        if {"active", "inactive"} <= states:
+            return "unknown", "CONFLICTING_OUTPUT"
+        if (
+            result.execution_status == "error"
+            and result.return_code == 3
+            and output == "inactive"
+        ):
+            return "inactive", ""
+        if result.return_code == 4 and output == "unknown":
+            return "unknown", "UNKNOWN_UNIT"
+
+    if not result.is_ok() or result.return_code != 0:
+        return "unknown", "FAILED_EXECUTION"
+
+    if provider == "firewalld" and output == "active":
+        return "active", ""
+    if provider == "ufw":
+        states = re.findall(r"^Status:[ \t]*(.*)$", output, flags=re.MULTILINE)
+        if len(set(states)) > 1:
+            return "unknown", "CONFLICTING_OUTPUT"
+        if states == ["active"] and output.splitlines()[0] == "Status: active":
+            return "active", ""
+        if output == "Status: inactive":
+            return "inactive", ""
+    if provider == "nftables":
+        if not output:
+            return "empty", ""
+        if re.search(
+            r"^table (?:ip6?|inet|arp|bridge|netdev) .+ \{", output
+        ) and output.endswith("}"):
+            return "table", ""
+
+    return "unknown", "UNRECOGNIZED_OUTPUT" if output else "EMPTY_OUTPUT"
+
+
 def run_cmd(
     cmd: list[str],
     timeout: int = TIMEOUT_SHORT,
     env: dict[str, str] | None = None,
     optional_dependency: bool = False,
+    max_bytes: int = TRUNCATE_NORMAL,
 ) -> CmdResult:
     """
     Uruchamia polecenie. Zwraca CmdResult ze szczegółowym statusem.
@@ -435,8 +518,8 @@ def run_cmd(
             chunk = stream.read(65536)
             if not chunk:
                 break
-            if retained < TRUNCATE_NORMAL:
-                keep = chunk[: TRUNCATE_NORMAL - retained]
+            if retained < max_bytes:
+                keep = chunk[: max_bytes - retained]
                 chunks.append(keep)
                 retained += len(keep)
                 if len(keep) < len(chunk):
@@ -1401,6 +1484,344 @@ def _deduplicate_journal_lines(text: str) -> str:
     return "\n".join(unique_lines)
 
 
+_JOURNAL_MONTHS = {
+    "jan": 1,
+    "sty": 1,
+    "feb": 2,
+    "lut": 2,
+    "mar": 3,
+    "apr": 4,
+    "kwi": 4,
+    "may": 5,
+    "maj": 5,
+    "jun": 6,
+    "cze": 6,
+    "jul": 7,
+    "lip": 7,
+    "aug": 8,
+    "sie": 8,
+    "sep": 9,
+    "wrz": 9,
+    "oct": 10,
+    "paź": 10,
+    "paz": 10,
+    "nov": 11,
+    "lis": 11,
+    "dec": 12,
+    "gru": 12,
+}
+_ISO_JOURNAL_PREFIX_RE = re.compile(
+    r"^(?P<ts>(?P<yr>\d{4})-(?P<mo>\d{2})-(?P<dy>\d{2})[T ]"
+    r"(?P<hr>\d{2}):(?P<mn>\d{2}):(?P<sc>\d{2})(?:\.(?P<us>\d{1,6})\d*)?"
+    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?)\s+(?P<after_ts>.+)$"
+)
+_SYSLOG_JOURNAL_PREFIX_RE = re.compile(
+    r"^(?P<ts>(?P<mon>[A-Za-ząćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,8})\s+(?P<dy>\d{1,2})\s+"
+    r"(?P<hr>\d{1,2}):(?P<mn>\d{2}):(?P<sc>\d{2})(?:\.(?P<us>\d{1,6})\d*)?)\s+"
+    r"(?P<after_ts>.+)$"
+)
+_JOURNAL_EMITTER_MSG_RE = re.compile(
+    r"^(?P<emitter>[A-Za-z0-9_@.()-]+(?:\[\d+\])?):\s+(?P<message>.+)$"
+)
+_JOURNAL_HOST_EMITTER_MSG_RE = re.compile(
+    r"^(?P<prefix>.+?)\s+(?P<emitter>[A-Za-z0-9_@.()-]+(?:\[\d+\])?):\s+(?P<message>.+)$"
+)
+_JOURNAL_HOSTNAME_TOKEN_RE = re.compile(
+    r"^(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9.-]*$|^<[^>]+>$"
+)
+_JOURNAL_PCI_BDF_RE = re.compile(
+    r"\b\d{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]\b"
+)
+_JOURNAL_ALT_DEVICE_RE = re.compile(
+    r"\b(nvme\d+(?:n\d+)?|card\d+(?:-[A-Za-z0-9-]+)?|usb\s+\d+-\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class _JournalEventGroup:
+    """Source-local aggregated count and bounds for repeated journal events."""
+
+    emitter: str
+    device_id: str
+    signature: str
+    representative_message: str
+    count: int
+    first_ts: str | None
+    last_ts: str | None
+    missing_ts_count: int
+    unparseable_ts_count: int
+    ts_authority: str = "none"
+    chronology_status: str = "unavailable"
+
+
+def _extract_journal_device_id(message: str) -> str:
+    """Extract explicit PCI BDF or device token when already present in the message."""
+    pci_match = _JOURNAL_PCI_BDF_RE.search(message)
+    if pci_match:
+        return pci_match.group(0).lower()
+    alt_match = _JOURNAL_ALT_DEVICE_RE.search(message)
+    if alt_match:
+        return " ".join(alt_match.group(1).split())
+    return ""
+
+
+def _parse_iso_ts_match(
+    m: re.Match[str],
+) -> tuple[str, str | None, tuple[int, ...] | None, str]:
+    yr, mo, dy = int(m.group("yr")), int(m.group("mo")), int(m.group("dy"))
+    hr, mn, sc = int(m.group("hr")), int(m.group("mn")), int(m.group("sc"))
+    us_str = m.group("us") or ""
+    us = int(us_str.ljust(6, "0")) if us_str else 0
+    tz_str = m.group("tz")
+    try:
+        datetime.date(yr, mo, dy)
+        if not (0 <= hr <= 23 and 0 <= mn <= 59 and 0 <= sc <= 59):
+            raise ValueError("time out of range")
+        if tz_str:
+            if tz_str == "Z":
+                tz_info = datetime.timezone.utc
+            else:
+                norm_tz = f"{tz_str[:3]}:{tz_str[3:]}" if ":" not in tz_str else tz_str
+                tz_hours = int(norm_tz[:3])
+                tz_mins = int(norm_tz[4:6]) * (-1 if tz_hours < 0 else 1)
+                tz_info = datetime.timezone(
+                    datetime.timedelta(hours=tz_hours, minutes=tz_mins)
+                )
+            dt_utc = datetime.datetime(
+                yr, mo, dy, hr, mn, sc, us, tzinfo=tz_info
+            ).astimezone(datetime.timezone.utc)
+            key = (
+                dt_utc.year,
+                dt_utc.month,
+                dt_utc.day,
+                dt_utc.hour,
+                dt_utc.minute,
+                dt_utc.second,
+                dt_utc.microsecond,
+            )
+            return "valid", m.group("ts"), key, "iso_aware"
+    except ValueError:
+        return "unparseable", None, None, "none"
+    return "valid", m.group("ts"), (yr, mo, dy, hr, mn, sc, us), "iso_naive"
+
+
+_SYSLOG_MONTH_MAX_DAYS = {
+    1: 31,
+    2: 28,
+    3: 31,
+    4: 30,
+    5: 31,
+    6: 30,
+    7: 31,
+    8: 31,
+    9: 30,
+    10: 31,
+    11: 30,
+    12: 31,
+}
+
+
+def _parse_syslog_ts_match(
+    m: re.Match[str],
+) -> tuple[str, str | None, tuple[int, ...] | None, str]:
+    mon_num = _JOURNAL_MONTHS.get(m.group("mon").lower())
+    if mon_num is None:
+        return "unparseable", None, None, "none"
+    dy = int(m.group("dy"))
+    hr, mn, sc = int(m.group("hr")), int(m.group("mn")), int(m.group("sc"))
+    us_str = m.group("us") or ""
+    us = int(us_str.ljust(6, "0")) if us_str else 0
+    if not (0 <= hr <= 23 and 0 <= mn <= 59 and 0 <= sc <= 59):
+        return "unparseable", None, None, "none"
+    if mon_num == 2 and dy == 29:
+        return "valid", m.group("ts"), None, "syslog_leap_ambiguous"
+    if not (1 <= dy <= _SYSLOG_MONTH_MAX_DAYS[mon_num]):
+        return "unparseable", None, None, "none"
+    return "valid", m.group("ts"), (mon_num, dy, hr, mn, sc, us), "syslog"
+
+
+def _build_parsed_journal_row(
+    emitter: str,
+    message: str,
+    ts_raw: str | None,
+    ts_key: tuple[int, ...] | None,
+    ts_authority: str,
+    ts_state: str,
+) -> tuple[bool, str, str, str, str, str | None, tuple[int, ...] | None, str, str]:
+    sig_msg = re.sub(r"^\[\s*\d+\.\d+\]\s+", "", message)
+    sig_norm = " ".join(sig_msg.split())
+    return (
+        True,
+        emitter,
+        _extract_journal_device_id(message),
+        sig_norm,
+        message,
+        ts_raw,
+        ts_key,
+        ts_authority,
+        ts_state,
+    )
+
+
+def _parse_journal_event_line(
+    line: str,
+) -> tuple[bool, str, str, str, str, str | None, tuple[int, ...] | None, str, str]:
+    """Parse one journal row conservatively into emitter, device, message, and timestamp."""
+    iso_m = _ISO_JOURNAL_PREFIX_RE.match(line)
+    if iso_m:
+        ts_state, ts_raw, ts_key, ts_authority = _parse_iso_ts_match(iso_m)
+        after_ts = iso_m.group("after_ts").strip()
+    elif sys_m := _SYSLOG_JOURNAL_PREFIX_RE.match(line):
+        ts_state, ts_raw, ts_key, ts_authority = _parse_syslog_ts_match(sys_m)
+        after_ts = sys_m.group("after_ts").strip()
+    else:
+        direct_m = _JOURNAL_EMITTER_MSG_RE.match(line)
+        if direct_m:
+            return _build_parsed_journal_row(
+                direct_m.group("emitter"),
+                direct_m.group("message").strip(),
+                None,
+                None,
+                "none",
+                "missing",
+            )
+        pref_m = _JOURNAL_HOST_EMITTER_MSG_RE.match(line)
+        if not pref_m:
+            return False, "", "", "", line, None, None, "none", "missing"
+        prefix = pref_m.group("prefix").strip()
+        ts_state = (
+            "missing"
+            if " " not in prefix and bool(_JOURNAL_HOSTNAME_TOKEN_RE.match(prefix))
+            else "unparseable"
+        )
+        return _build_parsed_journal_row(
+            pref_m.group("emitter"),
+            pref_m.group("message").strip(),
+            None,
+            None,
+            "none",
+            ts_state,
+        )
+
+    host_m = _JOURNAL_HOST_EMITTER_MSG_RE.match(after_ts)
+    if host_m and " " not in host_m.group("prefix").strip():
+        emitter = host_m.group("emitter")
+        message = host_m.group("message").strip()
+    else:
+        direct_m = _JOURNAL_EMITTER_MSG_RE.match(after_ts)
+        if not direct_m:
+            return False, "", "", "", line, None, None, "none", ts_state
+        emitter = direct_m.group("emitter")
+        message = direct_m.group("message").strip()
+
+    return _build_parsed_journal_row(
+        emitter, message, ts_raw, ts_key, ts_authority, ts_state
+    )
+
+
+def _resolve_group_chronology(
+    timestamps: list[tuple[str, tuple[int, ...] | None, str]],
+) -> tuple[str | None, str | None, str, str]:
+    """Determine bounded first/last timestamps only when authority permits ordering."""
+    if not timestamps:
+        return None, None, "none", "unavailable"
+    authorities = {auth for auth, _, _ in timestamps}
+    if "syslog_leap_ambiguous" in authorities:
+        return None, None, "syslog_leap_ambiguous", "unverified_leap_day"
+    if len(authorities) > 1:
+        if {"iso_naive", "iso_aware"} <= authorities:
+            return None, None, "mixed", "unverified_mixed_naive_aware"
+        return None, None, "mixed", "unverified_mixed_formats"
+
+    authority = next(iter(authorities))
+    comparable = [(key, raw) for _, key, raw in timestamps if key is not None]
+    if authority == "syslog":
+        months = {key[0] for key, _ in comparable}
+        if any(m in (11, 12) for m in months) and any(m in (1, 2) for m in months):
+            return None, None, "syslog", "unverified_year_rollover"
+        ordered = sorted(comparable, key=lambda item: (item[0], item[1]))
+        return ordered[0][1], ordered[-1][1], "syslog", "calendar_label_only"
+
+    ordered = sorted(comparable, key=lambda item: (item[0], item[1]))
+    status = "verified_utc_instant" if authority == "iso_aware" else "wall_clock_only"
+    return ordered[0][1], ordered[-1][1], authority, status
+
+
+def _aggregate_journal_events(
+    text: str,
+) -> tuple[list[_JournalEventGroup], list[str], bool]:
+    """Deterministically group repeated events within a single source capture."""
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    ungrouped: list[str] = []
+    any_unparseable_ts = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        (
+            parsed_ok,
+            emitter,
+            device_id,
+            sig_norm,
+            message,
+            ts_raw,
+            ts_key,
+            ts_authority,
+            ts_state,
+        ) = _parse_journal_event_line(line)
+        if ts_state == "unparseable":
+            any_unparseable_ts = True
+        if not parsed_ok:
+            ungrouped.append(line)
+            continue
+        key = (emitter, device_id, sig_norm)
+        entry = buckets.get(key)
+        if entry is None:
+            entry = {
+                "emitter": emitter,
+                "device_id": device_id,
+                "signature": sig_norm,
+                "representative_message": message,
+                "count": 0,
+                "timestamps": [],
+                "missing_ts_count": 0,
+                "unparseable_ts_count": 0,
+            }
+            buckets[key] = entry
+        entry["count"] += 1
+        if ts_state == "valid" and ts_raw is not None:
+            entry["timestamps"].append((ts_authority, ts_key, ts_raw))
+        elif ts_state == "unparseable":
+            entry["unparseable_ts_count"] += 1
+        else:
+            entry["missing_ts_count"] += 1
+
+    groups: list[_JournalEventGroup] = []
+    for entry in buckets.values():
+        first_ts, last_ts, ts_auth, chron_status = _resolve_group_chronology(
+            entry["timestamps"]
+        )
+        groups.append(
+            _JournalEventGroup(
+                emitter=entry["emitter"],
+                device_id=entry["device_id"],
+                signature=entry["signature"],
+                representative_message=entry["representative_message"],
+                count=entry["count"],
+                first_ts=first_ts,
+                last_ts=last_ts,
+                missing_ts_count=entry["missing_ts_count"],
+                unparseable_ts_count=entry["unparseable_ts_count"],
+                ts_authority=ts_auth,
+                chronology_status=chron_status,
+            )
+        )
+    groups.sort(key=lambda g: (-g.count, g.emitter, g.device_id, g.signature))
+    return groups, ungrouped, any_unparseable_ts
+
+
 def _count_unique_segfaults(text: str) -> int:
     """
     Zlicza unikalne segfaulty z jądra, pomijając duplikaty i wpisy z syscheck.py.
@@ -1643,8 +2064,11 @@ def _get_bootable_kernels_from_module_roots(
         readable_roots += 1
         for entry in entries:
             try:
-                if stat.S_ISDIR(entry.stat().st_mode) and not entry.name.startswith(
-                    "."
+                if (
+                    stat.S_ISDIR(entry.stat().st_mode)
+                    and not entry.name.startswith(".")
+                    and not entry.name.endswith((".old", ".bak", ".backup", "~"))
+                    and bool(re.match(r"^\d+\.\d+", entry.name))
                 ):
                     versions.add(entry.name)
             except OSError:
@@ -3670,6 +4094,8 @@ class SysCheckEngine:
         self.evidence_objects: list[Evidence] = []
         self.pipeline_accounting: list[dict[str, str]] = []
         self.restrictions: list[str] = []
+        self._recorded_source_results: dict[tuple[int, str], CmdResult] = {}
+        self._recorded_limitation_keys: set[str] = set()
         self.commands_used: list[str] = []
         self._script_pids: list[str] = []
         self._lspci_result: CmdResult | None = None
@@ -3707,10 +4133,15 @@ class SysCheckEngine:
         timeout: int = TIMEOUT_SHORT,
         env: dict[str, str] | None = None,
         optional_dependency: bool = False,
+        max_bytes: int = TRUNCATE_NORMAL,
     ) -> CmdResult:
         self.commands_used.append(" ".join(cmd))
         return run_cmd(
-            cmd, timeout=timeout, env=env, optional_dependency=optional_dependency
+            cmd,
+            timeout=timeout,
+            env=env,
+            optional_dependency=optional_dependency,
+            max_bytes=max_bytes,
         )
 
     def cmd_ok(
@@ -3728,11 +4159,22 @@ class SysCheckEngine:
             self.restrictions.append(f"Brak sudo: {cmd[0]}")
         return fallback if fallback else result.to_fallback_text()
 
+    def _record_limitation(self, source_key: str, restriction: str) -> None:
+        """Record a non-command limitation deduplicated by source identity."""
+        if source_key in self._recorded_limitation_keys:
+            return
+        self._recorded_limitation_keys.add(source_key)
+        if restriction not in self.restrictions:
+            self.restrictions.append(restriction)
+
     def _record_truncated_capture(
         self, result: CmdResult | None, source_name: str
     ) -> None:
         """Record that a bounded result cannot prove absence of a finding."""
         if result is None or not result.truncated:
+            return
+        key = (id(result), source_name)
+        if key in self._recorded_source_results:
             return
         restriction = (
             f"Capture truncated for {source_name} (status=TRUNCATED_OUTPUT); "
@@ -3740,6 +4182,7 @@ class SysCheckEngine:
         )
         if restriction not in self.restrictions:
             self.restrictions.append(restriction)
+        self._recorded_source_results[key] = result
 
     def _record_source_status(
         self,
@@ -3755,6 +4198,9 @@ class SysCheckEngine:
         with a successful zero-result query.
         """
         if result is None:
+            return
+        key = (id(result), source_name)
+        if key in self._recorded_source_results:
             return
         if authority_state is None:
             if result.execution_status == "ok" and not result.truncated:
@@ -3778,6 +4224,149 @@ class SysCheckEngine:
         )
         if restriction not in self.restrictions:
             self.restrictions.append(restriction)
+        self._recorded_source_results[key] = result
+
+    def _append_journal_event_section(
+        self,
+        result: CmdResult,
+        *,
+        source_name: str,
+        tail_limit: int | None = None,
+        limitation_key_prefix: str = "journal_event_grouping",
+    ) -> None:
+        """Render source-local repeated-event summary alongside captured journal rows."""
+        raw_display = _filter_own_journal_entries(result.to_fallback_text())
+        if not result.is_ok():
+            self.report_lines.append(
+                f"- **Source-local event summary (`{source_name}`):** "
+                "unavailable (source did not complete authoritatively; no event counts inferred).\n"
+            )
+            self.report_lines.append(
+                codeblock(raw_display if raw_display else "(brak)")
+            )
+            return
+        raw_events = _filter_own_journal_entries(result.stdout)
+        if not raw_events.strip():
+            self.report_lines.append(
+                codeblock(raw_display if raw_display else "(brak)")
+            )
+            return
+
+        groups, ungrouped, any_unparseable_ts = _aggregate_journal_events(raw_events)
+        row_count = sum(1 for ln in raw_events.splitlines() if ln.strip())
+        scope_parts = [
+            "observed rows within captured window (no cross-source unique count or off-window frequency inferred)"
+        ]
+        if result.truncated:
+            scope_parts.append(
+                "capture truncated (lower bound only for captured prefix)"
+            )
+        elif tail_limit is not None and row_count >= tail_limit:
+            scope_parts.append(
+                f"tail-limited window ({tail_limit} rows; earlier events in boot not captured)"
+            )
+        elif tail_limit is not None:
+            scope_parts.append(f"tail window (limit {tail_limit} rows)")
+
+        if groups:
+            self.report_lines.append(
+                f"- **Source-local event summary (`{source_name}`):**\n"
+            )
+            self.report_lines.append(f"  - Scope: {'; '.join(scope_parts)}.\n")
+            for grp in groups:
+                ctx = (
+                    f"{grp.emitter} | device: {grp.device_id}"
+                    if grp.device_id
+                    else grp.emitter
+                )
+                noun = "observed row" if grp.count == 1 else "observed rows"
+                missing_total = grp.missing_ts_count + grp.unparseable_ts_count
+                missing_note = (
+                    f"; timestamps unavailable on {missing_total} of {grp.count} rows"
+                    if missing_total > 0
+                    else ""
+                )
+                if (
+                    grp.first_ts is not None
+                    and grp.last_ts is not None
+                    and grp.chronology_status == "verified_utc_instant"
+                ):
+                    ts_part = (
+                        f"first: `{grp.first_ts}`, last: `{grp.last_ts}` "
+                        f"(UTC-normalized chronology){missing_note}"
+                    )
+                elif (
+                    grp.first_ts is not None
+                    and grp.last_ts is not None
+                    and grp.chronology_status == "wall_clock_only"
+                ):
+                    ts_part = (
+                        f"wall-clock first: `{grp.first_ts}`, last: `{grp.last_ts}` "
+                        f"(timezone omitted; absolute chronology unverified){missing_note}"
+                    )
+                elif (
+                    grp.first_ts is not None
+                    and grp.last_ts is not None
+                    and grp.chronology_status == "calendar_label_only"
+                ):
+                    ts_part = (
+                        f"calendar-label first: `{grp.first_ts}`, last: `{grp.last_ts}` "
+                        f"(year and timezone omitted by syslog){missing_note}"
+                    )
+                elif grp.chronology_status == "unverified_mixed_naive_aware":
+                    ts_part = (
+                        "chronological order unverified "
+                        "(mixed timezone-naive and timezone-aware ISO timestamps)"
+                        + missing_note
+                    )
+                elif grp.chronology_status == "unverified_mixed_formats":
+                    ts_part = (
+                        "chronological order unverified "
+                        "(mixed ISO and syslog timestamp formats)" + missing_note
+                    )
+                elif grp.chronology_status == "unverified_year_rollover":
+                    ts_part = (
+                        "chronological order unverified "
+                        "(ambiguous syslog year rollover without year)" + missing_note
+                    )
+                elif grp.chronology_status == "unverified_leap_day":
+                    ts_part = (
+                        "chronological order unverified "
+                        "(February 29 without year cannot establish calendar chronology)"
+                        + missing_note
+                    )
+                elif grp.unparseable_ts_count > 0:
+                    ts_part = "timestamps: unavailable (unparseable timestamps in source rows)"
+                else:
+                    ts_part = "timestamps: unavailable (missing in source rows)"
+                safe_msg = grp.representative_message.replace("`", "'")
+                self.report_lines.append(
+                    f"  - `[{ctx}]` **{grp.count} {noun}** ({ts_part}): `{safe_msg}`\n"
+                )
+        if any_unparseable_ts:
+            self._record_limitation(
+                f"{limitation_key_prefix}:{source_name}:unparseable_ts",
+                f"Source {source_name} contains unparseable timestamp(s); "
+                "chronological bounds omit invalid timestamps.",
+            )
+        if ungrouped:
+            self._record_limitation(
+                f"{limitation_key_prefix}:{source_name}:unstructured",
+                f"Source {source_name} contains {len(ungrouped)} unstructured row(s) "
+                "for which reliable event grouping could not be established; original rows are preserved.",
+            )
+            if not groups:
+                self.report_lines.append(
+                    f"- **Source-local event summary (`{source_name}`):** "
+                    f"reliable event grouping unavailable for {len(ungrouped)} unstructured row(s); "
+                    "original rows preserved verbatim.\n"
+                )
+            else:
+                self.report_lines.append(
+                    f"  - Ungrouped rows: {len(ungrouped)} unstructured row(s) preserved verbatim "
+                    "(reliable grouping unavailable).\n"
+                )
+        self.report_lines.append(codeblock(raw_display if raw_display else raw_events))
 
     @staticmethod
     def _pipeline_rejection_reason(observation: Observation) -> str:
@@ -3852,18 +4441,23 @@ class SysCheckEngine:
         return results
 
     # ── Równoległe wykonanie z CmdResult ─────────────────────────
-    def _parallel_cmd(
-        self, tasks: dict[str, tuple[list[str], int, bool]]
-    ) -> dict[str, CmdResult]:
+    def _parallel_cmd(self, tasks: dict[str, tuple]) -> dict[str, CmdResult]:
         """
         Uruchamia wiele komend równolegle. Zwraca słownik name->CmdResult.
-        tasks: {nazwa: ([cmd, ...], timeout, optional_dependency)}
+        tasks: {nazwa: ([cmd, ...], timeout, optional_dependency, [max_bytes])}
         """
         results: dict[str, CmdResult] = {}
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(tasks))) as executor:
             future_map = {
-                executor.submit(self.cmd, cmd, timeout, None, optional): name
-                for name, (cmd, timeout, optional) in tasks.items()
+                executor.submit(
+                    self.cmd,
+                    task[0],
+                    task[1],
+                    None,
+                    task[2],
+                    *(task[3:]),
+                ): name
+                for name, task in tasks.items()
             }
             for future in as_completed(future_map):
                 name = future_map[future]
@@ -4042,8 +4636,14 @@ class SysCheckEngine:
                 )
                 if inventory.status == "partial":
                     limitation += " Some visible entries could not be inspected."
-            if limitation not in self.restrictions:
-                self.restrictions.append(limitation)
+            if inventory.label == "/boot" and inventory.status == "unavailable":
+                continue
+            limitation_kind = (
+                "unavailable" if inventory.status == "unavailable" else "visibility"
+            )
+            self._record_limitation(
+                f"boot_source:{inventory.label}:{limitation_kind}", limitation
+            )
 
         if bootable_kernels is not None:
             self.report_lines.append(f"**Obrazy w /boot:** {len(bootable_kernels)}\n")
@@ -4056,8 +4656,7 @@ class SysCheckEngine:
                 "(PermissionError: permission denied) lub nie istnieje; "
                 "obrazy kernela w /boot są niedostępne (unavailable / unknown)."
             )
-            if restriction not in self.restrictions:
-                self.restrictions.append(restriction)
+            self._record_limitation("boot_kernel_images:/boot:unavailable", restriction)
 
     # ── Raport: CPU, RAM, zram, procesy ──────────────────────────
     def collect_resources(self) -> None:
@@ -4201,8 +4800,8 @@ class SysCheckEngine:
         for name, result in r.items():
             self._record_truncated_capture(result, f"storage command {name}")
 
-        # Sprawdź czy Btrfs wymaga roota
-        for name in ("show", "stats", "scrub"):
+        # Sprawdź czy Btrfs wymaga roota (scrub permission denial is handled below with scrub history consequence)
+        for name in ("show", "stats"):
             status = btrfs_statuses[name]
             if status == "permission_denied":
                 restriction = (
@@ -4595,11 +5194,9 @@ class SysCheckEngine:
 
         self.report_lines.append(heading(2, "4. Kernel, sprzęt i sterowniki"))
         self.report_lines.append(heading(3, "Kernel log (błędy/ostrzeżenia)"))
-        kernel_errors_out = _filter_own_journal_entries(
-            kernel_errors_result.to_fallback_text()
-        )
-        self.report_lines.append(
-            codeblock(kernel_errors_out if kernel_errors_out else "(brak)")
+        self._append_journal_event_section(
+            kernel_errors_result,
+            source_name="current-boot kernel journal (kernel_errors)",
         )
         self.report_lines.append(heading(3, "Segfaulty z bieżącego bootu"))
         segfaults_filtered = _filter_own_journal_entries(
@@ -4610,11 +5207,9 @@ class SysCheckEngine:
             codeblock(segfaults_dedup if segfaults_dedup else "(brak)")
         )
         self.report_lines.append(heading(3, "Firmware / microcode"))
-        firmware_filtered = _filter_own_journal_entries(
-            firmware_msgs_result.to_fallback_text()
-        )
-        self.report_lines.append(
-            codeblock(firmware_filtered if firmware_filtered else "(brak)")
+        self._append_journal_event_section(
+            firmware_msgs_result,
+            source_name="current-boot firmware journal (firmware_msgs)",
         )
         self.report_lines.append(heading(3, "dmesg_restrict"))
         self.report_lines.append(
@@ -5597,15 +6192,18 @@ class SysCheckEngine:
             "foreign": cfg.get("pkg_list_foreign"),
             "kernels": cfg.get("pkg_query_kernels"),
         }
+        _TRUNCATE_PACKAGE_INVENTORY = 1048576
         tasks_cmd = {
-            name: (command, cfg["pkg_timeout"], False)
+            name: (
+                command,
+                cfg["pkg_timeout"],
+                False,
+                _TRUNCATE_PACKAGE_INVENTORY if name == "installed" else TRUNCATE_NORMAL,
+            )
             for name, command in query_specs.items()
             if command is not None and not (profile == "arch" and name == "kernels")
         }
         r = self._parallel_cmd(tasks_cmd) if tasks_cmd else {}
-
-        for name, result in r.items():
-            self._record_truncated_capture(result, f"package command {name}")
 
         self.report_lines.append(heading(2, "6. Pakiety i spójność systemu"))
         installed_result = r.get("installed")
@@ -5652,10 +6250,6 @@ class SysCheckEngine:
             )
         ):
             self.report_lines.append("(no orphan packages reported)\n\n")
-            self.restrictions.append(
-                "pacman -Qdt returned rc=1 with empty output; this provider "
-                "defines that result as no orphan packages."
-            )
         elif orphans_result.is_ok() and not orphans_result.truncated:
             self.report_lines.append(
                 codeblock(orphans_result.stdout or "(no orphan packages reported)")
@@ -5669,9 +6263,14 @@ class SysCheckEngine:
                 "SUCCESS_AUTHORITATIVE"
                 if profile == "arch"
                 and orphans_result is not None
-                and orphans_result.return_code == 1
-                and not orphans_result.stdout
-                and not orphans_result.stderr
+                and (
+                    orphans_result.execution_status == "empty_ok"
+                    or (
+                        orphans_result.return_code == 1
+                        and not orphans_result.stdout
+                        and not orphans_result.stderr
+                    )
+                )
                 else None
             ),
         )
@@ -5713,6 +6312,9 @@ class SysCheckEngine:
         kernels_result = r.get(
             "kernels", r.get("installed") if profile == "arch" else None
         )
+        running_kernel = self.active_kernel or "unknown"
+        self.report_lines.append(f"**Running kernel:** `{running_kernel}`\n\n")
+
         if modules_versions is None:
             self.report_lines.append(
                 "**Module tree inventory:** unknown / unavailable; no zero inferred.\n"
@@ -5729,15 +6331,17 @@ class SysCheckEngine:
             self.report_lines.append(
                 "**/boot kernel image inventory:** unknown / unavailable; no zero inferred.\n"
             )
-            self.restrictions.append(
+            self._record_limitation(
+                "boot_kernel_images:/boot:unavailable",
                 "Visible /boot kernel image inventory is unavailable; no absent "
-                "image or boot layout was inferred."
+                "image or boot layout was inferred.",
             )
         else:
             self.report_lines.append(
                 f"**Visible /boot kernel images:** {len(boot_images)}\n"
             )
 
+        package_count: int | None = None
         if kernels_result is None:
             self.report_lines.append(
                 "Kernel package inventory provider is not configured; "
@@ -5767,8 +6371,12 @@ class SysCheckEngine:
             bootable_count, _total_count, bootable_list = _count_kernel_packages(
                 kernel_output
             )
+            package_count = bootable_count
             self.report_lines.append(
                 f"**Bootable kernel package records:** {bootable_count}\n"
+            )
+            self.report_lines.append(
+                f"**Installed kernel package records:** {bootable_count}\n"
             )
             if bootable_list:
                 self.report_lines.append(
@@ -5788,7 +6396,24 @@ class SysCheckEngine:
                 )
         else:
             self.report_lines.append(codeblock(kernels_result.to_fallback_text()))
-        self._record_source_status(kernels_result, "kernel package query")
+        if kernels_result is not installed_result:
+            self._record_source_status(kernels_result, "kernel package query")
+
+        if (
+            modules_versions is not None
+            and package_count is not None
+            and len(modules_versions) > package_count
+        ):
+            diff = len(modules_versions) - package_count
+            self.report_lines.append(
+                f"**Module-tree vs package count difference:** {diff} more visible module trees "
+                f"than installed kernel package records "
+                f"({len(modules_versions)} visible module trees vs {package_count} installed kernel package records; "
+                "no per-tree package mapping is established). "
+                "Retention intent is unverified (directories may belong to snapshots, "
+                "alternate boot entries, or external builds; safe deletion cannot be established "
+                "from directory counts or package ownership alone).\n\n"
+            )
 
     # ── Raport: Grafika ──────────────────────────────────────────
     def collect_graphics(self) -> None:
@@ -5869,11 +6494,18 @@ class SysCheckEngine:
         self.report_lines.append(heading(3, "Niri outputs (monitory)"))
         self.report_lines.append(codeblock(r["niri_out"].to_fallback_text()))
         self.report_lines.append(heading(3, "Logi graficzne (błędy/ostrzeżenia)"))
-        gfx_logs_filtered = _filter_own_journal_entries(
-            r["gfx_logs"].to_fallback_text()
-        )
-        self.report_lines.append(
-            codeblock(gfx_logs_filtered if gfx_logs_filtered else "(brak)")
+        gfx_logs_result = r["gfx_logs"]
+        if (
+            gfx_logs_result.execution_status not in {"ok", "empty_ok"}
+            or gfx_logs_result.truncated
+        ):
+            self._record_source_status(
+                gfx_logs_result, "current-boot graphics journal query"
+            )
+        self._append_journal_event_section(
+            gfx_logs_result,
+            source_name="current-boot graphics journal (gfx_logs, tail 30)",
+            tail_limit=30,
         )
 
     # ── Raport: Sieć ─────────────────────────────────────────────
@@ -5930,8 +6562,7 @@ class SysCheckEngine:
                 )
             )
         )
-        self.report_lines.append(heading(3, "Nasłuchujące usługi (ss -tlnp)"))
-        self.report_lines.append(codeblock(r["ss_tlnp"].to_fallback_text()))
+        self._report_tcp_listeners(r["ss_tlnp"])
         self.report_lines.append(heading(3, "DNS (resolvectl status)"))
         self.report_lines.append(
             codeblock(
@@ -6020,82 +6651,105 @@ class SysCheckEngine:
                     )
                 )
 
-        # Analiza nasłuchujących usług — lokalne vs zewnętrzne
-        ss_output = r["ss_tlnp"].stdout
-        external_listeners = []
-        local_listeners = []
-        for line in ss_output.split("\n"):
-            if "LISTEN" in line:
-                addr_match = re.search(r"(\S+):(\d+)", line)
-                if addr_match:
-                    addr = addr_match.group(1)
-                    port = addr_match.group(2)
-                    if addr in ("127.0.0.1", "::1", "127.0.0.53", "127.0.0.54"):
-                        local_listeners.append(f"{addr}:{port}")
-                    elif addr == "0.0.0.0" or addr == "::":
-                        # Może być zewnętrzne — sprawdź czy to znany port systemowy
-                        if port not in ("631", "5355"):  # cups, llmnr
-                            external_listeners.append(f"{addr}:{port}")
-                    elif addr.startswith("192.168.") or addr.startswith("10."):
-                        external_listeners.append(f"{addr}:{port}")
-
-        if local_listeners:
-            self.report_lines.append(
-                f"ℹ️ Nasłuchiwanie lokalne: {len(local_listeners)} usług na "
-                f"127.0.0.1/::1 (niedostępne z zewnątrz).\n\n"
-            )
-        if external_listeners:
-            self.report_lines.append(
-                f"⚠️ Nasłuchiwanie zewnętrzne: {len(external_listeners)} usług "
-                f"na adresach niebędących localhost.\n\n"
-            )
-
-        # Firewall — sprawdź różne frontendy
-        firewall_found = False
-        firewall_details = []
-
-        # 1. nftables
         nft_result = self.cmd(
             ["nft", "list", "ruleset"], timeout=TIMEOUT_SHORT, optional_dependency=True
         )
-        if nft_result.execution_status == "permission_denied":
-            self.restrictions.append(
-                "Firewall (nft) — wymaga sudo, stan nie został zweryfikowany."
-            )
-        elif nft_result.is_ok() and nft_result.stdout.strip():
-            firewall_found = True
-            firewall_details.append("nftables (aktywny)")
-            self.report_lines.append(heading(3, "Firewall (nft ruleset)"))
-            self.report_lines.append(
-                codeblock(safestr(nft_result.stdout, TRUNCATE_NFT, full=self.full))
-            )
-        elif nft_result.execution_status == "not_found":
-            firewall_details.append("nftables (niedostępny)")
+        self._report_firewall(nft_result, r["firewalld"], r["ufw_status"])
 
-        # 2. firewalld
-        firewalld_result = r["firewalld"]
-        if firewalld_result.is_ok() and firewalld_result.stdout.strip() == "active":
-            firewall_found = True
-            firewall_details.append("firewalld (aktywny)")
+    def _report_tcp_listeners(self, result: CmdResult) -> None:
+        self.report_lines.append(heading(3, "Gniazda nasłuchujące TCP (ss -tlnp)"))
+        self.report_lines.append(codeblock(result.to_fallback_text()))
+        source = "TCP listener inventory (ss -tlnp)"
+        self._record_source_status(result, source)
+        if not result.is_ok():
+            self.report_lines.append("Inwentaryzacja gniazd TCP niedostępna.\n\n")
+            return
 
-        # 3. ufw
-        ufw_result = r["ufw_status"]
-        if ufw_result.is_ok() and "Status: active" in ufw_result.stdout:
-            firewall_found = True
-            firewall_details.append("ufw (aktywny)")
-        elif ufw_result.execution_status == "not_found":
-            firewall_details.append("ufw (niedostępny)")
-
-        # Podsumowanie firewalla
-        if firewall_found:
-            self.report_lines.append(
-                f"✅ Firewall wykryty: {', '.join(firewall_details)}\n\n"
+        has_diagnostic = bool(result.stderr.strip())
+        if has_diagnostic:
+            self._record_source_status(
+                result, source, authority_state="COMMAND_DIAGNOSTIC"
             )
-        else:
+        counts = dict.fromkeys(
+            ("LOOPBACK", "WILDCARD", "SPECIFIC_ADDRESS", "UNKNOWN"), 0
+        )
+        unparsed = 0
+        for line in result.stdout.splitlines():
+            columns = line.split()
+            if columns[:1] == ["tcp"]:
+                columns = columns[1:]
+            if not columns or columns[:3] == ["State", "Recv-Q", "Send-Q"]:
+                continue
+            if (
+                len(columns) >= 5
+                and columns[0] == "LISTEN"
+                and columns[1].isdecimal()
+                and columns[2].isdecimal()
+            ):
+                counts[_listener_bind_scope(columns[3])] += 1
+            else:
+                unparsed += 1
+
+        if unparsed:
+            self._record_source_status(
+                result, source, authority_state="MALFORMED_OUTPUT"
+            )
+            self.report_lines.append(f"Pominięte nieczytelne wiersze: {unparsed}.\n\n")
+        total = sum(counts.values())
+        incomplete = bool(result.truncated or has_diagnostic or unparsed)
+        if incomplete and not total:
             self.report_lines.append(
-                f"⚠️ Nie wykryto aktywnego firewalla. "
-                f"Sprawdzone frontendy: {', '.join(firewall_details) if firewall_details else 'brak'}. "
-                f"Możliwe że firewall jest skonfigurowany inaczej lub wymaga sudo do weryfikacji.\n\n"
+                "Nie ustalono liczby gniazd TCP (niepełny odczyt).\n\n"
+            )
+            return
+        scope_counts = ", ".join(f"{scope}={count}" for scope, count in counts.items())
+        capture = "niepełny odczyt" if incomplete else "pełny odczyt"
+        self.report_lines.append(
+            f"Gniazda TCP ({capture}, liczba wierszy): "
+            f"TOTAL={total}, {scope_counts}. "
+            "Zakres adresu lokalnego nie określa osiągalności.\n\n"
+        )
+
+    def _report_firewall(
+        self, nft: CmdResult, firewalld: CmdResult, ufw: CmdResult
+    ) -> None:
+        self.report_lines.append(heading(3, "Firewall"))
+        self.report_lines.append(
+            "Nie zweryfikowano ogólnego stanu filtrowania pakietów. "
+            "Wyniki dotyczą zakresów poszczególnych poleceń.\n\n"
+        )
+        states = {}
+        for provider, result, scope in (
+            ("nftables", nft, "reguły nftables w bieżącej przestrzeni sieciowej"),
+            ("firewalld", firewalld, "stan jednostki systemd"),
+            ("ufw", ufw, "stan zgłaszany przez frontend"),
+        ):
+            state, reason = _firewall_probe_state(provider, result)
+            states[provider] = state
+            if state == "unknown":
+                self._record_source_status(
+                    result, f"Firewall ({provider})", authority_state=reason
+                )
+                detail = f"stan nieznany ({reason}, rc={result.return_code})"
+            else:
+                detail = {
+                    "active": "potwierdzono stan aktywny",
+                    "inactive": "potwierdzono stan nieaktywny",
+                    "empty": "potwierdzono pusty zestaw reguł",
+                    "table": "odczytano deklarację tabeli",
+                }[state]
+            self.report_lines.append(f"- {provider}: {detail} ({scope}).\n")
+
+        if states["nftables"] == "empty" and "active" in states.values():
+            self.report_lines.append(
+                "\nAktywny frontend i pusty zestaw nftables dotyczą różnych "
+                "zakresów. Odczyty nie wyjaśniają tej rozbieżności.\n"
+            )
+        self.report_lines.append("\n")
+        if nft.stdout.strip():
+            self.report_lines.append(heading(4, "Wynik polecenia nft list ruleset"))
+            self.report_lines.append(
+                codeblock(safestr(nft.to_fallback_text(), TRUNCATE_NFT, full=self.full))
             )
 
     # ── Raport: Zasilanie ────────────────────────────────────────
@@ -9201,11 +9855,13 @@ FINDING_EXPLANATION_REGISTRY = {
     "KRNL-INFO-001": _explain_definition(
         "KRNL-INFO-001",
         "The installed kernel inventory contains an informational condition.",
-        "LDE reports this Finding when the read-only kernel-package and boot-image inventory meets the configured informational condition.",
-        "Boot storage usage or fallback-kernel availability may warrant review; this is not a failure claim.",
+        "LDE reports this Finding when the read-only installed kernel package inventory meets the configured informational condition.",
+        "Installed kernel package count exceeds recommended retention threshold; boot-image and module availability require independent verification.",
         Actionability.INFORMATIONAL,
         (
-            _explain_step("List bootable kernel images.", "ls /boot/vmlinuz-*"),
+            _explain_step(
+                "Review installed kernel packages with the distribution package manager."
+            ),
             _explain_step("Record the running kernel.", "uname -r"),
         ),
         (
@@ -9216,7 +9872,7 @@ FINDING_EXPLANATION_REGISTRY = {
                 "Confirm that the running kernel and intended fallback remain available."
             ),
         ),
-        ("Kernel package inventory", "/boot kernel images"),
+        ("Kernel package inventory",),
     ),
     "BOOT-SLOW-001": _explain_definition(
         "BOOT-SLOW-001",

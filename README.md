@@ -50,7 +50,7 @@ Install it into an isolated virtual environment:
 
 ```text
 uv venv /tmp/lde-venv
-uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.7.1-py3-none-any.whl
+uv pip install --python /tmp/lde-venv/bin/python /tmp/lde-dist/linux_diagnostic_engine-0.8.0-py3-none-any.whl
 ```
 
 The installed command is `lde`:
@@ -69,8 +69,8 @@ The installed command is `lde`:
 /tmp/lde-venv/bin/lde snapshot compare --help
 ```
 
-The public product version is `0.7.1`; `lde --version` prints
-`Linux Diagnostic Engine 0.7.1`. Without `--output-dir`, reports are written
+The public product version is `0.8.0`; `lde --version` prints
+`Linux Diagnostic Engine 0.8.0`. Without `--output-dir`, reports are written
 to `$XDG_DATA_HOME/lde/reports` or `~/.local/share/lde/reports`; an explicit
 `--output-dir` still overrides this default. A successful `lde run` prints a
 compact English summary with the exact absolute report path. Use
@@ -168,6 +168,20 @@ Sanitization replaces known identifiers with stable placeholders and is
 deterministic. It is not a guarantee of anonymity. Inspect the generated
 copy for sensitive free text in other sections and snapshot fields before
 sharing.
+
+## Version 0.8.0 — Diagnostic Authority & Event Aggregation
+
+Version 0.8.0 tightens evidence authority, limitation accounting, and report-level event summaries without adding new detectors or altering schema-3 snapshots:
+
+- **TCP listener classification:** Complete socket-row counting with explicit bind-scope classification (`LOOPBACK`, `WILDCARD`, `SPECIFIC_ADDRESS`, `UNKNOWN`) and an explicit caveat that local bind scope does not verify network reachability.
+- **Firewall evidence authority:** Independent per-provider status (`nftables`, `firewalld`, `ufw`) distinguishing active, inactive, empty ruleset, table-only declaration, and unverified/unknown states without assuming overall packet filtering.
+- **Package inventory & empty orphan semantics:** Purpose-bounded capture preserving authoritative installed package counts independently of display truncation, while normalizing provider-defined Arch empty orphan results (`pacman -Qdt` exit 1 with empty output) as authoritative.
+- **Kernel, module & boot authority:** Independent reporting of running kernel, installed kernel package records, filtered `/usr/lib/modules` version trees, and visible `/boot` images with arithmetic-only count difference notes, scoped `KernelCountRule` wording, and no automatic deletion recommendations.
+- **Source-specific limitation deduplication:** Deduplicates identical source failures without suppressing distinct `/boot`, `/boot/efi`, and `/efi` limitations or colliding on transient result identities.
+- **Deterministic source-local journal summaries:** Groups repeated journal events within each source by emitter, device identity, and signature while preserving raw lines, tail/truncation disclosures, parenthesized workers (`(udev-worker)`), and RFC 1123 digit-leading hostnames, with no cross-source global unique-event totals.
+- **Conservative timestamp authority:** Distinguishes timezone-aware ISO, timezone-naive ISO, and year-less syslog timestamps without inventing missing years or UTC offsets across ambiguous rollovers or mixed formats.
+- **Retained v0.7.1 privacy protection:** `lde sanitize` continues omitting process CPU/MEM tables, multiline continuations, and known identifiers while sanitizing rendered event summaries; sanitized artifacts still require manual inspection before sharing.
+- **Validation boundary:** Arch/CachyOS workstation diagnostics are verified live without sudo on v0.8.0; Fedora and Debian portability is covered by synthetic tests in v0.8.0 building on historical v0.7 VM runtime evidence rather than fresh VM runs.
 
 ## Version 0.7.1 — Privacy hotfix
 

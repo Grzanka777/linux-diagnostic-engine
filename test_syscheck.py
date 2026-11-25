@@ -72,6 +72,7 @@ from syscheck import (  # type: ignore[import-untyped]
     _pcie_aer_severity,
     _write_new_text,
     build_snapshot,
+    compare_finding_lifecycle,
     confidence_tag,
     derive_confidence,
     determine_cli_status,
@@ -937,53 +938,6 @@ class TestBootAnalysis:
     def test_fstrim_not_on_critical_path(self):
         blame_line = "41.891s fstrim.service"
         assert "fstrim" in blame_line
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Test 11: Local vs external sockets
-# ═══════════════════════════════════════════════════════════════════
-
-
-class TestSocketClassification:
-    """T11: Local-only and externally listening sockets distinguished."""
-
-    def test_localhost_only_sockets(self):
-        ss_output = """LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:*
-LISTEN 0 10   127.0.0.1:44097 0.0.0.0:*
-LISTEN 0 128  127.0.0.1:11987 0.0.0.0:*
-LISTEN 0 4096 [::1]:11987     [::]:*"""
-        external, local = self._classify_sockets(ss_output)
-        assert len(local) > 0
-
-    def test_externally_listening_sockets(self):
-        ss_output = """LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:(("myapp",pid=1234))
-LISTEN 0 128  0.0.0.0:22   0.0.0.0:*"""
-        external, _ = self._classify_sockets(ss_output)
-        assert len(external) > 0
-
-    def test_cups_is_excluded_from_external(self):
-        ss_output = "LISTEN 0 4096 0.0.0.0:631 0.0.0.0:*"
-        external, _ = self._classify_sockets(ss_output)
-        assert all(":631" not in e for e in external)
-
-    @staticmethod
-    def _classify_sockets(ss_output: str):
-        external = []
-        local = []
-        for line in ss_output.split("\n"):
-            if "LISTEN" in line:
-                addr_match = re.search(r"(\S+):(\d+)", line)
-                if addr_match:
-                    addr = addr_match.group(1)
-                    port = addr_match.group(2)
-                    if addr in ("127.0.0.1", "::1", "127.0.0.53", "127.0.0.54"):
-                        local.append(f"{addr}:{port}")
-                    elif addr in ("0.0.0.0", "::"):
-                        if port not in ("631", "5355"):
-                            external.append(f"{addr}:{port}")
-                    elif addr.startswith("192.168.") or addr.startswith("10."):
-                        external.append(f"{addr}:{port}")
-        return external, local
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -12783,14 +12737,14 @@ class TestIteration011RealWorldCorrectness:
 
         assert report_path.is_file()
         assert "# Linux Diagnostic Engine (LDE)" in report
-        assert "**Wersja produktu:** `0.7.1`" in report
+        assert "**Wersja produktu:** `0.8.0`" in report
         assert "**Kompatybilność raportów/snapshotów:** `2.1.0`" in report
         assert "**Internal metadata:**" not in report
         assert "**Internal metadata:**" not in report
         assert "<REDACTED-ROLE>" not in report
         assert "<REDACTED-PROVIDER>" not in report
         assert "przez <REDACTED-ROLE>" not in report
-        assert "Linux Diagnostic Engine 0.7.1" in report
+        assert "Linux Diagnostic Engine 0.8.0" in report
         assert "kompatybilność raportów/snapshotów 2.1.0" in report
 
     @staticmethod
@@ -13812,29 +13766,315 @@ class TestV04WorkstationCoverage:
             "nm_activation_failures": cls._result(""),
             "network_device_watchdog": cls._result(""),
             "auth_fails": cls._result("0"),
-            "firewalld": cls._result("inactive"),
+            "firewalld": cls._result("inactive", status="error", return_code=3),
             "ufw_status": cls._result("Status: inactive"),
         }
         results.update(overrides)
         return results
 
-    def _collect_network(self, **overrides):
+    def _collect_network(self, *, nft_result=None, **overrides):
         from unittest.mock import patch
 
         engine = SysCheckEngine(output_dir="/tmp/test_v04_network", quiet=True)
-        nft_missing = self._result(
-            status="not_found", return_code=-1, stderr="not found"
-        )
         with (
             patch.object(
                 SysCheckEngine,
                 "_parallel_cmd",
                 return_value=self._network_results(**overrides),
             ),
-            patch.object(engine, "cmd", return_value=nft_missing),
+            patch.object(engine, "cmd", return_value=nft_result or self._result()),
         ):
             engine.collect_network()
         return engine
+
+    def test_tcp_listener_original_replay(self):
+        fixture = Path(__file__).parent / "tests/fixtures/lde_gap_01_listeners.txt"
+        result = self._result(fixture.read_text(encoding="utf-8"))
+        engine = self._collect_network(ss_tlnp=result)
+        report = "".join(engine.report_lines)
+        assert report == "".join(self._collect_network(ss_tlnp=result).report_lines)
+        assert (
+            "Gniazda TCP (pełny odczyt, liczba wierszy): TOTAL=22, "
+            "LOOPBACK=12, WILDCARD=7, SPECIFIC_ADDRESS=3, UNKNOWN=0." in report
+        )
+        assert "Zakres adresu lokalnego nie określa osiągalności." in report
+        assert "Nasłuchiwanie zewnętrzne" not in report
+        assert not engine.restrictions
+
+    @pytest.mark.parametrize(
+        ("endpoint", "scope"),
+        [
+            ("127.0.0.1:0", "LOOPBACK"),
+            ("127.0.0.1:1", "LOOPBACK"),
+            ("127.42.255.9:65535", "LOOPBACK"),
+            ("127.0.0.53%lo:53", "LOOPBACK"),
+            ("[::1]:80", "LOOPBACK"),
+            ("::1:80", "LOOPBACK"),
+            ("[0:0:0:0:0:0:0:1%lo]:80", "LOOPBACK"),
+            ("[::1]%lo:80", "LOOPBACK"),
+            ("0.0.0.0:631", "WILDCARD"),
+            (":::5355", "WILDCARD"),
+            ("[::]:5355", "WILDCARD"),
+            ("*:80", "WILDCARD"),
+            ("172.16.0.1:80", "SPECIFIC_ADDRESS"),
+            ("8.8.8.8:80", "SPECIFIC_ADDRESS"),
+            ("[2001:db8::1]:80", "SPECIFIC_ADDRESS"),
+            ("fe80::1%test0:80", "SPECIFIC_ADDRESS"),
+            ("[::ffff:127.0.0.1]:80", "SPECIFIC_ADDRESS"),
+            ("[::ffff:0.0.0.0]:80", "SPECIFIC_ADDRESS"),
+            ("[::1:80", "UNKNOWN"),
+            ("[::1]:", "UNKNOWN"),
+            ("127.0.0.1", "UNKNOWN"),
+            (":80", "UNKNOWN"),
+            ("999.0.0.1:80", "UNKNOWN"),
+            ("127.0.0.1:65536", "UNKNOWN"),
+            ("[::1%lo]%test0:80", "UNKNOWN"),
+        ],
+    )
+    def test_tcp_listener_classifies_local_column(self, endpoint, scope):
+        result = self._result(f"LISTEN 0 128 {endpoint} 192.0.2.1:9000")
+        engine = self._collect_network(ss_tlnp=result)
+        report = "".join(engine.report_lines)
+        assert "TOTAL=1" in report
+        assert f"{scope}=1" in report
+        assert not engine.restrictions
+
+    def test_tcp_listener_counts_socket_rows_even_when_ports_repeat(self):
+        row = "LISTEN 0 128 0.0.0.0:631 0.0.0.0:*"
+        result = self._result(
+            f'{row}\n{row}\n{row} users:(("synthetic",pid=1234,fd=1))\n'
+            "tcp LISTEN 0 128 [::]:631 [::]:*"
+        )
+        report = "".join(self._collect_network(ss_tlnp=result).report_lines)
+        assert (
+            "TOTAL=4, LOOPBACK=0, WILDCARD=4, SPECIFIC_ADDRESS=0, UNKNOWN=0" in report
+        )
+        assert "liczba wierszy" in report
+        assert "usług" not in report
+
+    def test_tcp_listener_counts_empty_authoritative_inventory(self):
+        result = self._result(
+            "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process"
+        )
+        engine = self._collect_network(ss_tlnp=result)
+        assert "pełny odczyt, liczba wierszy): TOTAL=0" in "".join(engine.report_lines)
+        assert not engine.restrictions
+
+    def test_tcp_listener_empty_truncated_capture_has_unknown_total(self):
+        engine = self._collect_network(ss_tlnp=self._result(truncated=True))
+        report = "".join(engine.report_lines)
+        assert "Nie ustalono liczby gniazd TCP" in report
+        assert "TOTAL=" not in report
+        assert any("TRUNCATED_OUTPUT" in limit for limit in engine.restrictions)
+
+    def test_tcp_listener_failed_inventory_does_not_report_zero_or_partial_as_complete(
+        self,
+    ):
+        result = self._result(
+            "LISTEN 0 128 127.0.0.1:80 *:*", status="error", return_code=1
+        )
+        engine = self._collect_network(ss_tlnp=result)
+        report = "".join(engine.report_lines)
+        assert "Inwentaryzacja gniazd TCP niedostępna" in report
+        assert "TOTAL=" not in report
+        assert any("FAILED_EXECUTION" in limit for limit in engine.restrictions)
+
+    @pytest.mark.parametrize(
+        ("stdout", "stderr", "truncated", "reason"),
+        [
+            ("\nLISTEN 0 128", "", False, "MALFORMED_OUTPUT"),
+            ("", "", True, "TRUNCATED_OUTPUT"),
+            ("", "capture diagnostic", False, "COMMAND_DIAGNOSTIC"),
+        ],
+    )
+    def test_tcp_listener_incomplete_inventory(self, stdout, stderr, truncated, reason):
+        result = self._result(
+            "LISTEN 0 128 127.0.0.1:80 *:*" + stdout, stderr=stderr, truncated=truncated
+        )
+        engine = self._collect_network(ss_tlnp=result)
+        report = "".join(engine.report_lines)
+        assert "niepełny odczyt, liczba wierszy): TOTAL=1, LOOPBACK=1" in report
+        if reason == "MALFORMED_OUTPUT":
+            assert "Pominięte nieczytelne wiersze: 1" in report
+        assert any(reason in limit for limit in engine.restrictions)
+
+    @pytest.mark.parametrize(
+        ("probe", "provider", "output", "metadata", "expected"),
+        [
+            (
+                "ufw_status",
+                "ufw",
+                "Status: active\nTo Action From",
+                {},
+                "potwierdzono stan aktywny",
+            ),
+            (
+                "ufw_status",
+                "ufw",
+                "Status: inactive",
+                {},
+                "potwierdzono stan nieaktywny",
+            ),
+            ("firewalld", "firewalld", "active", {}, "potwierdzono stan aktywny"),
+            (
+                "firewalld",
+                "firewalld",
+                "inactive",
+                {"status": "error", "return_code": 3},
+                "potwierdzono stan nieaktywny",
+            ),
+            ("nft_result", "nftables", "", {}, "pusty zestaw reguł"),
+            (
+                "nft_result",
+                "nftables",
+                "table inet synthetic { }",
+                {},
+                "deklarację tabeli",
+            ),
+            ("nft_result", "nftables", "unexpected output", {}, "UNRECOGNIZED_OUTPUT"),
+            (
+                "nft_result",
+                "nftables",
+                "",
+                {"status": "error", "return_code": 1},
+                "FAILED_EXECUTION",
+            ),
+            (
+                "nft_result",
+                "nftables",
+                "",
+                {"status": "timeout", "return_code": -2},
+                "TIMEOUT",
+            ),
+            ("nft_result", "nftables", "", {"truncated": True}, "TRUNCATED_OUTPUT"),
+            (
+                "firewalld",
+                "firewalld",
+                "unknown",
+                {"status": "error", "return_code": 4},
+                "UNKNOWN_UNIT",
+            ),
+            (
+                "firewalld",
+                "firewalld",
+                "",
+                {"status": "not_found", "return_code": -1},
+                "NOT_FOUND",
+            ),
+            ("firewalld", "firewalld", "active\ninactive", {}, "CONFLICTING_OUTPUT"),
+            (
+                "ufw_status",
+                "ufw",
+                "",
+                {"status": "not_found", "return_code": -1},
+                "NOT_FOUND",
+            ),
+            (
+                "ufw_status",
+                "ufw",
+                "",
+                {"status": "permission_denied", "return_code": -3},
+                "PERMISSION_DENIED",
+            ),
+            (
+                "ufw_status",
+                "ufw",
+                "Status: inactive",
+                {
+                    "status": "error",
+                    "return_code": 1,
+                    "stderr": "Operation not permitted",
+                },
+                "PERMISSION_DENIED",
+            ),
+            (
+                "ufw_status",
+                "ufw",
+                "Status: inactive",
+                {"status": "error", "return_code": 1},
+                "FAILED_EXECUTION",
+            ),
+            (
+                "ufw_status",
+                "ufw",
+                "Status: active",
+                {"truncated": True},
+                "TRUNCATED_OUTPUT",
+            ),
+            ("ufw_status", "ufw", "", {}, "EMPTY_OUTPUT"),
+            ("ufw_status", "ufw", "Status: active-ish", {}, "UNRECOGNIZED_OUTPUT"),
+            (
+                "ufw_status",
+                "ufw",
+                "Status: active\nStatus: inactive",
+                {},
+                "CONFLICTING_OUTPUT",
+            ),
+        ],
+    )
+    def test_firewall_authority(self, probe, provider, output, metadata, expected):
+        engine = self._collect_network(**{probe: self._result(output, **metadata)})
+        report = "".join(engine.report_lines)
+        line = next(
+            line for line in report.splitlines() if line.startswith(f"- {provider}:")
+        )
+        assert expected in line
+        if expected.isupper():
+            assert "stan nieznany" in line
+            assert any(expected in limit for limit in engine.restrictions)
+        else:
+            assert not engine.restrictions
+        assert "Nie zweryfikowano ogólnego stanu filtrowania pakietów" in report
+        engine._derive_observations()
+        engine._interpret()
+        assert not engine.raw_diagnostics
+        assert not engine.findings
+
+    def test_firewall_preserves_mixed_provider_evidence(self):
+        unavailable = self._result(status="not_found", return_code=-1)
+        engine = self._collect_network(nft_result=unavailable, firewalld=unavailable)
+        report = "".join(engine.report_lines)
+        assert "nftables: stan nieznany" in report
+        assert "firewalld: stan nieznany" in report
+        assert "ufw: potwierdzono stan nieaktywny" in report
+
+        engine = self._collect_network(firewalld=self._result("active"))
+        report = "".join(engine.report_lines)
+        assert "nftables: potwierdzono pusty zestaw reguł" in report
+        assert "firewalld: potwierdzono stan aktywny" in report
+        assert "ufw: potwierdzono stan nieaktywny" in report
+        assert "Odczyty nie wyjaśniają tej rozbieżności." in report
+
+    def test_firewall_evidence_cannot_resolve_network_findings(self):
+        unavailable = self._result(status="permission_denied", return_code=-3)
+        baseline = self._collect_network(
+            nm_activation_failures=self._result(
+                "Activation: failed for connection 'synthetic-office'"
+            )
+        )
+        current = self._collect_network(
+            nm_activation_failures=unavailable,
+            nft_result=unavailable,
+            ss_tlnp=unavailable,
+        )
+        complete_network_journal = self._collect_network(nft_result=unavailable)
+        for engine in (baseline, current, complete_network_journal):
+            engine.hostname = "test-host"
+            engine.active_kernel = "test-kernel"
+            engine._derive_observations()
+            engine._interpret()
+
+        finding_ids = ("NETWORK-NM-ACTIVATION-FAIL-001",)
+        result = compare_finding_lifecycle(
+            build_snapshot(baseline), build_snapshot(current)
+        )
+        assert result.unverified_finding_ids == finding_ids
+        assert not result.resolved_finding_ids
+        assert not result.new_finding_ids
+        control = compare_finding_lifecycle(
+            build_snapshot(baseline), build_snapshot(complete_network_journal)
+        )
+        assert control.resolved_finding_ids == finding_ids
 
     def test_replay_parser_positive_healthy_and_near_miss(self):
         critical, malformed, source_count = _parse_upower_critical_states(
@@ -14483,3 +14723,1442 @@ with patch.object(Path, 'iterdir', custom_iterdir):
         assert res_unverified.resolved_finding_ids == ()
         assert res_unverified.unverified_finding_ids == ("BOOT-IMG-001",)
         assert boot_restriction in res_unverified.source_limitations
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TASK-LDE-16: GAP-03 Package Inventory Authority & Limitation Semantics
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPackageInventoryAuthority:
+    """Regression tests for package inventory authority and analysis limitations."""
+
+    def test_complete_package_collection_authoritative_count_and_display_boundary(
+        self, tmp_path, monkeypatch
+    ):
+        """Complete collection (>5KB) yields authoritative count and no truncation restriction."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        # 1500 packages is ~30KB
+        pkg_lines = [f"test-pkg-{i} 1.0.0-{i}" for i in range(1500)]
+        pkg_stdout = "\n".join(pkg_lines)
+
+        mock_results = {
+            "installed": CmdResult(
+                command="pacman -Q",
+                stdout=pkg_stdout,
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+                truncated=False,
+            ),
+            "orphans": CmdResult(
+                command="pacman -Qdt",
+                stdout="",
+                stderr="",
+                return_code=1,
+                execution_status="empty_ok",
+                truncated=False,
+            ),
+            "foreign": CmdResult(
+                command="pacman -Qm",
+                stdout="aur-pkg 1.0-1\n",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+                truncated=False,
+            ),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-arch1-1"]
+        )
+
+        engine.collect_packages()
+
+        # No limitations recorded for complete package collection
+        assert not any("obcięty" in r for r in engine.restrictions)
+        assert not any(
+            "cannot establish an authoritative state" in r for r in engine.restrictions
+        )
+        report_text = "".join(engine.report_lines)
+        assert "Authoritative installed package rows: **1500**" in report_text
+        assert "Authoritative provider rows: **1**" in report_text
+        assert "(no orphan packages reported)" in report_text
+
+    def test_truncated_package_collection_marks_count_unauthoritative(
+        self, tmp_path, monkeypatch
+    ):
+        """Truncated collection does not claim authoritative count and emits exactly one limitation."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult(
+                command="pacman -Q",
+                stdout="pkg-1 1.0\npkg-2 1.0",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+                truncated=True,
+            ),
+            "orphans": CmdResult(
+                command="pacman -Qdt",
+                stdout="",
+                stderr="",
+                return_code=1,
+                execution_status="empty_ok",
+            ),
+            "foreign": CmdResult(
+                command="pacman -Qm",
+                stdout="",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-arch1-1"]
+        )
+
+        engine.collect_packages()
+
+        report_text = "".join(engine.report_lines)
+        assert "Authoritative installed package rows" not in report_text
+        # Truncation limitation is recorded
+        trunc_limits = [r for r in engine.restrictions if "TRUNCATED_OUTPUT" in r]
+        assert len(trunc_limits) == 1
+        assert "installed package inventory" in trunc_limits[0]
+
+    def test_arch_empty_orphans_rc1_no_limitation(self, tmp_path, monkeypatch):
+        """Arch pacman -Qdt returning rc=1 with empty output is authoritative empty, not limitation."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult(
+                command="pacman -Q",
+                stdout="pkg-1 1.0\n",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+            "orphans": CmdResult(
+                command="pacman -Qdt",
+                stdout="",
+                stderr="",
+                return_code=1,
+                execution_status="empty_ok",
+            ),
+            "foreign": CmdResult(
+                command="pacman -Qm",
+                stdout="",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-arch1-1"]
+        )
+
+        engine.collect_packages()
+
+        assert not any("orphan" in r.lower() for r in engine.restrictions)
+        assert not any("pacman -Qdt" in r for r in engine.restrictions)
+        report_text = "".join(engine.report_lines)
+        assert "(no orphan packages reported)" in report_text
+
+    def test_orphan_query_with_stderr_records_limitation(self, tmp_path, monkeypatch):
+        """pacman -Qdt failing with error message in stderr records an analysis limitation."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult(
+                command="pacman -Q",
+                stdout="pkg-1 1.0\n",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+            "orphans": CmdResult(
+                command="pacman -Qdt",
+                stdout="",
+                stderr="error: could not open database core",
+                return_code=1,
+                execution_status="error",
+            ),
+            "foreign": CmdResult(
+                command="pacman -Qm",
+                stdout="",
+                stderr="",
+                return_code=0,
+                execution_status="ok",
+            ),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-arch1-1"]
+        )
+
+        engine.collect_packages()
+
+        orphan_limits = [r for r in engine.restrictions if "orphan package query" in r]
+        assert len(orphan_limits) == 1
+        assert "cannot establish an authoritative state" in orphan_limits[0]
+
+    def test_package_query_failure_modes(self, tmp_path):
+        """Timeout, not_found, permission_denied, and error status are cleanly mapped to limitations."""
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+
+        cases = [
+            ("timeout", CmdResult("cmd", "", "timed out", 124, "timeout"), "TIMEOUT"),
+            (
+                "not_found",
+                CmdResult("cmd", "", "not found", 127, "not_found"),
+                "COMMAND_NOT_FOUND",
+            ),
+            (
+                "permission_denied",
+                CmdResult("cmd", "", "denied", 126, "permission_denied"),
+                "PERMISSION_DENIED",
+            ),
+            ("error", CmdResult("cmd", "", "fatal", 2, "error"), "FAILED_EXECUTION"),
+        ]
+        for name, cmd_res, expected_token in cases:
+            engine = SysCheckEngine(output_dir=str(out_dir))
+            engine._record_source_status(cmd_res, f"test_{name}")
+            matching = [r for r in engine.restrictions if f"test_{name}" in r]
+            assert len(matching) == 1
+            assert f"status={expected_token}" in matching[0]
+
+    def test_fedora_and_debian_package_query_compatibility(self, tmp_path, monkeypatch):
+        """Debian (dpkg-query) and Fedora (rpm) profiles count packages accurately."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+
+        # Debian
+        deb_engine = SysCheckEngine(output_dir=str(out_dir))
+        deb_engine.distro_config = DISTRO_CONFIG["debian"]
+        deb_stdout = (
+            "ii\tcurl\t7.88.1-10+deb12u5\n"
+            "ii\tgpg\t2.2.40-1.1\n"
+            "rc\told-pkg\t1.0-1\n"  # removed config-files, not installed
+            "ii\tlinux-image-6.1.0-21-amd64\t6.1.90-1\n"
+        )
+        deb_results = {
+            "installed": CmdResult("dpkg-query -W", deb_stdout, "", 0, "ok"),
+            "kernels": CmdResult(
+                "dpkg-query -W linux-image-*",
+                "ii\tlinux-image-6.1.0-21-amd64\t6.1.90-1\n",
+                "",
+                0,
+                "ok",
+            ),
+        }
+        monkeypatch.setattr(deb_engine, "_parallel_cmd", lambda _tasks: deb_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.1.0-21-amd64"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.1.0-21-amd64"]
+        )
+
+        deb_engine.collect_packages()
+        deb_text = "".join(deb_engine.report_lines)
+        # Should count exactly 3 'ii' records (excluding 'rc')
+        assert "Authoritative installed package rows: **3**" in deb_text
+
+        # RHEL / Fedora
+        rhel_engine = SysCheckEngine(output_dir=str(out_dir))
+        rhel_engine.distro_config = DISTRO_CONFIG["rhel"]
+        rhel_stdout = "bash\ncoreutils\nkernel-core\n"
+        rhel_results = {
+            "installed": CmdResult("rpm -qa", rhel_stdout, "", 0, "ok"),
+            "kernels": CmdResult(
+                "rpm -qa kernel*",
+                "kernel-core-6.8.9-200.fc40.x86_64\n",
+                "",
+                0,
+                "ok",
+            ),
+        }
+        monkeypatch.setattr(rhel_engine, "_parallel_cmd", lambda _tasks: rhel_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.8.9-200.fc40.x86_64"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot",
+            lambda: ["6.8.9-200.fc40.x86_64"],
+        )
+
+        rhel_engine.collect_packages()
+        rhel_text = "".join(rhel_engine.report_lines)
+        assert "Authoritative installed package rows: **3**" in rhel_text
+
+    def test_limitation_deduplication_single_limitation_for_shared_arch_capture(
+        self, tmp_path, monkeypatch
+    ):
+        """In Arch where installed and kernels query share one capture, failure records one limitation."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        shared_res = CmdResult(
+            command="pacman -Q",
+            stdout="",
+            stderr="error: lock file found",
+            return_code=1,
+            execution_status="error",
+        )
+        mock_results = {
+            "installed": shared_res,
+            "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+            "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-arch1-1"]
+        )
+
+        engine.collect_packages()
+
+        # Check restrictions for pacman -Q failure
+        matching = [
+            r
+            for r in engine.restrictions
+            if "cannot establish an authoritative state" in r
+        ]
+        assert len(matching) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TASK-LDE-16: GAP-05 Kernel Inventory Authority & Count Rule
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestKernelInventoryAuthority:
+    """Regression tests for kernel inventory authority, module roots filtering, and rule accuracy."""
+
+    def test_running_kernel_identity_rendered(self, tmp_path, monkeypatch):
+        """Report renders running kernel identity unambiguously."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.active_kernel = "6.12.1-cachyos"
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult(
+                "pacman -Q", "linux-cachyos 6.12.1-1\n", "", 0, "ok"
+            ),
+            "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+            "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-cachyos"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot", lambda: ["6.12.1-cachyos"]
+        )
+
+        engine.collect_packages()
+        report_text = "".join(engine.report_lines)
+        assert "**Running kernel:** `6.12.1-cachyos`" in report_text
+
+    def test_installed_kernel_packages_and_module_trees_retention_caveat(
+        self, tmp_path, monkeypatch
+    ):
+        """When module trees exceed package records (14 vs 2), observation with retention caveat is rendered."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.active_kernel = "6.12.1-cachyos"
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        module_trees = [f"6.{i}.0-test" for i in range(14)]
+        mock_results = {
+            "installed": CmdResult(
+                "pacman -Q",
+                "linux 6.12.1.arch1-1\nlinux-lts 6.6.65-1\n",
+                "",
+                0,
+                "ok",
+            ),
+            "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+            "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots", lambda: module_trees
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot",
+            lambda: ["6.12.1-arch1-1", "6.6.65-lts"],
+        )
+
+        engine.collect_packages()
+        report_text = "".join(engine.report_lines)
+        assert "**Visible module-tree versions:** 14" in report_text
+        assert "**Installed kernel package records:** 2" in report_text
+        assert (
+            "**Module-tree vs package count difference:** 12 more visible module trees "
+            "than installed kernel package records "
+            "(14 visible module trees vs 2 installed kernel package records; "
+            "no per-tree package mapping is established)." in report_text
+        )
+        assert "Retention intent is unverified" in report_text
+        for forbidden in ("unmapped", "orphaned", "obsolete"):
+            assert forbidden not in report_text.lower()
+
+    def test_module_trees_equal_or_fewer_packages_no_extra_observation(
+        self, tmp_path, monkeypatch
+    ):
+        """When module trees count matches packages, no count difference observation is rendered."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.active_kernel = "6.12.1-cachyos"
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult(
+                "pacman -Q",
+                "linux 6.12.1.arch1-1\nlinux-lts 6.6.65-1\n",
+                "",
+                0,
+                "ok",
+            ),
+            "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+            "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1", "6.6.65-lts"],
+        )
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_boot",
+            lambda: ["6.12.1-arch1-1", "6.6.65-lts"],
+        )
+
+        engine.collect_packages()
+        report_text = "".join(engine.report_lines)
+        assert "**Module-tree vs package count difference:**" not in report_text
+
+    def test_module_roots_exclusion_of_backup_and_non_kernel_dirs(self, tmp_path):
+        """Module root scanner strictly excludes .old, .bak, backup, and non-kernel directory names."""
+        from syscheck import _get_bootable_kernels_from_module_roots
+
+        mod_dir = tmp_path / "modules"
+        mod_dir.mkdir()
+
+        # Valid kernel version directory names
+        (mod_dir / "6.12.1-cachyos").mkdir()
+        (mod_dir / "6.6.65-lts").mkdir()
+
+        # Invalid or non-kernel directory names
+        (mod_dir / "6.6.65-lts.old").mkdir()
+        (mod_dir / "6.6.65-lts.bak").mkdir()
+        (mod_dir / "6.6.65-lts.backup").mkdir()
+        (mod_dir / "6.12.1-cachyos~").mkdir()
+        (mod_dir / "extramodules-6.12-cachyos").mkdir()
+        (mod_dir / "backup").mkdir()
+        (mod_dir / "lost+found").mkdir()
+        (mod_dir / ".hidden").mkdir()
+
+        result = _get_bootable_kernels_from_module_roots(modules_dirs=[mod_dir])
+        assert result == ["6.12.1-cachyos", "6.6.65-lts"]
+
+    def test_protected_boot_handling_unreadable_boot(self, tmp_path, monkeypatch):
+        """Unreadable /boot produces no false zero-count assertions and deduplicates limitations."""
+        from syscheck import DISTRO_CONFIG
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = DISTRO_CONFIG["arch"]
+
+        mock_results = {
+            "installed": CmdResult("pacman -Q", "linux 6.12.1.arch1-1\n", "", 0, "ok"),
+            "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+            "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+        }
+        monkeypatch.setattr(engine, "_parallel_cmd", lambda _tasks: mock_results)
+        monkeypatch.setattr(
+            "syscheck._get_bootable_kernels_from_module_roots",
+            lambda: ["6.12.1-arch1-1"],
+        )
+        monkeypatch.setattr("syscheck._get_bootable_kernels_from_boot", lambda: None)
+
+        engine.collect_packages()
+        report_text = "".join(engine.report_lines)
+        assert (
+            "**/boot kernel image inventory:** unknown / unavailable; no zero inferred."
+            in report_text
+        )
+        assert "**Visible /boot kernel images:** 0" not in report_text
+
+        # Deduplication check: only 1 /boot limitation recorded
+        boot_restrictions = [r for r in engine.restrictions if "/boot" in r]
+        assert len(boot_restrictions) == 1
+
+    def test_kernel_count_rule_evaluation_no_overclaiming(self):
+        """KernelCountRule does not claim boot image presence or advise deletion/ls verification."""
+        from diagnostic_rules import KernelCountRule
+        from syscheck import (
+            EvidenceBuilder,
+            FindingClassificationPolicy,
+            Observation,
+        )
+
+        eb = EvidenceBuilder()
+        rule = KernelCountRule(eb)
+        obs = Observation(
+            obs_id="KRNL-INFO-001", category="kernel_count", details={"count": 4}
+        )
+        policy = FindingClassificationPolicy()
+        result = rule.evaluate(obs, policy.classify(obs))
+
+        assert result.finding is not None
+        assert result.finding.finding_id == "KRNL-INFO-001"
+        assert result.finding.severity == "Info"
+
+        # Verify scoped interpretation
+        expected_interpretation = (
+            "Liczba zainstalowanych pakietów kernela (4) przekracza zalecany próg. "
+            "Stan obrazów rozruchowych /boot oraz drzew modułów wymaga niezależnej weryfikacji."
+        )
+        assert result.finding.interpretation == expected_interpretation
+
+        # Verify overclaiming was removed
+        assert "Wszystkie obrazy kernel obecne" not in result.finding.interpretation
+        assert "sudo pacman -Rs" not in result.finding.remediation
+        assert "ls /boot/vmlinuz" not in result.finding.verification
+
+    def test_finding_lifecycle_source_provenance_and_resolution_guard(self):
+        """Lifecycle verification proves source failure preserves UNVERIFIED while package drops resolve."""
+        from syscheck import (
+            REPORT_COMPATIBILITY_VERSION,
+            EnvironmentSnapshot,
+            ExecutionSnapshot,
+            FindingLifecycleComparator,
+            FindingSnapshot,
+            ObservationSnapshot,
+            RawDiagnosticSnapshot,
+            SnapshotMetadata,
+            SystemSnapshot,
+        )
+
+        def _make_meta():
+            return SnapshotMetadata(
+                hostname="test-host",
+                kernel="6.12.1-arch1-1",
+                distro="arch",
+                syscheck_version=REPORT_COMPATIBILITY_VERSION,
+                timestamp_utc="2026-11-25T10:00:00+00:00",
+                timestamp_local="2026-11-25T10:00:00+00:00",
+            )
+
+        baseline_finding = FindingSnapshot(
+            finding_id="KRNL-INFO-001",
+            title="Zainstalowane kernele (3)",
+            severity="Info",
+            confidence="Certain",
+            evidence="Liczba kernel: 3.",
+            recommended_diagnostics="uname -r",
+            source_observation_ids=("OBS-KRNL-INFO-001",),
+        )
+        baseline = SystemSnapshot(
+            metadata=_make_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(
+                ObservationSnapshot(
+                    obs_id="OBS-KRNL-INFO-001",
+                    category="kernel_count",
+                    source_raw_ids=("RAW-KRNL-INFO-001",),
+                ),
+            ),
+            raw_diagnostics=(
+                RawDiagnosticSnapshot(
+                    source_id="RAW-KRNL-INFO-001",
+                    category="kernel_count",
+                    payload={"count": 3, "source_query": "kernel_package"},
+                    provenance={"execution_status": "ok", "truncated": False},
+                ),
+            ),
+            findings=(baseline_finding,),
+            execution=ExecutionSnapshot(),
+        )
+
+        # 1. Package count legitimately reduced to 2 with authoritative query: resolves
+        current_resolved = SystemSnapshot(
+            metadata=_make_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(),
+            raw_diagnostics=(
+                RawDiagnosticSnapshot(
+                    source_id="RAW-KRNL-INFO-001",
+                    category="kernel_count",
+                    payload={"count": 2, "source_query": "kernel_package"},
+                    provenance={"execution_status": "ok", "truncated": False},
+                ),
+            ),
+            findings=(),
+            execution=ExecutionSnapshot(),
+        )
+        res_resolved = FindingLifecycleComparator.compare(baseline, current_resolved)
+        assert res_resolved.resolved_finding_ids == ("KRNL-INFO-001",)
+        assert res_resolved.unverified_finding_ids == ()
+
+        # 2. Package query failed in current run: limitation prevents false resolution -> UNVERIFIED
+        current_failed = SystemSnapshot(
+            metadata=_make_meta(),
+            environment=EnvironmentSnapshot(),
+            observations=(),
+            raw_diagnostics=(),
+            findings=(),
+            restrictions=(
+                (
+                    "Source kernel package query cannot establish an authoritative state "
+                    "(status=FAILED_EXECUTION, rc=1); no healthy or failure state was inferred."
+                ),
+            ),
+            execution=ExecutionSnapshot(),
+        )
+        res_failed = FindingLifecycleComparator.compare(baseline, current_failed)
+        assert res_failed.resolved_finding_ids == ()
+        assert res_failed.unverified_finding_ids == ("KRNL-INFO-001",)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TASK-LDE-17: Semantic Closure Verification & GAP-04 Event Aggregation
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestSemanticClosureTaskLde17:
+    """Focused closure tests for TASK-LDE-16 semantic risks (3.1 - 3.4)."""
+
+    def test_boot_limitation_preserves_independent_boot_efi_and_boot_image_failures(
+        self, tmp_path, monkeypatch
+    ):
+        """Substring '/boot/efi' or '/boot' visibility must not suppress '/boot' kernel image limitation."""
+        import syscheck
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.distro_config = syscheck.DISTRO_CONFIG["arch"]
+
+        monkeypatch.setattr(
+            syscheck,
+            "_inspect_boot_sources",
+            lambda: (
+                syscheck.BootSourceInventory(
+                    "/boot", "available", (), (), (), (), "Mount layout unverified"
+                ),
+                syscheck.BootSourceInventory(
+                    "/boot/efi", "unavailable", (), (), (), (), "Permission denied"
+                ),
+                syscheck.BootSourceInventory(
+                    "/efi", "unavailable", (), (), (), (), "Not found"
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            syscheck, "_get_bootable_kernels_from_module_roots", lambda: ["6.12.1"]
+        )
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", lambda: None)
+        monkeypatch.setattr(
+            engine,
+            "_parallel",
+            lambda _tasks: {
+                "osr": 'NAME="Arch Linux"\nID=arch',
+                "kernel": "6.12.1",
+                "hostname": "host",
+                "uptime": "1h",
+                "cmdline": "quiet",
+                "boot_ls": "",
+                "mod_ls": "",
+                "niri_ver": "",
+            },
+        )
+        monkeypatch.setattr(
+            engine,
+            "_parallel_cmd",
+            lambda _tasks: {
+                "installed": CmdResult("pacman -Q", "linux 6.12.1-1\n", "", 0, "ok"),
+                "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+                "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+            },
+        )
+
+        engine.collect_base_info()
+        engine.collect_packages()
+
+        # All four independent limitations must be present:
+        # 1) /boot visibility from _inspect_boot_sources
+        # 2) /boot/efi unavailable
+        # 3) /efi unavailable
+        # 4) /boot kernel images unavailable (recorded once, NOT suppressed by /boot/efi!)
+        assert any(
+            "Boot source /boot covers visible entries only" in r
+            for r in engine.restrictions
+        )
+        assert any(
+            "Boot source /boot/efi is unavailable" in r for r in engine.restrictions
+        )
+        assert any("Boot source /efi is unavailable" in r for r in engine.restrictions)
+        boot_img_limits = [
+            r
+            for r in engine.restrictions
+            if "Katalog /boot jest niedostępny" in r
+            or "Visible /boot kernel image inventory is unavailable" in r
+        ]
+        assert len(boot_img_limits) == 1
+
+    def test_module_tree_discrepancy_equal_different_identities_and_unknown_inventories(
+        self, tmp_path, monkeypatch
+    ):
+        """Count differences never claim per-tree mapping and handle unknown package/module sources."""
+        import syscheck
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+
+        # 1. Equal counts with different identities: report both independent counts, no mapping claim
+        e_equal = SysCheckEngine(output_dir=str(out_dir))
+        e_equal.distro_config = syscheck.DISTRO_CONFIG["arch"]
+        monkeypatch.setattr(
+            syscheck,
+            "_get_bootable_kernels_from_module_roots",
+            lambda: ["6.6.65-lts", "6.10.0-custom"],
+        )
+        monkeypatch.setattr(
+            syscheck, "_get_bootable_kernels_from_boot", lambda: ["6.6.65-lts"]
+        )
+        monkeypatch.setattr(
+            e_equal,
+            "_parallel_cmd",
+            lambda _tasks: {
+                "installed": CmdResult(
+                    "pacman -Q", "linux 6.12.1-1\nlinux-zen 6.12.2-1\n", "", 0, "ok"
+                ),
+                "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+                "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+            },
+        )
+        e_equal.collect_packages()
+        eq_text = "".join(e_equal.report_lines)
+        assert "**Visible module-tree versions:** 2" in eq_text
+        assert "**Installed kernel package records:** 2" in eq_text
+        assert "**Module-tree vs package count difference:**" not in eq_text
+
+        # 2. Unknown package inventory + known module count -> no difference calculation
+        e_unk_pkg = SysCheckEngine(output_dir=str(out_dir))
+        e_unk_pkg.distro_config = syscheck.DISTRO_CONFIG["arch"]
+        monkeypatch.setattr(
+            syscheck,
+            "_get_bootable_kernels_from_module_roots",
+            lambda: [f"6.{i}.0" for i in range(14)],
+        )
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", lambda: None)
+        monkeypatch.setattr(
+            e_unk_pkg,
+            "_parallel_cmd",
+            lambda _tasks: {
+                "installed": CmdResult("pacman -Q", "", "db error", 1, "error"),
+                "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+                "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+            },
+        )
+        e_unk_pkg.collect_packages()
+        unk_pkg_text = "".join(e_unk_pkg.report_lines)
+        assert "**Visible module-tree versions:** 14" in unk_pkg_text
+        assert "**Installed kernel package records:**" not in unk_pkg_text
+        assert "Module-tree vs package count difference" not in unk_pkg_text
+
+        # 3. Unknown module inventory + known packages -> no difference calculation
+        e_unk_mod = SysCheckEngine(output_dir=str(out_dir))
+        e_unk_mod.distro_config = syscheck.DISTRO_CONFIG["arch"]
+        monkeypatch.setattr(
+            syscheck, "_get_bootable_kernels_from_module_roots", lambda: None
+        )
+        monkeypatch.setattr(syscheck, "_get_bootable_kernels_from_boot", lambda: None)
+        monkeypatch.setattr(
+            e_unk_mod,
+            "_parallel_cmd",
+            lambda _tasks: {
+                "installed": CmdResult(
+                    "pacman -Q", "linux 6.12.1-1\nlinux-lts 6.6.65-1\n", "", 0, "ok"
+                ),
+                "orphans": CmdResult("pacman -Qdt", "", "", 1, "empty_ok"),
+                "foreign": CmdResult("pacman -Qm", "", "", 0, "ok"),
+            },
+        )
+        e_unk_mod.collect_packages()
+        unk_mod_text = "".join(e_unk_mod.report_lines)
+        assert "**Module tree inventory:** unknown / unavailable" in unk_mod_text
+        assert "**Installed kernel package records:** 2" in unk_mod_text
+        assert "Module-tree vs package count difference" not in unk_mod_text
+
+    def test_result_identity_retention_prevents_id_reuse_suppression(self, tmp_path):
+        """Temporary CmdResult objects cannot be freed and reused to suppress distinct failures."""
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+
+        same_res = CmdResult("cmd", "", "err1", 1, "error")
+        engine._record_source_status(same_res, "source_alpha")
+        engine._record_source_status(same_res, "source_alpha")
+        assert len(engine.restrictions) == 1
+
+        # Independent source using same result instance is preserved
+        engine._record_source_status(same_res, "source_beta")
+        assert len(engine.restrictions) == 2
+
+        # Sequential temporary CmdResult objects from the same source with distinct failures
+        def _record_transient_failure(rc: int) -> None:
+            transient = CmdResult("cmd", "", f"err-{rc}", rc, "error")
+            engine._record_source_status(transient, "source_gamma")
+
+        _record_transient_failure(1)
+        _record_transient_failure(2)
+        gamma_restrictions = [
+            r for r in engine.restrictions if "Source source_gamma" in r
+        ]
+        assert len(gamma_restrictions) == 2
+
+    def test_btrfs_scrub_limitation_and_lifecycle_preserved(
+        self, tmp_path, monkeypatch
+    ):
+        """Btrfs scrub permission denial records single history limitation and blocks false resolution."""
+        from unittest.mock import patch
+
+        import syscheck
+
+        out_dir = tmp_path / "reports"
+        out_dir.mkdir()
+        engine = SysCheckEngine(output_dir=str(out_dir))
+        engine.hostname = "btrfs-box"
+        engine.active_kernel = "6.12.1"
+        engine.distro_id = "arch"
+
+        mocked = {
+            "df_h": CmdResult("df -h", "/dev/sda1 10G 5G 5G 50% /", "", 0, "ok"),
+            "df_i": CmdResult("df -i", "", "", 0, "ok"),
+            "lsblk": CmdResult("lsblk -f", "sda1 btrfs", "", 0, "ok"),
+            "mount": CmdResult("mount", "/dev/sda1 on / type btrfs", "", 0, "ok"),
+            "fstab": CmdResult(
+                "cat /etc/fstab", "/dev/sda1 / btrfs defaults 0 0", "", 0, "ok"
+            ),
+            "btrfs_stats": CmdResult(
+                "btrfs device stats /", "[dev].write_io_errs 0\n", "", 0, "ok"
+            ),
+            "btrfs_show": CmdResult(
+                "btrfs filesystem show /",
+                "devid 1 size 10GiB used 5GiB path /dev/sda1\n",
+                "",
+                0,
+                "ok",
+            ),
+            "btrfs_df": CmdResult("btrfs filesystem df /", "", "", 0, "ok"),
+            "btrfs_scrub": CmdResult(
+                "btrfs scrub status /",
+                "",
+                "ERROR: cannot check scrub status: Operation not permitted",
+                1,
+                "error",
+                privilege_required=True,
+            ),
+            "nvme_list": CmdResult("nvme list", "", "", 0, "ok"),
+        }
+        with patch.object(SysCheckEngine, "_parallel_cmd", return_value=mocked):
+            engine.collect_storage()
+
+        scrub_limits = [r for r in engine.restrictions if "scrub" in r.lower()]
+        assert len(scrub_limits) == 1
+        assert "wymaga sudo" in scrub_limits[0]
+
+        engine._derive_observations()
+        engine._interpret()
+        current = syscheck.build_snapshot(engine)
+
+        baseline = syscheck.SystemSnapshot(
+            metadata=syscheck.SnapshotMetadata(
+                "btrfs-box",
+                "6.12.1",
+                "arch",
+                syscheck.REPORT_COMPATIBILITY_VERSION,
+                "2026-11-25T00:00:00+00:00",
+                "2026-11-25T00:00:00+00:00",
+            ),
+            environment=syscheck.EnvironmentSnapshot(),
+            observations=(
+                syscheck.ObservationSnapshot(
+                    obs_id="OBS-BTRFS-SCRUB-001",
+                    category="btrfs_scrub",
+                    source_raw_ids=("BTRFS-SCRUB-001",),
+                ),
+            ),
+            raw_diagnostics=(
+                syscheck.RawDiagnosticSnapshot(
+                    source_id="BTRFS-SCRUB-001",
+                    category="btrfs_scrub",
+                    payload={"scrub_status": "no_scrub", "source_query": "btrfs_scrub"},
+                ),
+            ),
+            findings=(
+                syscheck.FindingSnapshot(
+                    finding_id="BTRFS-SCRUB-001",
+                    title="Brak historii Btrfs scrub",
+                    severity="Info",
+                    confidence="Certain",
+                    evidence="no scrub data",
+                    recommended_diagnostics="sudo btrfs scrub status /",
+                    source_observation_ids=("OBS-BTRFS-SCRUB-001",),
+                ),
+            ),
+            execution=syscheck.ExecutionSnapshot(),
+        )
+        res = syscheck.compare_finding_lifecycle(baseline, current)
+        assert res.resolved_finding_ids == ()
+        assert res.unverified_finding_ids == ("BTRFS-SCRUB-001",)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TASK-LDE-17: GAP-04 Deterministic Source-Local Event Aggregation
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestGap04EventAggregation:
+    """Comprehensive synthetic regression suite for GAP-04 report-level event aggregation."""
+
+    def _run_kernel_and_gfx(
+        self,
+        tmp_path,
+        *,
+        kernel_errors_res: CmdResult,
+        gfx_logs_res: CmdResult,
+        firmware_msgs_res: CmdResult | None = None,
+    ) -> tuple[SysCheckEngine, str]:
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir=str(tmp_path), quiet=True)
+        kernel_payload = {
+            "dmesg_restrict": CmdResult("cat", "1", "", 0, "ok"),
+            "kernel_errors": kernel_errors_res,
+            "segfaults": CmdResult("journalctl", "", "", 0, "ok"),
+            "firmware_msgs": firmware_msgs_res
+            or CmdResult("journalctl", "", "", 0, "ok"),
+            "oom_events": CmdResult("journalctl", "", "", 0, "ok"),
+            "gpu_i915_hang": CmdResult("journalctl", "", "", 0, "ok"),
+            "amdgpu_reset_fail": CmdResult("journalctl", "", "", 0, "ok"),
+            "gpu_nvidia_xid_79": CmdResult("journalctl", "", "", 0, "ok"),
+            "lspci": CmdResult("lspci -nnk", "", "", 0, "ok"),
+            "lsusb": CmdResult("lsusb", "", "", 0, "ok"),
+        }
+        gfx_payload = {
+            "drm_inventory": CmdResult("bash", "", "", 0, "ok"),
+            "drm_ls": CmdResult("ls", "", "", 0, "ok"),
+            "niri_out": CmdResult("niri", "", "", 0, "ok"),
+            "gfx_logs": gfx_logs_res,
+        }
+        with patch.object(
+            SysCheckEngine, "_parallel_cmd", side_effect=[kernel_payload, gfx_payload]
+        ):
+            engine.collect_kernel_hw()
+            engine.collect_graphics()
+        return engine, "".join(engine.report_lines)
+
+    def test_z13_overlap_10_kernel_and_2_graphics_without_global_sum_of_12(
+        self, tmp_path
+    ):
+        """10 DPCD kernel rows and 2 overlapping graphics rows report per-source 10 and 2, never 12."""
+        kern_lines = [
+            f"Nov 25 08:51:{10 + i:02d} fixture-host kernel: amdgpu 0000:01:00.0: [drm] *ERROR* dc_dmub_srv_log_diagnostic_data: DPCD read failed"
+            for i in range(10)
+        ]
+        gfx_lines = [
+            "Nov 25 11:34:11 fixture-host kernel: amdgpu 0000:01:00.0: [drm] *ERROR* dc_dmub_srv_log_diagnostic_data: DPCD read failed",
+            "Nov 25 11:44:34 fixture-host kernel: amdgpu 0000:01:00.0: [drm] *ERROR* dc_dmub_srv_log_diagnostic_data: DPCD read failed",
+        ]
+        engine, report = self._run_kernel_and_gfx(
+            tmp_path,
+            kernel_errors_res=CmdResult(
+                "journalctl", "\n".join(kern_lines), "", 0, "ok"
+            ),
+            gfx_logs_res=CmdResult("journalctl", "\n".join(gfx_lines), "", 0, "ok"),
+        )
+        assert "**10 observed rows**" in report
+        assert "first: `Nov 25 08:51:10`, last: `Nov 25 08:51:19`" in report
+        assert "**2 observed rows**" in report
+        assert "first: `Nov 25 11:34:11`, last: `Nov 25 11:44:34`" in report
+        assert "device: 0000:01:00.0" in report
+        assert "**12 " not in report
+        assert "12 unique" not in report.lower()
+        assert "confirmed gpu failure" not in report.lower()
+
+        # Preserve no promotion into findings or new observations
+        engine._derive_observations()
+        engine._interpret()
+        assert engine.findings == []
+
+    def test_distinct_pci_devices_and_signatures_never_merged(self, tmp_path):
+        """Different PCI BDFs and different event messages remain distinct groups."""
+        lines = (
+            "Nov 25 10:00:01 h kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed\n"
+            "Nov 25 10:00:02 h kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed\n"
+            "Nov 25 10:00:03 h kernel: amdgpu 0000:c5:00.0: [drm] *ERROR* DPCD read failed\n"
+            "Nov 25 10:00:04 h kernel: amdgpu 0000:01:00.0: [drm] *ERROR* ring gfx_0.0.0 timeout"
+        )
+        _, report = self._run_kernel_and_gfx(
+            tmp_path,
+            kernel_errors_res=CmdResult("journalctl", lines, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "`[kernel | device: 0000:01:00.0]` **2 observed rows**" in report
+        assert "`[kernel | device: 0000:c5:00.0]` **1 observed row**" in report
+        assert "ring gfx_0.0.0 timeout" in report
+        assert "**3 observed rows**" not in report
+
+    def test_missing_unparseable_identical_and_out_of_order_timestamps(self, tmp_path):
+        """Handle missing, unparseable, duplicate timestamps, and out-of-order rows safely."""
+        # 1. Missing timestamps
+        missing_lines = (
+            "kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed\n"
+            "kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed"
+        )
+        _, rep_missing = self._run_kernel_and_gfx(
+            tmp_path / "m",
+            kernel_errors_res=CmdResult("journalctl", missing_lines, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_missing
+        assert "timestamps: unavailable (missing in source rows)" in rep_missing
+
+        # 2. Unparseable timestamps + completely unstructured fallback
+        bad_ts_lines = (
+            "2026-99-99T25:61:00 h kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed\n"
+            "Foo 99 99:99:99 h kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed\n"
+            "unstructured garbled kernel text line without emitter"
+        )
+        eng_bad, rep_bad = self._run_kernel_and_gfx(
+            tmp_path / "b",
+            kernel_errors_res=CmdResult("journalctl", bad_ts_lines, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_bad
+        assert "unparseable timestamps in source rows" in rep_bad
+        assert "2026-99-99T25:61:00" in rep_bad  # original row preserved verbatim
+        assert "unstructured garbled kernel text line without emitter" in rep_bad
+        assert any(
+            "reliable event grouping could not be established" in r
+            for r in eng_bad.restrictions
+        )
+
+        # 3. Repeated identical rows (same timestamp & message -> count 3) + out-of-order timestamps
+        ooo_and_dup = (
+            "Nov 25 11:44:34 h niri[1234]: virtual_pointer warning\n"
+            "Nov 25 08:51:13 h niri[1234]: virtual_pointer warning\n"
+            "Nov 25 08:51:13 h niri[1234]: virtual_pointer warning"
+        )
+        _, rep_ooo = self._run_kernel_and_gfx(
+            tmp_path / "o",
+            kernel_errors_res=CmdResult("journalctl", "", "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", ooo_and_dup, "", 0, "ok"),
+        )
+        assert "`[niri[1234]]` **3 observed rows**" in rep_ooo
+        assert "first: `Nov 25 08:51:13`, last: `Nov 25 11:44:34`" in rep_ooo
+
+    def test_truncated_unavailable_and_deterministic_ordering(self, tmp_path):
+        """Truncated/unavailable sources preserve limitations, and row order is deterministic."""
+        lines_a = (
+            "Nov 25 12:00:01 h kernel: amdgpu 0000:01:00.0: event alpha\n"
+            "Nov 25 12:00:02 h kernel: amdgpu 0000:01:00.0: event beta\n"
+            "Nov 25 12:00:03 h kernel: amdgpu 0000:01:00.0: event beta"
+        )
+        lines_b = (
+            "Nov 25 12:00:02 h kernel: amdgpu 0000:01:00.0: event beta\n"
+            "Nov 25 12:00:01 h kernel: amdgpu 0000:01:00.0: event alpha\n"
+            "Nov 25 12:00:03 h kernel: amdgpu 0000:01:00.0: event beta"
+        )
+        eng_a, rep_a = self._run_kernel_and_gfx(
+            tmp_path / "da",
+            kernel_errors_res=CmdResult(
+                "journalctl", lines_a, "", 0, "ok", truncated=True
+            ),
+            gfx_logs_res=CmdResult("journalctl", "", "denied", 1, "permission_denied"),
+        )
+        _, rep_b = self._run_kernel_and_gfx(
+            tmp_path / "db",
+            kernel_errors_res=CmdResult(
+                "journalctl", lines_b, "", 0, "ok", truncated=True
+            ),
+            gfx_logs_res=CmdResult("journalctl", "", "denied", 1, "permission_denied"),
+        )
+        # Summary order: highest count (event beta = 2) before (event alpha = 1) in both!
+        sum_a = [ln for ln in rep_a.splitlines() if ln.startswith("  - `[kernel")]
+        sum_b = [ln for ln in rep_b.splitlines() if ln.startswith("  - `[kernel")]
+        assert sum_a == sum_b
+        assert "event beta" in sum_a[0]
+        assert "capture truncated" in rep_a
+        assert "unavailable (source did not complete authoritatively" in rep_a
+        assert any("TRUNCATED_OUTPUT" in r for r in eng_a.restrictions)
+        assert any("PERMISSION_DENIED" in r for r in eng_a.restrictions)
+
+    def test_existing_finding_inputs_preserved_and_summary_privacy_sanitized(
+        self, tmp_path
+    ):
+        """Aggregation preserves existing KERNEL-TAINT-001 finding and sanitizes summaries."""
+        import syscheck
+
+        lines = (
+            "Nov 25 10:00:01 secret-workstation kernel: i915: module verification failed: signature and/or required key missing - tainting kernel from /home/secretuser/mod.ko\n"
+            "Nov 25 10:00:02 secret-workstation kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed host secret-workstation ip 192.0.2.55 uuid 123e4567-e89b-12d3-a456-426614174000\n"
+            "Nov 25 10:00:03 secret-workstation kernel: amdgpu 0000:01:00.0: [drm] *ERROR* DPCD read failed host secret-workstation ip 192.0.2.55 uuid 123e4567-e89b-12d3-a456-426614174000"
+        )
+        engine, report = self._run_kernel_and_gfx(
+            tmp_path / "priv",
+            kernel_errors_res=CmdResult("journalctl", lines, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        engine.hostname = "secret-workstation"
+        engine._derive_observations()
+        engine._interpret()
+
+        # Existing KERNEL-TAINT-001 still produced normally
+        assert any(f.finding_id == "KERNEL-TAINT-001" for f in engine.findings)
+        # No new DPCD finding created
+        assert not any(
+            "DPCD" in f.finding_id or "DPCD" in f.title for f in engine.findings
+        )
+
+        sanitized = syscheck._sanitize_text(report, hostname="secret-workstation")
+        for canary in (
+            "secret-workstation",
+            "secretuser",
+            "192.0.2.55",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ):
+            assert canary not in sanitized
+        assert "`[kernel | device: 0000:01:00.0]` **2 observed rows**" in sanitized
+        assert "DPCD read failed" in sanitized
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TASK-LDE-18-R1: Timestamp Authority & Journal Input Separation
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestTaskLde18R1JournalAuthority:
+    """Regression suite closing TASK-LDE-18 timestamp authority & Z13 journal defects."""
+
+    def _run_kernel_and_gfx(
+        self,
+        tmp_path,
+        *,
+        kernel_errors_res: CmdResult,
+        gfx_logs_res: CmdResult,
+        firmware_msgs_res: CmdResult | None = None,
+    ) -> tuple[SysCheckEngine, str]:
+        from unittest.mock import patch
+
+        engine = SysCheckEngine(output_dir=str(tmp_path), quiet=True)
+        kernel_payload = {
+            "dmesg_restrict": CmdResult("cat", "1", "", 0, "ok"),
+            "kernel_errors": kernel_errors_res,
+            "segfaults": CmdResult("journalctl", "", "", 0, "ok"),
+            "firmware_msgs": firmware_msgs_res
+            or CmdResult("journalctl", "", "", 0, "ok"),
+            "oom_events": CmdResult("journalctl", "", "", 0, "ok"),
+            "gpu_i915_hang": CmdResult("journalctl", "", "", 0, "ok"),
+            "amdgpu_reset_fail": CmdResult("journalctl", "", "", 0, "ok"),
+            "gpu_nvidia_xid_79": CmdResult("journalctl", "", "", 0, "ok"),
+            "lspci": CmdResult("lspci -nnk", "", "", 0, "ok"),
+            "lsusb": CmdResult("lsusb", "", "", 0, "ok"),
+        }
+        gfx_payload = {
+            "drm_inventory": CmdResult("bash", "", "", 0, "ok"),
+            "drm_ls": CmdResult("ls", "", "", 0, "ok"),
+            "niri_out": CmdResult("niri", "", "", 0, "ok"),
+            "gfx_logs": gfx_logs_res,
+        }
+        with patch.object(
+            SysCheckEngine, "_parallel_cmd", side_effect=[kernel_payload, gfx_payload]
+        ):
+            engine.collect_kernel_hw()
+            engine.collect_graphics()
+        return engine, "".join(engine.report_lines)
+
+    def test_timestamp_authority_iso_offsets_equiv_naive_and_mixed(self, tmp_path):
+        """ISO UTC offsets compare instants accurately; naive stays wall-clock; mixed is unverified."""
+        # 1. Explicit different ISO offsets (10:30+01:00 = 09:30Z < 12:00+02:00 = 10:00Z)
+        diff_offsets = (
+            "2026-11-25T12:00:00+02:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-11-25T10:30:00+01:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_diff = self._run_kernel_and_gfx(
+            tmp_path / "diff",
+            kernel_errors_res=CmdResult("journalctl", diff_offsets, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert (
+            "first: `2026-11-25T10:30:00+01:00`, last: `2026-11-25T12:00:00+02:00` (UTC-normalized chronology)"
+            in rep_diff
+        )
+
+        # 2. Equivalent instants in different offsets
+        equiv = (
+            "2026-11-25T10:00:00+01:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-11-25T09:00:00Z h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_equiv = self._run_kernel_and_gfx(
+            tmp_path / "equiv",
+            kernel_errors_res=CmdResult("journalctl", equiv, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_equiv
+        assert "UTC-normalized chronology" in rep_equiv
+
+        # 3. Homogeneous timezone-naive ISO -> wall-clock bounds only
+        naive_only = (
+            "2026-11-25T11:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-11-25T10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_naive = self._run_kernel_and_gfx(
+            tmp_path / "naive",
+            kernel_errors_res=CmdResult("journalctl", naive_only, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert (
+            "wall-clock first: `2026-11-25T10:00:00`, last: `2026-11-25T11:00:00` "
+            "(timezone omitted; absolute chronology unverified)" in rep_naive
+        )
+
+        # 4. Mixed naive + aware ISO -> chronological order unverified
+        mixed_na = (
+            "2026-11-25T10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-11-25T09:30:00+01:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_mixed = self._run_kernel_and_gfx(
+            tmp_path / "mixed_na",
+            kernel_errors_res=CmdResult("journalctl", mixed_na, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_mixed
+        assert (
+            "chronological order unverified "
+            "(mixed timezone-naive and timezone-aware ISO timestamps)" in rep_mixed
+        )
+
+    def test_timestamp_authority_rollover_mixed_formats_feb29_invalid_and_deterministic(
+        self, tmp_path
+    ):
+        """Enforce conservative handling across rollover, mixed formats, Feb 29, and invalid dates."""
+        # 1. Dec -> Jan syslog rollover
+        rollover = (
+            "Dec 31 23:59:50 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Jan  1 00:00:05 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_roll = self._run_kernel_and_gfx(
+            tmp_path / "roll",
+            kernel_errors_res=CmdResult("journalctl", rollover, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_roll
+        assert (
+            "chronological order unverified (ambiguous syslog year rollover without year)"
+            in rep_roll
+        )
+
+        # 2. Mixed ISO and syslog
+        mixed_fmt = (
+            "2026-11-25T10:00:00+00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Nov 25 11:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_fmt = self._run_kernel_and_gfx(
+            tmp_path / "mixed_fmt",
+            kernel_errors_res=CmdResult("journalctl", mixed_fmt, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_fmt
+        assert (
+            "chronological order unverified (mixed ISO and syslog timestamp formats)"
+            in rep_fmt
+        )
+
+        # 3. Homogeneous syslog explicitly states year/timezone omitted
+        sys_only = (
+            "Nov 25 08:51:10 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Nov 25 08:51:19 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_sys = self._run_kernel_and_gfx(
+            tmp_path / "sys_only",
+            kernel_errors_res=CmdResult("journalctl", sys_only, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert (
+            "calendar-label first: `Nov 25 08:51:10`, last: `Nov 25 08:51:19` "
+            "(year and timezone omitted by syslog)" in rep_sys
+        )
+
+        # 4. February 29 without year preserves original row/text without chronology claim
+        feb29 = (
+            "Feb 29 10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Mar  1 10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        _, rep_feb29 = self._run_kernel_and_gfx(
+            tmp_path / "feb29",
+            kernel_errors_res=CmdResult("journalctl", feb29, "", 0, "ok"),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**2 observed rows**" in rep_feb29
+        assert (
+            "chronological order unverified "
+            "(February 29 without year cannot establish calendar chronology)"
+            in rep_feb29
+        )
+        assert "Feb 29 10:00:00 h kernel:" in rep_feb29
+
+        # 5. Mixed valid, invalid dates, and missing timestamps + deterministic order
+        mixed_valid_invalid_a = (
+            "Nov 25 10:00:05 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Nov 31 10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-02-30T10:00:00Z h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        mixed_valid_invalid_b = (
+            "kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "2026-02-30T10:00:00Z h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Nov 31 10:00:00 h kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "Nov 25 10:00:05 h kernel: amdgpu 0000:01:00.0: DPCD read failed"
+        )
+        eng_a, rep_a = self._run_kernel_and_gfx(
+            tmp_path / "mvi_a",
+            kernel_errors_res=CmdResult(
+                "journalctl", mixed_valid_invalid_a, "", 0, "ok"
+            ),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        _, rep_b = self._run_kernel_and_gfx(
+            tmp_path / "mvi_b",
+            kernel_errors_res=CmdResult(
+                "journalctl", mixed_valid_invalid_b, "", 0, "ok"
+            ),
+            gfx_logs_res=CmdResult("journalctl", "", "", 0, "ok"),
+        )
+        assert "**4 observed rows**" in rep_a
+        assert "timestamps unavailable on 3 of 4 rows" in rep_a
+        assert any("unparseable timestamp(s)" in r for r in eng_a.restrictions)
+        sum_a = [ln for ln in rep_a.splitlines() if ln.startswith("  - `[kernel")]
+        sum_b = [ln for ln in rep_b.splitlines() if ln.startswith("  - `[kernel")]
+        assert sum_a == sum_b
+
+    def test_journal_input_separation_truncation_udev_worker_and_digit_hostname(
+        self, tmp_path
+    ):
+        """Exclude synthetic truncation banners; support (udev-worker) and digit-leading hosts."""
+        fw_stdout = (
+            "lis 25 06:47:33 z13 (udev-worker)[835]: asus-armoury: Process '/usr/bin/chgrp' ok\n"
+            "lis 25 06:47:34 z13 (udev-worker)[835]: asus-armoury: Process '/usr/bin/chgrp' ok\n"
+            "7arch (udev-worker)[835]: asus-armoury: Process '/usr/bin/chmod' ok"
+        )
+        # Truncated firmware capture adds `[... wynik polecenia obcięty ...]` in to_fallback_text()
+        fw_res = CmdResult("journalctl", fw_stdout, "", 0, "ok", truncated=True)
+        assert "wynik polecenia obcięty" in fw_res.to_fallback_text()
+
+        gfx_stdout = (
+            "01-node kernel: amdgpu 0000:01:00.0: DPCD read failed\n"
+            "unstructured genuine raw line without emitter"
+        )
+        gfx_res = CmdResult("journalctl", gfx_stdout, "", 0, "ok")
+
+        eng, rep = self._run_kernel_and_gfx(
+            tmp_path,
+            kernel_errors_res=CmdResult("journalctl", "", "timeout", 124, "timeout"),
+            gfx_logs_res=gfx_res,
+            firmware_msgs_res=fw_res,
+        )
+
+        # Synthetic truncation banner preserved in codeblock, NEVER counted or flagged unstructured
+        assert "[... wynik polecenia obcięty ...]" in rep
+        assert "`[(udev-worker)[835]]` **2 observed rows**" in rep
+        assert "`[(udev-worker)[835]]` **1 observed row**" in rep
+        assert not any(
+            "firmware_msgs" in r and "unstructured row" in r for r in eng.restrictions
+        )
+
+        # Digit-leading hostname grouped cleanly without false unparseable timestamp
+        assert (
+            "`[kernel | device: 0000:01:00.0]` **1 observed row** (timestamps: unavailable (missing in source rows))"
+            in rep
+        )
+        # Genuine unstructured row in gfx_logs still triggers limitation and stays verbatim
+        assert any(
+            "gfx_logs" in r and "unstructured row" in r for r in eng.restrictions
+        )
+        assert "unstructured genuine raw line without emitter" in rep
+        # Unavailable kernel_errors stays non-authoritative
+        assert "unavailable (source did not complete authoritatively" in rep
+        assert any("TIMEOUT" in r for r in eng.restrictions)
+        # No global cross-source count and zero promoted findings
+        eng._derive_observations()
+        eng._interpret()
+        assert eng.findings == []

@@ -1958,10 +1958,16 @@ class KernelCountRule(DiagnosticRule):
             severity="Info",
             confidence=conf,
             evidence=f"Liczba kernel: {cnt}.",
-            interpretation="Wszystkie obrazy kernel obecne. Rekomendacja dot. przestrzeni.",
-            recommended_diagnostics="`uname -r`; `ls /boot/vmlinuz-*`",
-            remediation="Można usunąć nieużywane: `sudo pacman -Rs <kernel>`. Zostaw zapasowy.",
-            verification="`ls /boot/vmlinuz-* | wc -l` <= 2",
+            interpretation=(
+                f"Liczba zainstalowanych pakietów kernela ({cnt}) przekracza zalecany próg. "
+                "Stan obrazów rozruchowych /boot oraz drzew modułów wymaga niezależnej weryfikacji."
+            ),
+            recommended_diagnostics="`uname -r` i lista pakietów kernela właściwa dla dystrybucji.",
+            remediation=(
+                "Przejrzyj zainstalowane pakiety kernela. Upewnij się, że aktywny kernel i zamierzony "
+                "wariant zapasowy pozostają dostępne przed ewentualnym usunięciem nadmiarowych pakietów."
+            ),
+            verification="Zweryfikuj liczbę pakietów kernela oraz dostępność aktywnego i zapasowego kernela po zmianie.",
             risk_level="Informacja.",
             domain=classification.domain,
             kind=classification.kind,
